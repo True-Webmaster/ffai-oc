@@ -7,9 +7,13 @@ const path = require("path");
 // ── Config ───────────────────────────────────────────────────────────────────
 const PORT = parseInt(process.env.PORT || "8002", 10);
 const MODE = (process.env.MODE || "proxy").toLowerCase(); // "proxy" | "rotation"
-const LLM_BASE = (process.env.LLM_BASE_URL || "https://api.openai.com/v1").replace(/\/+$/, "");
-const KEYS_VAR = (process.env.KEYS_VAR || "LLM_KEYS").trim();
+const UPSTREAM_URL = (process.env.UPSTREAM_URL || "").replace(/\/+$/, "");
+const KEYS_VAR = (process.env.KEYS_VAR || "API_KEYS").trim();
 const KEYS = (process.env[KEYS_VAR] || "").split(",").map((k) => k.trim()).filter(Boolean);
+const AUTH_SCHEME = (process.env.AUTH_SCHEME || "bearer").toLowerCase(); // "bearer" | "query" | "header" | "none"
+const AUTH_HEADER = (process.env.AUTH_HEADER || "authorization").toLowerCase(); // custom header name for "header" scheme
+const AUTH_QUERY = (process.env.AUTH_QUERY || "key").trim(); // query param name for "query" scheme
+const ALLOWED_PATHS = (process.env.ALLOWED_PATHS || "").trim(); // e.g. "/v1/,/api/" — empty = allow all
 const MAX_RETRIES = Math.min(KEYS.length, parseInt(process.env.MAX_RETRIES || "3", 10));
 const REQUEST_TIMEOUT = parseInt(process.env.REQUEST_TIMEOUT || "120000", 10);
 const MAX_BODY_SIZE = parseInt(process.env.MAX_BODY_SIZE || String(2 * 1024 * 1024), 10);
@@ -21,8 +25,11 @@ const STATS_FILE = process.env.STATS_FILE || path.join(".", "data", "stats.json"
 const STATS_FLUSH_INTERVAL = parseInt(process.env.STATS_FLUSH_INTERVAL || "60000", 10);
 const STATS_RETENTION_DAYS = parseInt(process.env.STATS_RETENTION_DAYS || "7", 10);
 
+// Parse allowed path prefixes (empty = allow all paths)
+const PATH_PREFIXES = ALLOWED_PATHS ? ALLOWED_PATHS.split(",").map((p) => p.trim()).filter(Boolean) : [];
+
 // Parse expected upstream hostname once at startup for SSRF validation
-const EXPECTED_HOST = new URL(LLM_BASE).hostname;
+const EXPECTED_HOST = UPSTREAM_URL ? new URL(UPSTREAM_URL).hostname : null;
 
 // Hop-by-hop headers that should not be forwarded
 const HOP_HEADERS = new Set([
@@ -31,12 +38,22 @@ const HOP_HEADERS = new Set([
 ]);
 
 if (!KEYS.length) {
-  console.error(`[gateway] FATAL: No keys found in $${KEYS_VAR} (set KEYS_VAR to point to your env var)`);
+  console.error(`[keymux] FATAL: No keys found in $${KEYS_VAR} (set KEYS_VAR to point to your env var)`);
   process.exit(1);
 }
 
 if (!["proxy", "rotation"].includes(MODE)) {
-  console.error(`[gateway] FATAL: MODE must be "proxy" or "rotation", got "${MODE}"`);
+  console.error(`[keymux] FATAL: MODE must be "proxy" or "rotation", got "${MODE}"`);
+  process.exit(1);
+}
+
+if (MODE === "proxy" && !UPSTREAM_URL) {
+  console.error(`[keymux] FATAL: UPSTREAM_URL is required in proxy mode`);
+  process.exit(1);
+}
+
+if (!["bearer", "query", "header", "none"].includes(AUTH_SCHEME)) {
+  console.error(`[keymux] FATAL: AUTH_SCHEME must be "bearer", "query", "header", or "none", got "${AUTH_SCHEME}"`);
   process.exit(1);
 }
 
@@ -125,7 +142,7 @@ function flushStats() {
     fs.writeFileSync(STATS_FILE, JSON.stringify(stats, null, 2));
     statsDirty = false;
   } catch (err) {
-    console.error(`[gateway] stats flush error: ${err.message}`);
+    console.error(`[keymux] stats flush error: ${err.message}`);
   }
 }
 
@@ -150,7 +167,7 @@ function getNextKey() {
 function cooldownKey(key, retryAfterHeader) {
   const secs = parseInt(retryAfterHeader, 10) || DEFAULT_COOLDOWN;
   cooldowns.set(key, Date.now() + secs * 1000);
-  console.log(`[gateway] ${last4(key)} rate-limited, cooling ${secs}s`);
+  console.log(`[keymux] ${last4(key)} rate-limited, cooling ${secs}s`);
   recordRateLimit(key);
 }
 
@@ -172,16 +189,16 @@ function sendAlert(event, message) {
         headers: { "content-type": "application/json", "content-length": String(Buffer.byteLength(payload)) },
         timeout: ALERT_TIMEOUT,
       });
-      req.on("error", (err) => console.error(`[gateway] alert webhook error: ${err.message}`));
+      req.on("error", (err) => console.error(`[keymux] alert webhook error: ${err.message}`));
       req.on("timeout", () => req.destroy());
       req.write(payload);
       req.end();
     } catch (err) {
-      console.error(`[gateway] alert webhook error: ${err.message}`);
+      console.error(`[keymux] alert webhook error: ${err.message}`);
     }
   }
 
-  console.warn(`[gateway] ALERT: ${event} — ${message}`);
+  console.warn(`[keymux] ALERT: ${event} — ${message}`);
 }
 
 // ── Response header filtering ────────────────────────────────────────────────
@@ -216,20 +233,35 @@ function keyStatus() {
 // ── Proxy forward logic ──────────────────────────────────────────────────────
 function forward(key, method, urlPath, headers, body) {
   return new Promise((resolve, reject) => {
-    const url = new URL(LLM_BASE + urlPath);
+    const url = new URL(UPSTREAM_URL + urlPath);
 
     // SSRF protection
     if (url.hostname !== EXPECTED_HOST) {
       return reject(new Error(`SSRF blocked: resolved hostname ${url.hostname} != ${EXPECTED_HOST}`));
     }
 
+    // Inject key via query param if using "query" auth scheme
+    if (AUTH_SCHEME === "query") {
+      url.searchParams.set(AUTH_QUERY, key);
+    }
+
     const fwdHeaders = {};
     for (const [k, v] of Object.entries(headers)) {
-      if (!HOP_HEADERS.has(k.toLowerCase()) && k.toLowerCase() !== "authorization") {
+      const lk = k.toLowerCase();
+      // Strip hop-by-hop, original auth, and custom auth header
+      if (!HOP_HEADERS.has(lk) && lk !== "authorization" && lk !== AUTH_HEADER) {
         fwdHeaders[k] = v;
       }
     }
-    fwdHeaders.authorization = `Bearer ${key}`;
+
+    // Inject key via header based on auth scheme
+    if (AUTH_SCHEME === "bearer") {
+      fwdHeaders.authorization = `Bearer ${key}`;
+    } else if (AUTH_SCHEME === "header") {
+      fwdHeaders[AUTH_HEADER] = key;
+    }
+    // "query" and "none" don't set auth headers
+
     fwdHeaders.host = url.host;
     if (body && body.length > 0) {
       fwdHeaders["content-length"] = String(body.length);
@@ -308,7 +340,7 @@ function handleKeyRequest(req, res) {
 
   recordRequest(key);
   res.writeHead(200, { "content-type": "application/json" });
-  res.end(JSON.stringify({ key, base_url: LLM_BASE }));
+  res.end(JSON.stringify({ key, upstream_url: UPSTREAM_URL || null }));
 }
 
 // ── Route: POST /key/:keyId/cooldown (rotation mode — report rate limit) ─────
@@ -335,7 +367,7 @@ function handleCooldownReport(req, res, keyFragment) {
   });
 }
 
-// ── Route: /v1/* proxy (proxy mode only) ─────────────────────────────────────
+// ── Route: proxy pass-through (proxy mode only) ─────────────────────────────
 async function handleProxy(req, res) {
   // Collect request body with size limit
   const chunks = [];
@@ -384,7 +416,7 @@ async function handleProxy(req, res) {
       upstream.pipe(res);
       return;
     } catch (err) {
-      console.error(`[gateway] ${last4(key)} error: ${err.message}`);
+      console.error(`[keymux] ${last4(key)} error: ${err.message}`);
       recordError(key);
       if (attempt === MAX_RETRIES - 1) {
         res.writeHead(502, { "content-type": "application/json" });
@@ -417,10 +449,10 @@ async function handleRequest(req, res) {
     return res.end(JSON.stringify({ error: "not found", mode: "rotation", endpoints: ["/health", "/stats", "/key", "/key/:id/cooldown"] }));
   }
 
-  // Proxy mode — only allow /v1/ paths
-  if (!req.url.startsWith("/v1/")) {
+  // Proxy mode — check allowed path prefixes (if configured)
+  if (PATH_PREFIXES.length > 0 && !PATH_PREFIXES.some((p) => req.url.startsWith(p))) {
     res.writeHead(403, { "content-type": "application/json" });
-    return res.end(JSON.stringify({ error: "forbidden: only /v1/ paths allowed" }));
+    return res.end(JSON.stringify({ error: "forbidden: path not allowed", allowed: PATH_PREFIXES }));
   }
 
   return handleProxy(req, res);
@@ -429,7 +461,7 @@ async function handleRequest(req, res) {
 // ── Server ───────────────────────────────────────────────────────────────────
 const server = http.createServer((req, res) => {
   handleRequest(req, res).catch((err) => {
-    console.error(`[gateway] unhandled: ${err.message}`);
+    console.error(`[keymux] unhandled: ${err.message}`);
     if (!res.headersSent) {
       res.writeHead(500, { "content-type": "application/json" });
       res.end(JSON.stringify({ error: "internal gateway error" }));
@@ -440,7 +472,7 @@ const server = http.createServer((req, res) => {
 // Graceful shutdown
 let forceExitTimer;
 function shutdown(signal) {
-  console.log(`[gateway] ${signal} received, shutting down...`);
+  console.log(`[keymux] ${signal} received, shutting down...`);
   flushStats();
   clearInterval(flushInterval);
   server.close(() => {
@@ -453,8 +485,8 @@ process.on("SIGTERM", () => shutdown("SIGTERM"));
 process.on("SIGINT", () => shutdown("SIGINT"));
 
 server.listen(PORT, "0.0.0.0", () => {
-  console.log(`[gateway] KeyMux on :${PORT} [${MODE} mode] with ${KEYS.length} key(s) from $${KEYS_VAR}`);
-  if (MODE === "proxy") console.log(`[gateway] Upstream: ${EXPECTED_HOST}`);
-  if (MODE === "rotation") console.log(`[gateway] Rotation-only: clients fetch keys via GET /key`);
-  console.log(`[gateway] Stats: ${fs.existsSync(STATS_FILE) ? "loaded from disk" : "fresh start"}`);
+  console.log(`[keymux] KeyMux on :${PORT} [${MODE} mode] with ${KEYS.length} key(s) from $${KEYS_VAR} (auth: ${AUTH_SCHEME})`);
+  if (MODE === "proxy") console.log(`[keymux] Upstream: ${EXPECTED_HOST}${PATH_PREFIXES.length ? ` | paths: ${PATH_PREFIXES.join(", ")}` : " | paths: all"}`);
+  if (MODE === "rotation") console.log(`[keymux] Rotation-only: clients fetch keys via GET /key`);
+  console.log(`[keymux] Stats: ${fs.existsSync(STATS_FILE) ? "loaded from disk" : "fresh start"}`);
 });
