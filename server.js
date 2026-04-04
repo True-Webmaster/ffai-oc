@@ -393,28 +393,32 @@ function forward(key, method, urlPath, headers, body) {
 function handleHealth(req, res) {
   const now = Date.now();
   const ks = keyStatus();
-  const day = getDay();
-  ensureKeyEntries(day);
   const circuitOpen = cbIsOpen();
   const statusCode = (ks.available === 0 || circuitOpen) ? 503 : 200;
-  res.writeHead(statusCode, { "content-type": "application/json" });
-  res.end(JSON.stringify({
+  const payload = {
     status: statusCode === 200 ? "ok" : "degraded",
     mode: MODE,
-    keys: ks.total,
     available: ks.available,
     coolingDown: ks.coolingDown,
     circuitBreaker: CB_THRESHOLD ? (circuitOpen ? "open" : "closed") : "disabled",
     uptime: formatUptime(now - stats.startedAt),
-    today: {
+  };
+  // Include detailed stats only if admin auth passes (or no admin key set)
+  if (checkAuth(req, ADMIN_KEY)) {
+    const day = getDay();
+    ensureKeyEntries(day);
+    payload.keys = ks.total;
+    payload.today = {
       requests: day.requests,
       rateLimited: day.rateLimited,
       allKeysExhausted: day.allKeysExhausted,
       errors: day.errors,
       circuitBreaks: day.circuitBreaks || 0,
       perKey: day.perKey,
-    },
-  }));
+    };
+  }
+  res.writeHead(statusCode, { "content-type": "application/json" });
+  res.end(JSON.stringify(payload));
 }
 
 // ── Route: /stats ────────────────────────────────────────────────────────────
@@ -549,11 +553,17 @@ async function handleProxy(req, res) {
         return res.end(JSON.stringify({ error: `upstream returned ${upstream.statusCode}` }));
       }
 
-      // Success — pipe response
+      // Success — pipe response with absolute timeout guard
       cbRecordSuccess();
       const safeHeaders = filterResponseHeaders(upstream.headers);
       res.writeHead(upstream.statusCode, safeHeaders);
-      res.on("close", () => { upstream.destroy(); });
+      const pipeTimeout = setTimeout(() => {
+        console.error(`[keymux] response pipe timeout — destroying upstream`);
+        upstream.destroy();
+        if (!res.writableEnded) res.end();
+      }, REQUEST_TIMEOUT);
+      upstream.on("end", () => clearTimeout(pipeTimeout));
+      res.on("close", () => { clearTimeout(pipeTimeout); upstream.destroy(); });
       upstream.pipe(res);
       return;
     } catch (err) {
@@ -594,8 +604,10 @@ async function handleRequest(req, res) {
 
   // Proxy mode — check allowed path prefixes (if configured)
   if (PATH_PREFIXES.length > 0) {
-    const normalized = decodeURIComponent(req.url.split("?")[0]); // normalize for prefix check
-    if (!PATH_PREFIXES.some((p) => normalized.startsWith(p))) {
+    let normalized;
+    try { normalized = decodeURIComponent(req.url.split("?")[0]); } catch { normalized = req.url.split("?")[0]; }
+    // Prefix must match at a path boundary (exact or followed by / or end)
+    if (!PATH_PREFIXES.some((p) => normalized === p || normalized.startsWith(p.endsWith("/") ? p : p + "/"))) {
       res.writeHead(403, { "content-type": "application/json" });
       return res.end(JSON.stringify({ error: "forbidden: path not allowed", allowed: PATH_PREFIXES }));
     }
@@ -641,9 +653,10 @@ process.on("SIGTERM", () => shutdown("SIGTERM"));
 process.on("SIGINT", () => shutdown("SIGINT"));
 
 server.listen(PORT, BIND_ADDRESS, () => {
-  console.log(`[keymux] KeyMux on ${BIND_ADDRESS}:${PORT} [${MODE} mode] with ${KEYS.length} key(s) from $${KEYS_VAR} (auth: ${AUTH_SCHEME})`);
+  console.log(`[keymux] KeyMux on ${BIND_ADDRESS}:${PORT} [${MODE} mode] with ${KEYS.length} key(s) (auth: ${AUTH_SCHEME})`);
   if (MODE === "proxy") console.log(`[keymux] Upstream: ${EXPECTED_HOST}${PATH_PREFIXES.length ? ` | paths: ${PATH_PREFIXES.join(", ")}` : " | paths: all"}`);
   if (MODE === "rotation") console.log(`[keymux] Rotation-only: clients fetch keys via GET /key`);
+  if (!PROXY_KEY && !ADMIN_KEY) console.warn(`[keymux] WARNING: No PROXY_KEY or ADMIN_KEY set — endpoints are open to anyone with network access`);
   if (PROXY_KEY) console.log(`[keymux] Inbound auth: PROXY_KEY required`);
   if (ADMIN_KEY) console.log(`[keymux] Admin auth: ADMIN_KEY required for /stats`);
   if (CB_THRESHOLD) console.log(`[keymux] Circuit breaker: ${CB_THRESHOLD} errors in ${CB_WINDOW / 1000}s → block for ${CB_COOLDOWN / 1000}s`);
