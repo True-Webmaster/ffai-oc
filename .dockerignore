@@ -2,4 +2,10 @@ node_modules
 data
 .env
 .git
+.claude
+memory
 *.md
+docker-compose.yml
+Dockerfile
+.dockerignore
+.gitignore

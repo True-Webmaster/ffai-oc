@@ -1,13 +1,13 @@
 {
   "name": "keymux",
   "version": "1.0.0",
-  "description": "Standalone LLM API gateway with key rotation, rate-limit handling, stats, and alerting",
+  "description": "API key multiplexer with rotation, rate-limit handling, circuit breaker, stats, and alerting",
   "main": "server.js",
   "scripts": {
     "start": "node server.js",
     "dev": "node --watch server.js"
   },
-  "keywords": ["llm", "proxy", "gateway", "openai", "key-rotation"],
+  "keywords": ["api", "proxy", "gateway", "key-rotation", "circuit-breaker"],
   "license": "MIT",
   "engines": {
     "node": ">=18"
