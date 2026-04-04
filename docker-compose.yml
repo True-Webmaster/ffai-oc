@@ -1,0 +1,19 @@
+services:
+  keymux:
+    build: .
+    container_name: keymux
+    restart: unless-stopped
+    ports:
+      - "${PORT:-8002}:8002"
+    env_file:
+      - .env
+    volumes:
+      - keymux-data:/app/data
+    healthcheck:
+      test: ["CMD", "wget", "-q", "--spider", "http://localhost:8002/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+
+volumes:
+  keymux-data:
