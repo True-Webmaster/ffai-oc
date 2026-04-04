@@ -38,16 +38,20 @@ docker compose up -d
 
 | Variable | Default | Description |
 |---|---|---|
-| `LLM_KEYS` | *(required)* | Comma-separated API keys |
+| `KEYS_VAR` | `LLM_KEYS` | Name of the env var holding your comma-separated API keys |
 | `LLM_BASE_URL` | `https://api.openai.com/v1` | Upstream base URL |
 | `PORT` | `8002` | Listen port |
 | `MODE` | `proxy` | `proxy` or `rotation` |
-| `ALERT_WEBHOOK_URL` | *(empty)* | Webhook for all-keys-exhausted alerts |
+| `MAX_RETRIES` | `3` | Max retry attempts per request (capped at key count) |
+| `DEFAULT_COOLDOWN` | `60` | Cooldown seconds when no Retry-After header |
 | `MAX_BODY_SIZE` | `2097152` | Max request body (bytes) |
 | `REQUEST_TIMEOUT` | `120000` | Upstream timeout (ms) |
+| `ALERT_WEBHOOK_URL` | *(empty)* | Webhook for all-keys-exhausted alerts |
+| `ALERT_TIMEOUT` | `5000` | Webhook request timeout (ms) |
 | `STATS_FILE` | `./data/stats.json` | Stats persistence path |
 | `STATS_FLUSH_INTERVAL` | `60000` | Stats write interval (ms) |
 | `STATS_RETENTION_DAYS` | `7` | Days of stats history |
+| `SHUTDOWN_TIMEOUT` | `5000` | Force-exit timeout after graceful shutdown (ms) |
 
 ## Modes
 

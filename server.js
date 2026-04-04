@@ -8,11 +8,15 @@ const path = require("path");
 const PORT = parseInt(process.env.PORT || "8002", 10);
 const MODE = (process.env.MODE || "proxy").toLowerCase(); // "proxy" | "rotation"
 const LLM_BASE = (process.env.LLM_BASE_URL || "https://api.openai.com/v1").replace(/\/+$/, "");
-const KEYS = (process.env.LLM_KEYS || "").split(",").map((k) => k.trim()).filter(Boolean);
-const MAX_RETRIES = Math.min(KEYS.length, 3);
+const KEYS_VAR = (process.env.KEYS_VAR || "LLM_KEYS").trim();
+const KEYS = (process.env[KEYS_VAR] || "").split(",").map((k) => k.trim()).filter(Boolean);
+const MAX_RETRIES = Math.min(KEYS.length, parseInt(process.env.MAX_RETRIES || "3", 10));
 const REQUEST_TIMEOUT = parseInt(process.env.REQUEST_TIMEOUT || "120000", 10);
 const MAX_BODY_SIZE = parseInt(process.env.MAX_BODY_SIZE || String(2 * 1024 * 1024), 10);
+const DEFAULT_COOLDOWN = parseInt(process.env.DEFAULT_COOLDOWN || "60", 10);
 const ALERT_WEBHOOK_URL = (process.env.ALERT_WEBHOOK_URL || "").trim();
+const ALERT_TIMEOUT = parseInt(process.env.ALERT_TIMEOUT || "5000", 10);
+const SHUTDOWN_TIMEOUT = parseInt(process.env.SHUTDOWN_TIMEOUT || "5000", 10);
 const STATS_FILE = process.env.STATS_FILE || path.join(".", "data", "stats.json");
 const STATS_FLUSH_INTERVAL = parseInt(process.env.STATS_FLUSH_INTERVAL || "60000", 10);
 const STATS_RETENTION_DAYS = parseInt(process.env.STATS_RETENTION_DAYS || "7", 10);
@@ -27,7 +31,7 @@ const HOP_HEADERS = new Set([
 ]);
 
 if (!KEYS.length) {
-  console.error("[gateway] FATAL: LLM_KEYS is empty");
+  console.error(`[gateway] FATAL: No keys found in $${KEYS_VAR} (set KEYS_VAR to point to your env var)`);
   process.exit(1);
 }
 
@@ -144,7 +148,7 @@ function getNextKey() {
 }
 
 function cooldownKey(key, retryAfterHeader) {
-  const secs = parseInt(retryAfterHeader, 10) || 60;
+  const secs = parseInt(retryAfterHeader, 10) || DEFAULT_COOLDOWN;
   cooldowns.set(key, Date.now() + secs * 1000);
   console.log(`[gateway] ${last4(key)} rate-limited, cooling ${secs}s`);
   recordRateLimit(key);
@@ -166,7 +170,7 @@ function sendAlert(event, message) {
       const req = mod.request(url, {
         method: "POST",
         headers: { "content-type": "application/json", "content-length": String(Buffer.byteLength(payload)) },
-        timeout: 5000,
+        timeout: ALERT_TIMEOUT,
       });
       req.on("error", (err) => console.error(`[gateway] alert webhook error: ${err.message}`));
       req.on("timeout", () => req.destroy());
@@ -320,7 +324,7 @@ function handleCooldownReport(req, res, keyFragment) {
   const chunks = [];
   req.on("data", (c) => chunks.push(c));
   req.on("end", () => {
-    let retryAfter = "60";
+    let retryAfter = String(DEFAULT_COOLDOWN);
     try {
       const body = JSON.parse(Buffer.concat(chunks).toString());
       if (body.retry_after) retryAfter = String(body.retry_after);
@@ -443,13 +447,13 @@ function shutdown(signal) {
     clearTimeout(forceExitTimer);
     process.exit(0);
   });
-  forceExitTimer = setTimeout(() => process.exit(1), 5000);
+  forceExitTimer = setTimeout(() => process.exit(1), SHUTDOWN_TIMEOUT);
 }
 process.on("SIGTERM", () => shutdown("SIGTERM"));
 process.on("SIGINT", () => shutdown("SIGINT"));
 
 server.listen(PORT, "0.0.0.0", () => {
-  console.log(`[gateway] LLM Gateway on :${PORT} [${MODE} mode] with ${KEYS.length} key(s)`);
+  console.log(`[gateway] KeyMux on :${PORT} [${MODE} mode] with ${KEYS.length} key(s) from $${KEYS_VAR}`);
   if (MODE === "proxy") console.log(`[gateway] Upstream: ${EXPECTED_HOST}`);
   if (MODE === "rotation") console.log(`[gateway] Rotation-only: clients fetch keys via GET /key`);
   console.log(`[gateway] Stats: ${fs.existsSync(STATS_FILE) ? "loaded from disk" : "fresh start"}`);
