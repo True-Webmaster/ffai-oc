@@ -92,22 +92,6 @@ curl -X POST http://localhost:8002/key/xyz/cooldown \
 | `POST` | `/key/:id/cooldown` | rotation | Report key rate-limited |
 | `*` | `/v1/*` | proxy | Proxied to upstream |
 
-## TrueMem Integration
-
-Point TrueMem at the gateway as an external LLM service:
-
-```json
-{
-  "llmProxy": {
-    "enabled": false
-  },
-  "llm": {
-    "baseUrl": "http://localhost:8002/v1",
-    "model": "gemini-3.1-flash-lite-preview"
-  }
-}
-```
-
 ## Alert Webhook
 
 When all keys are exhausted, the gateway POSTs to `ALERT_WEBHOOK_URL`:
