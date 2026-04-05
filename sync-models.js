@@ -137,14 +137,22 @@ async function main() {
     const provModels = byProvider[provName] || [];
     if (provModels.length === 0) continue;
 
-    // Filter to chat-capable models (skip embedding, imagen, veo, audio, deprecated, etc.)
+    // Filter to chat-capable models with sufficient context for agentic use
+    const MIN_CONTEXT_WINDOW = 8192; // Models below this can't handle multi-turn conversations
     const chatModels = provModels.filter((m) => {
       const id = m.id || "";
-      if (/embed|imagen|veo|lyria|aqa|tts|audio|live|robotics|nano-banana|generate|clip|gemma|guard|whisper|distil|tool-use|prompt-guard/.test(id)) return false;
-      if (/^models\/gemini-2\.0-flash-(001|lite-001|lite)$/.test(m.id || "")) return false;
+      // Skip non-chat model categories
+      if (/embed|imagen|veo|lyria|aqa|tts|audio|live|robotics|nano-banana|generate|clip|guard|whisper|distil|prompt-guard|orpheus|safeguard/.test(id)) return false;
+      // Skip duplicate versioned models (prefer the alias without -001 suffix)
       if (/gemini-2\.0-flash-001|gemini-2\.0-flash-lite-001|gemini-2\.0-flash-lite$/.test(id)) return false;
-      if (/deep-research/.test(id)) return false;
-      if (/computer-use/.test(id)) return false;
+      // Skip special-purpose models
+      if (/deep-research|computer-use/.test(id)) return false;
+      // Filter by minimum context window (from API data or our fallback)
+      const ctx = m.context_window || 0;
+      if (ctx > 0 && ctx < MIN_CONTEXT_WINDOW) {
+        console.log(`[sync] Skipping ${id}: context_window ${ctx} < ${MIN_CONTEXT_WINDOW}`);
+        return false;
+      }
       return true;
     });
 
@@ -178,7 +186,7 @@ async function main() {
       models: chatModels.map((m) => {
         const cleanId = (m.id || "").replace(/^models\//, "");
         const isReasoning = false;
-        const supportsImage = /gemini|flash|pro|vision|grok-4-fast|llama-4|scout/.test(cleanId);
+        const supportsImage = /gemini|flash|pro|vision|grok-4-fast|llama-4|scout|gemma-[34]/.test(cleanId);
 
         // Resolution order for context window and max tokens:
         // 1. Native API (most accurate — e.g. Gemini's inputTokenLimit)
@@ -201,7 +209,21 @@ async function main() {
       }),
     };
 
-    console.log(`[sync] keymux-${provName}: ${chatModels.length} chat models`);
+    // Post-filter: remove models with resolved context below minimum
+    const beforeCount = existing.providers[`keymux-${provName}`].models.length;
+    existing.providers[`keymux-${provName}`].models = existing.providers[`keymux-${provName}`].models.filter((m) => {
+      if (m.contextWindow < MIN_CONTEXT_WINDOW) {
+        console.log(`[sync] Dropping ${m.id}: resolved contextWindow ${m.contextWindow} < ${MIN_CONTEXT_WINDOW}`);
+        return false;
+      }
+      return true;
+    });
+    const afterCount = existing.providers[`keymux-${provName}`].models.length;
+    if (afterCount < beforeCount) {
+      console.log(`[sync] keymux-${provName}: dropped ${beforeCount - afterCount} models below ${MIN_CONTEXT_WINDOW} ctx`);
+    }
+
+    console.log(`[sync] keymux-${provName}: ${afterCount} chat models`);
   }
 
   // 7. Build provider entry for openclaw.json (structured apiKey format)
