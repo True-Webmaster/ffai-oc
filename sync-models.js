@@ -137,22 +137,61 @@ async function main() {
     const provModels = byProvider[provName] || [];
     if (provModels.length === 0) continue;
 
-    // Filter to chat-capable models with sufficient context for agentic use
-    const MIN_CONTEXT_WINDOW = 8192; // Models below this can't handle multi-turn conversations
+    // ── Programmatic model filtering (no hardcoded model names) ──────────────
+    // All rules are pattern-based so new models are auto-included or excluded.
+    const MIN_CONTEXT_WINDOW = 8192;  // Min ctx for multi-turn conversations
+    const MIN_OUTPUT_TOKENS = 4096;   // Min output for useful responses
+    const MIN_PARAM_BILLIONS = 4;     // Skip tiny models (1b, 2b, 3b)
+
+    // Collect all IDs for dedup detection
+    const allIds = new Set(provModels.map(m => (m.id || "").replace(/^models\//, "")));
+
     const chatModels = provModels.filter((m) => {
-      const id = m.id || "";
-      // Skip non-chat model categories
-      if (/embed|imagen|veo|lyria|aqa|tts|audio|live|robotics|nano-banana|generate|clip|guard|whisper|distil|prompt-guard|orpheus|safeguard/.test(id)) return false;
-      // Skip duplicate versioned models (prefer the alias without -001 suffix)
-      if (/gemini-2\.0-flash-001|gemini-2\.0-flash-lite-001|gemini-2\.0-flash-lite$/.test(id)) return false;
-      // Skip special-purpose models
-      if (/deep-research|computer-use/.test(id)) return false;
-      // Filter by minimum context window (from API data or our fallback)
+      const id = (m.id || "").replace(/^models\//, "");
+      const idLower = id.toLowerCase();
+
+      // 1. Skip non-chat model categories (by keyword in ID)
+      const NON_CHAT_KEYWORDS = /embed|imagen|veo|lyria|aqa|tts|audio|live|robotics|generate|clip|guard|whisper|distil|orpheus|safeguard/;
+      if (NON_CHAT_KEYWORDS.test(idLower)) return false;
+
+      // 2. Skip image-generation models (contain "image" in the name)
+      if (/\bimage\b/.test(idLower)) return false;
+
+      // 3. Skip special-purpose models
+      if (/deep-research|computer-use|customtools/.test(idLower)) return false;
+
+      // 4. Skip "-latest" aliases (they point to a versioned model we already include)
+      if (/-latest$/.test(idLower)) {
+        console.log(`[sync] Skipping alias ${id}`);
+        return false;
+      }
+
+      // 5. Skip versioned duplicates: if "model-001" exists and "model" also exists, skip "-001"
+      const deVersioned = id.replace(/-\d{3}$/, "");
+      if (deVersioned !== id && allIds.has(deVersioned)) {
+        console.log(`[sync] Skipping versioned duplicate ${id} (have ${deVersioned})`);
+        return false;
+      }
+
+      // 6. Skip tiny models by parameter count in the name
+      //    Matches: "-4b-", "-31b-it", "e2b-it" (effective params), "-1b-"
+      const paramMatch = idLower.match(/(?:^|[/-])(\d+(?:\.\d+)?)b(?:[^a-z]|$)/) ||
+                         idLower.match(/[/-]e(\d+(?:\.\d+)?)b(?:[^a-z]|$)/);
+      if (paramMatch) {
+        const params = parseFloat(paramMatch[1]);
+        if (params < MIN_PARAM_BILLIONS) {
+          console.log(`[sync] Skipping ${id}: ${params}B params < ${MIN_PARAM_BILLIONS}B minimum`);
+          return false;
+        }
+      }
+
+      // 7. Filter by context window (pre-check — applied again after native spec resolution)
       const ctx = m.context_window || 0;
       if (ctx > 0 && ctx < MIN_CONTEXT_WINDOW) {
         console.log(`[sync] Skipping ${id}: context_window ${ctx} < ${MIN_CONTEXT_WINDOW}`);
         return false;
       }
+
       return true;
     });
 
@@ -209,18 +248,22 @@ async function main() {
       }),
     };
 
-    // Post-filter: remove models with resolved context below minimum
+    // Post-filter: remove models with resolved specs below minimums
     const beforeCount = existing.providers[`keymux-${provName}`].models.length;
     existing.providers[`keymux-${provName}`].models = existing.providers[`keymux-${provName}`].models.filter((m) => {
       if (m.contextWindow < MIN_CONTEXT_WINDOW) {
-        console.log(`[sync] Dropping ${m.id}: resolved contextWindow ${m.contextWindow} < ${MIN_CONTEXT_WINDOW}`);
+        console.log(`[sync] Dropping ${m.id}: contextWindow ${m.contextWindow} < ${MIN_CONTEXT_WINDOW}`);
+        return false;
+      }
+      if (m.maxTokens < MIN_OUTPUT_TOKENS) {
+        console.log(`[sync] Dropping ${m.id}: maxTokens ${m.maxTokens} < ${MIN_OUTPUT_TOKENS}`);
         return false;
       }
       return true;
     });
     const afterCount = existing.providers[`keymux-${provName}`].models.length;
     if (afterCount < beforeCount) {
-      console.log(`[sync] keymux-${provName}: dropped ${beforeCount - afterCount} models below ${MIN_CONTEXT_WINDOW} ctx`);
+      console.log(`[sync] keymux-${provName}: dropped ${beforeCount - afterCount} models below minimums`);
     }
 
     console.log(`[sync] keymux-${provName}: ${afterCount} chat models`);
