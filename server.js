@@ -692,7 +692,13 @@ class Provider {
     try {
       const upstream = await this.forward(key, "GET", "/v1/models", {}, null);
       const chunks = [];
-      for await (const chunk of upstream) chunks.push(chunk);
+      let totalBytes = 0;
+      const MODELS_MAX_BODY = 10 * 1024 * 1024; // 10MB
+      for await (const chunk of upstream) {
+        totalBytes += chunk.length;
+        if (totalBytes > MODELS_MAX_BODY) throw new Error("models response too large");
+        chunks.push(chunk);
+      }
       const body = JSON.parse(Buffer.concat(chunks).toString());
 
       // Normalize: tag each model with provider name
@@ -817,6 +823,7 @@ function flushStats() {
     statsDirty = false;
   } catch (err) {
     console.error(`[keymux] stats flush error: ${err.message}`);
+    try { fs.unlinkSync(STATS_FILE + ".tmp"); } catch {}
   }
 }
 
@@ -846,6 +853,7 @@ const AUTH_FAIL_WINDOW = 60000;  // 1 minute
 const AUTH_FAIL_MAX = 10;        // max failures per IP per window
 const AUTH_BLOCK_DURATION = 300000; // 5 minutes block after exceeding
 const authFailures = new Map();  // ip → { count, windowStart, blockedUntil }
+const AUTH_FAILURES_MAX = 100000; // size cap to prevent unbounded growth
 
 function isAuthBlocked(ip) {
   const entry = authFailures.get(ip);
@@ -871,6 +879,11 @@ function recordAuthFailure(ip) {
     console.warn(`[keymux] AUTH: IP ${ip} blocked for ${AUTH_BLOCK_DURATION / 1000}s (${entry.count} failures)`);
   }
   authFailures.set(ip, entry);
+  // Evict oldest entries if map grows too large (distributed brute-force protection)
+  if (authFailures.size > AUTH_FAILURES_MAX) {
+    const iter = authFailures.keys();
+    for (let i = 0; i < 1000; i++) authFailures.delete(iter.next().value);
+  }
 }
 
 // Periodic cleanup of stale auth failure entries (every 5 min)
@@ -904,14 +917,21 @@ function sendUnauthorized(res, req) {
 }
 
 // ── Webhook alerts ───────────────────────────────────────────────────────────
+const _alertThrottles = new Map(); // event → lastSentTimestamp
+const ALERT_THROTTLE_MS = 60000; // max 1 webhook per event type per 60s
+
 function sendAlert(event, message) {
+  const now = Date.now();
+  const lastSent = _alertThrottles.get(event) || 0;
+  const webhookThrottled = (now - lastSent) < ALERT_THROTTLE_MS;
   const payload = JSON.stringify({
     event,
     timestamp: new Date().toISOString(),
     message,
   });
 
-  if (ALERT_WEBHOOK_URL) {
+  if (ALERT_WEBHOOK_URL && !webhookThrottled) {
+    _alertThrottles.set(event, now);
     try {
       const url = new URL(ALERT_WEBHOOK_URL);
       const mod = url.protocol === "https:" ? https : http;
@@ -1221,7 +1241,12 @@ async function handleProxy(req, res, prov, proxyPath) {
         }
         prov.cbRecordError();
         if (prov.scorer) prov.scorer.recordError(key, upstream.statusCode);
-        if (attempt < attempts - 1) continue;
+        if (attempt < attempts - 1) {
+          // Exponential backoff: 100ms, 200ms, 400ms, ... capped at 2s
+          const backoffMs = Math.min(100 * Math.pow(2, attempt), 2000);
+          await new Promise(r => setTimeout(r, backoffMs));
+          continue;
+        }
         res.writeHead(upstream.statusCode, { "content-type": "application/json" });
         return res.end(JSON.stringify({ error: `upstream returned ${upstream.statusCode}`, provider: prov.name }));
       }
@@ -1259,17 +1284,23 @@ async function handleProxy(req, res, prov, proxyPath) {
       }
       const safeHeaders = filterResponseHeaders(upstream.headers);
       res.writeHead(upstream.statusCode, safeHeaders);
+      // Use longer timeout for streaming responses (SSE can take minutes)
+      const isStreaming = (upstream.headers["content-type"] || "").includes("text/event-stream");
+      const streamTimeout = isStreaming ? Math.max(prov.requestTimeout * 3, 360000) : prov.requestTimeout;
+      let pipeTimedOut = false;
       const pipeTimeout = setTimeout(() => {
-        console.error(`[keymux:${prov.name}] response pipe timeout — destroying upstream`);
+        pipeTimedOut = true;
+        console.error(`[keymux:${prov.name}] response pipe timeout (${streamTimeout / 1000}s) — destroying upstream`);
         upstream.destroy();
         if (!res.writableEnded) res.end();
-      }, prov.requestTimeout);
+      }, streamTimeout);
       upstream.on("error", (err) => {
+        pipeTimedOut = true;
         clearTimeout(pipeTimeout);
         console.error(`[keymux:${prov.name}] upstream pipe error: ${err.message}`);
         if (!res.writableEnded) res.end();
       });
-      res.on("close", () => { clearTimeout(pipeTimeout); upstream.destroy(); });
+      res.on("close", () => { pipeTimedOut = true; clearTimeout(pipeTimeout); upstream.destroy(); });
 
       // Intercept response: extract usage data + thought signatures for Gemini 3
       const needsIntercept = prov.scorer || proxyPath.includes("chat/completions");
@@ -1288,7 +1319,7 @@ async function handleProxy(req, res, prov, proxyPath) {
 
         let pendingSSE = ""; // Buffer for cross-chunk SSE parsing
         upstream.on("data", (chunk) => {
-          if (!res.writableEnded && !res.destroyed) res.write(chunk);
+          if (!pipeTimedOut && !res.writableEnded && !res.destroyed) res.write(chunk);
           const str = chunk.toString();
 
           // Buffer SSE data for cross-chunk parsing of thought signatures
@@ -1369,10 +1400,17 @@ async function handleRequest(req, res) {
     if (!checkAuth(req, PROXY_KEY)) return sendUnauthorized(res, req);
     const allModels = [];
     const promises = [];
-    for (const [, prov] of providers) {
-      if (prov.mode === "proxy") promises.push(prov.fetchModels().then((m) => m && allModels.push(...m)));
+    for (const [name, prov] of providers) {
+      if (prov.mode === "proxy") {
+        const p = Promise.race([
+          prov.fetchModels(),
+          new Promise((_, rej) => setTimeout(() => rej(new Error("timeout")), 10000)),
+        ]).then((m) => m && allModels.push(...m))
+         .catch((err) => console.error(`[keymux:${name}] /models fetch failed: ${err.message}`));
+        promises.push(p);
+      }
     }
-    await Promise.all(promises);
+    await Promise.allSettled(promises);
     res.writeHead(200, { "content-type": "application/json" });
     return res.end(JSON.stringify({ object: "list", data: allModels }));
   }

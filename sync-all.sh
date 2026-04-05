@@ -3,7 +3,7 @@
 # Called by systemd ExecStartPre before gateway starts
 # Sources .env for PROXY_KEY and provider API keys (needed for native model spec fetching)
 
-set -uo pipefail
+set -euo pipefail
 
 KEYMUX_DIR="$(cd "$(dirname "$0")" && pwd)"
 
@@ -22,7 +22,7 @@ ALLOWED_KEYS="PROXY_KEY ADMIN_KEY PORT GEMINI_KEYS GROQ_KEYS XGROQ_KEYS OPENCLAW
 
 # Source env vars from .env — only whitelisted KEY=VALUE lines
 if [ -f "$KEYMUX_DIR/.env" ]; then
-  # Secure permissions check
+  # Secure permissions check (capture once to avoid TOCTOU)
   envmode="$(stat -c '%a' "$KEYMUX_DIR/.env" 2>/dev/null || stat -f '%Lp' "$KEYMUX_DIR/.env" 2>/dev/null)"
   if [ "$envmode" != "600" ]; then
     echo "[sync-all] WARNING: .env should have mode 600 (got $envmode)"
@@ -46,12 +46,16 @@ if [ -f "$KEYMUX_DIR/.env" ]; then
   done < "$KEYMUX_DIR/.env"
 fi
 
-export KEYMUX_URL="http://127.0.0.1:8002"
+export KEYMUX_URL="http://127.0.0.1:${PORT:-8002}"
 export KEYMUX_PROXY_KEY="${PROXY_KEY:-}"
 
-# Secure temp log file (avoid predictable /tmp paths)
-SYNC_LOG="$(mktemp /tmp/keymux-sync.XXXXXXXX.log)"
-trap 'cat "$SYNC_LOG" 2>/dev/null; rm -f "$SYNC_LOG"' EXIT
+# Clean stale temp files from prior crash-restart loops
+rm -f /tmp/keymux-sync.*.log 2>/dev/null || true
+
+# Secure temp log file — restrictive umask, guard mktemp
+umask 077
+SYNC_LOG="$(mktemp /tmp/keymux-sync.XXXXXXXX.log)" || { echo "[sync-all] FATAL: mktemp failed" >&2; exit 1; }
+trap 'cat "$SYNC_LOG" 2>/dev/null; rm -f "$SYNC_LOG"' EXIT INT TERM
 
 # Iterate agents — handle no matches gracefully
 shopt -s nullglob
@@ -65,12 +69,14 @@ fi
 
 failures=0
 for f in "${agent_files[@]}"; do
-  if ! "$NODE" "$KEYMUX_DIR/sync-models.js" "$f" >> "$SYNC_LOG" 2>&1; then
+  # 30s timeout per agent to prevent hung provider API from blocking startup
+  if ! timeout 30 "$NODE" "$KEYMUX_DIR/sync-models.js" "$f" >> "$SYNC_LOG" 2>&1; then
     echo "[sync-all] WARN: sync failed for $f" >> "$SYNC_LOG"
     failures=$((failures + 1))
   fi
 done
 
 if [ "$failures" -gt 0 ]; then
-  echo "[sync-all] $failures agent(s) failed to sync" >> "$SYNC_LOG"
+  echo "[sync-all] $failures/${#agent_files[@]} agent(s) failed to sync" >> "$SYNC_LOG"
+  exit 1
 fi

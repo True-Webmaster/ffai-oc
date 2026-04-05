@@ -60,35 +60,60 @@ const NATIVE_MODEL_APIS = {
   },
 };
 
+const HTTP_MAX_BODY = 10 * 1024 * 1024; // 10MB response body limit
+const HTTP_WALL_TIMEOUT = 30000; // 30s hard wall-clock deadline
+
 function httpGet(url, headers) {
   return new Promise((resolve, reject) => {
+    let settled = false;
+    const done = (fn, val) => { if (!settled) { settled = true; fn(val); } };
     const mod = url.startsWith("https://") ? https : http;
+    const wallTimer = setTimeout(() => {
+      req.destroy();
+      done(reject, new Error("wall-clock timeout"));
+    }, HTTP_WALL_TIMEOUT);
     const req = mod.get(url, { headers, timeout: 15000 }, (res) => {
       const chunks = [];
-      res.on("data", (c) => chunks.push(c));
-      res.on("error", reject);
+      let totalBytes = 0;
+      res.on("data", (c) => {
+        totalBytes += c.length;
+        if (totalBytes > HTTP_MAX_BODY) {
+          req.destroy();
+          return done(reject, new Error("response too large"));
+        }
+        chunks.push(c);
+      });
+      res.on("error", (e) => { clearTimeout(wallTimer); done(reject, e); });
       res.on("end", () => {
-        if (res.statusCode !== 200) return reject(new Error(`HTTP ${res.statusCode}`));
+        clearTimeout(wallTimer);
+        if (res.statusCode !== 200) return done(reject, new Error(`HTTP ${res.statusCode}`));
         try {
-          resolve(JSON.parse(Buffer.concat(chunks).toString()));
+          done(resolve, JSON.parse(Buffer.concat(chunks).toString()));
         } catch {
-          reject(new Error(`Invalid JSON from ${url.split("?")[0]}`));
+          done(reject, new Error(`Invalid JSON from ${url.split("?")[0]}`));
         }
       });
     });
-    req.on("error", reject);
-    req.on("timeout", () => { req.destroy(new Error("timeout")); });
+    req.on("error", (e) => { clearTimeout(wallTimer); done(reject, e); });
+    req.on("timeout", () => { req.destroy(new Error("socket timeout")); });
   });
 }
 
 // Fetch model specs from a provider's native API (e.g. Gemini's /v1beta/models)
+const NATIVE_SPEC_TIMEOUT = 30000; // 30s aggregate timeout for all native spec fetches
+
 async function fetchNativeModelSpecs(provName, modelIds, apiKey) {
   const api = NATIVE_MODEL_APIS[provName];
   if (!api || !apiKey) return {};
 
   const specs = {};
+  const deadline = Date.now() + NATIVE_SPEC_TIMEOUT;
   const batchSize = 5; // parallel requests, be gentle
   for (let i = 0; i < modelIds.length; i += batchSize) {
+    if (Date.now() > deadline) {
+      console.warn(`[sync] Native spec fetch timeout — got ${Object.keys(specs).length}/${modelIds.length} models`);
+      break;
+    }
     const batch = modelIds.slice(i, i + batchSize);
     const results = await Promise.allSettled(batch.map(async (id) => {
       let url = api.urlTemplate(id);
@@ -125,7 +150,17 @@ async function main() {
   if (KEYMUX_PROXY_KEY) headers.authorization = `Bearer ${KEYMUX_PROXY_KEY}`;
 
   console.log(`[sync] Fetching models from ${KEYMUX_URL}/models ...`);
-  const modelsResp = await httpGet(`${KEYMUX_URL}/models`, headers);
+  let modelsResp;
+  for (let attempt = 0; attempt < 3; attempt++) {
+    try {
+      modelsResp = await httpGet(`${KEYMUX_URL}/models`, headers);
+      break;
+    } catch (err) {
+      if (attempt === 2) throw err;
+      console.warn(`[sync] /models attempt ${attempt + 1} failed: ${err.message}, retrying in 2s...`);
+      await new Promise(r => setTimeout(r, 2000));
+    }
+  }
   const models = modelsResp?.data;
   if (!Array.isArray(models)) throw new Error(`/models response missing "data" array`);
   console.log(`[sync] Got ${models.length} models`);
@@ -149,7 +184,12 @@ async function main() {
   try {
     existing = JSON.parse(fs.readFileSync(MODELS_JSON, "utf8"));
   } catch (err) {
-    console.log(`[sync] No existing ${MODELS_JSON}, creating fresh`);
+    if (err.code === "ENOENT") {
+      console.log(`[sync] No existing ${MODELS_JSON}, creating fresh`);
+    } else {
+      console.error(`[sync] WARNING: Corrupt ${MODELS_JSON}: ${err.message} — backing up and creating fresh`);
+      try { fs.copyFileSync(MODELS_JSON, MODELS_JSON + ".corrupt"); } catch {}
+    }
   }
 
   // 5. Remove old keymux-* providers
@@ -360,6 +400,6 @@ async function main() {
 }
 
 main().catch((err) => {
-  console.error(`[sync] ERROR: ${err.message}`);
+  console.error(`[sync] ERROR: ${err.stack || err.message}`);
   process.exit(1);
 });
