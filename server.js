@@ -138,6 +138,11 @@ class Provider {
     // Circuit breaker state
     this.cbErrors = [];
     this.cbOpenUntil = 0;
+
+    // Models cache
+    this._modelsCache = null;
+    this._modelsCacheExpiry = 0;
+    this.modelsCacheTtl = config.models_cache_ttl ?? 300000; // 5 min default
   }
 
   keyId(k) { return this.keyIds.get(k) || "…" + k.slice(-4); }
@@ -245,6 +250,36 @@ class Provider {
     for (const k of this.keys) {
       const kid = this.keyId(k);
       if (!day.perKey[kid]) day.perKey[kid] = { requests: 0, rateLimited: 0, errors: 0 };
+    }
+  }
+
+  // ── Models discovery (proxy mode) ──────────────────────────────────────────
+  async fetchModels() {
+    if (this.mode !== "proxy" || !this.upstreamUrl) return null;
+    const now = Date.now();
+    if (this._modelsCache && now < this._modelsCacheExpiry) return this._modelsCache;
+
+    const key = this.getNextKey();
+    if (!key) return this._modelsCache || null;
+
+    try {
+      const upstream = await this.forward(key, "GET", "/v1/models", {}, null);
+      const chunks = [];
+      for await (const chunk of upstream) chunks.push(chunk);
+      const body = JSON.parse(Buffer.concat(chunks).toString());
+
+      // Normalize: tag each model with provider name
+      const models = (body.data || []).map((m) => ({
+        ...m,
+        provider: this.name,
+      }));
+
+      this._modelsCache = models;
+      this._modelsCacheExpiry = now + this.modelsCacheTtl;
+      return models;
+    } catch (err) {
+      console.error(`[keymux:${this.name}] models fetch error: ${err.message}`);
+      return this._modelsCache || null;
     }
   }
 
@@ -620,8 +655,31 @@ async function handleProxy(req, res, prov, proxyPath) {
     }
     chunks.push(chunk);
   }
-  const body = Buffer.concat(chunks);
+  let body = Buffer.concat(chunks);
   const headers = { ...req.headers };
+
+  // Sanitize: strip non-standard OpenAI params that upstream providers reject
+  // (e.g. Gemini rejects "store", "reasoning_effort", "thinking", "strict" in tools)
+  if (req.url.includes("chat/completions") && body.length > 0) {
+    try {
+      const p = JSON.parse(body);
+      const allowed = new Set([
+        "model", "messages", "stream", "stream_options",
+        "max_tokens", "max_completion_tokens", "temperature",
+        "tools", "tool_choice", "top_p", "n", "stop",
+        "parallel_tool_calls", "response_format", "seed",
+        "frequency_penalty", "presence_penalty",
+        "logprobs", "top_logprobs", "user",
+      ]);
+      const removed = Object.keys(p).filter(k => !allowed.has(k));
+      if (removed.length > 0) {
+        for (const k of removed) delete p[k];
+        body = Buffer.from(JSON.stringify(p));
+        headers["content-length"] = String(body.length);
+        console.log("[sanitize] stripped non-standard keys:", removed.join(", "));
+      }
+    } catch (e) { /* not JSON, pass through */ }
+  }
 
   // Retry loop
   const attempts = prov.maxRetries + 1;
@@ -693,6 +751,19 @@ async function handleRequest(req, res) {
   if (req.method === "GET" && reqPath === "/health") return handleHealth(req, res);
   if (req.method === "GET" && reqPath === "/stats") return handleStats(req, res);
 
+  // Aggregated models from all proxy-mode providers
+  if (req.method === "GET" && reqPath === "/models") {
+    if (!checkAuth(req, PROXY_KEY)) return sendUnauthorized(res);
+    const allModels = [];
+    const promises = [];
+    for (const [, prov] of providers) {
+      if (prov.mode === "proxy") promises.push(prov.fetchModels().then((m) => m && allModels.push(...m)));
+    }
+    await Promise.all(promises);
+    res.writeHead(200, { "content-type": "application/json" });
+    return res.end(JSON.stringify({ object: "list", data: allModels }));
+  }
+
   // List providers (requires PROXY_KEY)
   if (req.method === "GET" && reqPath === "/providers") {
     if (!checkAuth(req, PROXY_KEY)) return sendUnauthorized(res);
@@ -708,7 +779,7 @@ async function handleRequest(req, res) {
   const match = req.url.match(/^\/([a-z0-9][a-z0-9_-]*)(\/.*)?$/);
   if (!match) {
     res.writeHead(404, { "content-type": "application/json" });
-    return res.end(JSON.stringify({ error: "not found", endpoints: ["/health", "/stats", "/providers", "/:provider/..."] }));
+    return res.end(JSON.stringify({ error: "not found", endpoints: ["/health", "/stats", "/models", "/providers", "/:provider/..."] }));
   }
 
   const providerName = match[1];
