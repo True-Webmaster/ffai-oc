@@ -299,10 +299,12 @@ class KeyScorer {
     const w = this.windows.get(key).totals();
     const currentLearned = this.learnedRpm.get(key) || this.rpmLimit;
 
-    // If we got rate-limited at fewer requests than we thought was the limit,
-    // ratchet down. Use 90% dampening to avoid overreacting to transient errors.
-    if (w.requests > 0 && w.requests < currentLearned) {
-      const newLimit = Math.max(1, Math.min(w.requests, Math.floor(currentLearned * 0.9)));
+    // Only ratchet down if we were actually sending at a meaningful rate.
+    // A 429 at 1-2 RPM is likely a quota/concurrency limit, not an RPM limit.
+    // Floor at 50% of configured limit to avoid collapsing to unusable values.
+    const minLearnedRpm = Math.max(2, Math.ceil(this.rpmLimit * 0.5));
+    if (w.requests > 2 && w.requests < currentLearned) {
+      const newLimit = Math.max(minLearnedRpm, Math.floor(currentLearned * 0.9));
       if (newLimit < currentLearned) {
         this.learnedRpm.set(key, newLimit);
         const kid = this.provider.keyId(key);
