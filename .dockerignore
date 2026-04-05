@@ -5,6 +5,7 @@ data
 .claude
 memory
 *.md
+*.example
 docker-compose.yml
 Dockerfile
 .dockerignore

@@ -8,6 +8,7 @@ services:
     env_file:
       - .env
     volumes:
+      - ./providers.json:/app/providers.json:ro
       - keymux-data:/app/data
     logging:
       driver: json-file
