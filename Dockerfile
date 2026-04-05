@@ -9,6 +9,9 @@ RUN mkdir -p /app/data && chown -R node:node /app
 
 USER node
 
+# Inside Docker, bind to 0.0.0.0 (container-internal; host exposure controlled by docker-compose ports)
+ENV BIND_ADDRESS=0.0.0.0
+
 # Default port — override via PORT env var (EXPOSE is documentation-only)
 EXPOSE 8002
 

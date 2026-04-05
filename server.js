@@ -7,7 +7,7 @@ const path = require("path");
 
 // ── Global Config (env vars) ─────────────────────────────────────────────────
 const PORT = parseInt(process.env.PORT || "8002", 10);
-const BIND_ADDRESS = (process.env.BIND_ADDRESS || "0.0.0.0").trim();
+const BIND_ADDRESS = (process.env.BIND_ADDRESS || "127.0.0.1").trim();
 const PROXY_KEY = (process.env.PROXY_KEY || "").trim();
 const ADMIN_KEY = (process.env.ADMIN_KEY || "").trim();
 const ALERT_WEBHOOK_URL = (process.env.ALERT_WEBHOOK_URL || "").trim();
@@ -34,6 +34,14 @@ const DEFAULTS = {
   cb_window: 60000,
   cb_cooldown: 120000,
   allowed_paths: [],
+  // Smart scoring (all optional — 0 means "unknown/unlimited")
+  rpm_limit: 0,
+  tpm_limit: 0,
+  rpd_limit: 0,
+  key_cb_threshold: 3,
+  key_cb_cooldown: 120000,
+  // Max output tokens cap (0 = no cap; enforced in sanitizer)
+  max_output_tokens: 0,
 };
 
 // Hop-by-hop headers that should not be forwarded
@@ -72,6 +80,278 @@ function buildKeyIds(keys) {
   return ids;
 }
 
+// ── SlidingWindow (memory-efficient bucketed counters) ───────────────────────
+class SlidingWindow {
+  constructor(windowMs = 60000, bucketCount = 60) {
+    this.windowMs = windowMs;
+    this.bucketCount = bucketCount;
+    this.bucketMs = windowMs / bucketCount;
+    this.buckets = Array.from({ length: bucketCount }, () => ({ ts: 0, requests: 0, tokens: 0 }));
+    this.currentIndex = 0;
+  }
+
+  _bucketIndex(now) {
+    return Math.floor((now / this.bucketMs) % this.bucketCount);
+  }
+
+  _rotate(now) {
+    const idx = this._bucketIndex(now);
+    const cutoff = now - this.windowMs;
+    // Clear any expired buckets
+    for (let i = 0; i < this.bucketCount; i++) {
+      if (this.buckets[i].ts < cutoff) {
+        this.buckets[i] = { ts: 0, requests: 0, tokens: 0 };
+      }
+    }
+    // Initialize current bucket if empty
+    if (!this.buckets[idx].ts || this.buckets[idx].ts < cutoff) {
+      this.buckets[idx] = { ts: now, requests: 0, tokens: 0 };
+    }
+    this.currentIndex = idx;
+  }
+
+  record(requests = 1, tokens = 0) {
+    const now = Date.now();
+    this._rotate(now);
+    this.buckets[this.currentIndex].requests += requests;
+    this.buckets[this.currentIndex].tokens += tokens;
+  }
+
+  totals() {
+    const now = Date.now();
+    this._rotate(now);
+    const cutoff = now - this.windowMs;
+    let requests = 0, tokens = 0;
+    for (const b of this.buckets) {
+      if (b.ts >= cutoff) {
+        requests += b.requests;
+        tokens += b.tokens;
+      }
+    }
+    return { requests, tokens };
+  }
+}
+
+// ── Token estimation helpers ────────────────────────────────────────────────
+function estimateInputTokens(body) {
+  if (!body || body.length === 0) return 0;
+  try {
+    const p = JSON.parse(body);
+    if (!Array.isArray(p.messages)) return 0;
+    let chars = 0;
+    for (const msg of p.messages) {
+      if (typeof msg.content === "string") chars += msg.content.length;
+      else if (Array.isArray(msg.content)) {
+        for (const part of msg.content) {
+          if (typeof part === "string") chars += part.length;
+          else if (part?.text) chars += part.text.length;
+          else if (part?.image_url) chars += 1000; // ~256 tokens for a small image
+        }
+      }
+    }
+    // Rough: ~4 chars per token for English
+    return Math.max(1, Math.ceil(chars / 4));
+  } catch { return 0; }
+}
+
+// ── KeyScorer (smart key selection with token-aware scoring) ─────────────────
+class KeyScorer {
+  constructor(provider) {
+    this.provider = provider;
+    this.name = provider.name;
+    this.keys = provider.keys;
+
+    // Per-key state
+    this.windows = new Map();       // key → SlidingWindow (1-minute)
+    this.dailyUsage = new Map();    // key → { date, requests, tokens }
+    this.consecutiveErrors = new Map(); // key → count
+    this.keyCbUntil = new Map();    // key → timestamp (per-key circuit breaker)
+    this.lastUsed = new Map();      // key → timestamp (for LRU tie-breaking)
+    this.learnedRpm = new Map();    // key → learned RPM limit
+
+    // Config
+    this.rpmLimit = provider.rpmLimit || 0;
+    this.tpmLimit = provider.tpmLimit || 0;
+    this.rpdLimit = provider.rpdLimit || 0;
+    this.keyCbThreshold = provider.keyCbThreshold || 3;
+    this.keyCbCooldown = provider.keyCbCooldown || 120000;
+
+    // Initialize per-key state
+    for (const key of this.keys) {
+      this.windows.set(key, new SlidingWindow(60000, 60));
+      this.dailyUsage.set(key, { date: todayKey(), requests: 0, tokens: 0 });
+      this.consecutiveErrors.set(key, 0);
+      this.lastUsed.set(key, 0);
+    }
+  }
+
+  // ── Core: select best available key ──────────────────────────────────────
+  selectKey() {
+    const now = Date.now();
+    const cooldowns = this.provider.cooldowns;
+    let bestKey = null;
+    let bestScore = -Infinity;
+    let allCircuitOpen = true;
+
+    for (const key of this.keys) {
+      // Per-key circuit breaker
+      const cbUntil = this.keyCbUntil.get(key) || 0;
+      if (now < cbUntil) continue;
+      allCircuitOpen = false;
+
+      // Cooldown from 429
+      if ((cooldowns.get(key) || 0) > now) continue;
+
+      const score = this._scoreKey(key, now);
+      if (score > bestScore) {
+        bestScore = score;
+        bestKey = key;
+      }
+    }
+
+    if (allCircuitOpen && this.keys.length > 0) return null;
+    if (!bestKey) return null;
+
+    // Immediately mark as used to prevent TOCTOU (concurrent requests picking same key)
+    this.lastUsed.set(bestKey, Date.now());
+
+    // Log selection (only when multiple keys exist — avoid spam for single-key)
+    if (this.keys.length > 1 && bestScore < 0.5) {
+      const w = this.windows.get(bestKey).totals();
+      const kid = this.provider.keyId(bestKey);
+      console.log(`[keymux:${this.name}:scorer] selected ${kid} score=${bestScore.toFixed(2)} rpm=${w.requests} tpm=${w.tokens}`);
+    }
+
+    return bestKey;
+  }
+
+  _scoreKey(key, now) {
+    const w = this.windows.get(key).totals();
+    const daily = this._getDailyUsage(key);
+
+    // Calculate usage ratios (0.0 = idle, 1.0 = at limit)
+    const effectiveRpm = this.learnedRpm.get(key) || this.rpmLimit;
+    const rpmRatio = effectiveRpm > 0 ? w.requests / effectiveRpm : 0;
+    const tpmRatio = this.tpmLimit > 0 ? w.tokens / this.tpmLimit : 0;
+    const rpdRatio = this.rpdLimit > 0 ? daily.requests / this.rpdLimit : 0;
+
+    // Score = how much capacity remains (1.0 = fully idle, 0.0 = at limit)
+    const usageRatio = Math.max(rpmRatio, tpmRatio, rpdRatio);
+    let score = 1.0 - usageRatio;
+
+    // Penalize heavily if approaching any limit (>90% used)
+    if (usageRatio > 0.9) score -= 2.0;
+
+    // LRU tie-breaking: slightly prefer keys not used recently
+    // Normalize to 0-0.1 range based on time since last use (max 60s)
+    const idleMs = now - (this.lastUsed.get(key) || 0);
+    const idleBonus = Math.min(idleMs / 60000, 1.0) * 0.1;
+    score += idleBonus;
+
+    // Penalize keys with recent consecutive errors (but not CB-open)
+    const consErrors = this.consecutiveErrors.get(key) || 0;
+    if (consErrors > 0) score -= consErrors * 0.3;
+
+    return score;
+  }
+
+  // ── Recording methods ────────────────────────────────────────────────────
+  recordRequest(key, inputTokens = 0) {
+    this.windows.get(key)?.record(1, inputTokens);
+    this.lastUsed.set(key, Date.now());
+    const daily = this._getDailyUsage(key);
+    daily.requests++;
+    daily.tokens += inputTokens;
+  }
+
+  recordResponse(key, outputTokens = 0) {
+    // Add output tokens to the window (0 requests — just token accounting)
+    this.windows.get(key)?.record(0, outputTokens);
+    const daily = this._getDailyUsage(key);
+    daily.tokens += outputTokens;
+  }
+
+  recordSuccess(key) {
+    this.consecutiveErrors.set(key, 0);
+  }
+
+  recordError(key, statusCode = null) {
+    const count = (this.consecutiveErrors.get(key) || 0) + 1;
+    this.consecutiveErrors.set(key, count);
+
+    // Learn from 429s
+    if (statusCode === 429) {
+      this._learnFromRateLimit(key);
+    }
+
+    // Per-key circuit breaker
+    if (count >= this.keyCbThreshold) {
+      const until = Date.now() + this.keyCbCooldown;
+      this.keyCbUntil.set(key, until);
+      const kid = this.provider.keyId(key);
+      console.log(`[keymux:${this.name}:scorer] ${kid} circuit open (${count} consecutive errors), isolating for ${this.keyCbCooldown / 1000}s`);
+    }
+  }
+
+  // ── Adaptive limit learning ──────────────────────────────────────────────
+  _learnFromRateLimit(key) {
+    if (!this.rpmLimit) return; // Only learn if baseline is configured
+    const w = this.windows.get(key).totals();
+    const currentLearned = this.learnedRpm.get(key) || this.rpmLimit;
+
+    // If we got rate-limited at fewer requests than we thought was the limit,
+    // ratchet down. Use 90% dampening to avoid overreacting to transient errors.
+    if (w.requests > 0 && w.requests < currentLearned) {
+      const newLimit = Math.max(1, Math.min(w.requests, Math.floor(currentLearned * 0.9)));
+      if (newLimit < currentLearned) {
+        this.learnedRpm.set(key, newLimit);
+        const kid = this.provider.keyId(key);
+        console.log(`[keymux:${this.name}:scorer] ${kid} learned RPM limit: ${currentLearned} → ${newLimit} (hit 429 at ${w.requests} rpm)`);
+      }
+    }
+  }
+
+  // ── Utility ──────────────────────────────────────────────────────────────
+  _getDailyUsage(key) {
+    const today = todayKey();
+    let daily = this.dailyUsage.get(key);
+    if (!daily || daily.date !== today) {
+      daily = { date: today, requests: 0, tokens: 0 };
+      this.dailyUsage.set(key, daily);
+    }
+    return daily;
+  }
+
+  isAllKeysCircuitOpen() {
+    const now = Date.now();
+    return this.keys.every(k => (this.keyCbUntil.get(k) || 0) > now);
+  }
+
+  keyStatuses() {
+    const now = Date.now();
+    const result = {};
+    for (const key of this.keys) {
+      const kid = this.provider.keyId(key);
+      const w = this.windows.get(key).totals();
+      const daily = this._getDailyUsage(key);
+      const cbUntil = this.keyCbUntil.get(key) || 0;
+      const cooldownUntil = this.provider.cooldowns.get(key) || 0;
+      result[kid] = {
+        score: parseFloat(this._scoreKey(key, now).toFixed(3)),
+        rpm: w.requests,
+        tpm: w.tokens,
+        rpd: daily.requests,
+        learnedRpm: this.learnedRpm.get(key) || null,
+        consecutiveErrors: this.consecutiveErrors.get(key) || 0,
+        perKeyCB: cbUntil > now ? `open (${Math.ceil((cbUntil - now) / 1000)}s)` : "closed",
+        cooldown: cooldownUntil > now ? `${Math.ceil((cooldownUntil - now) / 1000)}s` : null,
+        lastUsedAgo: this.lastUsed.get(key) ? `${Math.ceil((now - this.lastUsed.get(key)) / 1000)}s` : "never",
+      };
+    }
+    return result;
+  }
+}
+
 // ── Provider class (encapsulates all per-provider state) ─────────────────────
 class Provider {
   constructor(name, config) {
@@ -91,6 +371,14 @@ class Provider {
     this.cbWindow = config.cb_window ?? DEFAULTS.cb_window;
     this.cbCooldown = config.cb_cooldown ?? DEFAULTS.cb_cooldown;
     this.allowedPaths = config.allowed_paths || DEFAULTS.allowed_paths;
+
+    // Smart scoring config
+    this.rpmLimit = config.rpm_limit ?? DEFAULTS.rpm_limit;
+    this.tpmLimit = config.tpm_limit ?? DEFAULTS.tpm_limit;
+    this.rpdLimit = config.rpd_limit ?? DEFAULTS.rpd_limit;
+    this.keyCbThreshold = config.key_cb_threshold ?? DEFAULTS.key_cb_threshold;
+    this.keyCbCooldown = config.key_cb_cooldown ?? DEFAULTS.key_cb_cooldown;
+    this.maxOutputTokens = config.max_output_tokens ?? DEFAULTS.max_output_tokens;
 
     // Load keys from env var
     const keysVar = config.keys_var || "API_KEYS";
@@ -139,6 +427,13 @@ class Provider {
     this.cbErrors = [];
     this.cbOpenUntil = 0;
 
+    // Smart key scorer (activates when any rate limit is configured)
+    this.scorer = (this.rpmLimit || this.tpmLimit || this.rpdLimit)
+      ? new KeyScorer(this) : null;
+    if (this.scorer) {
+      console.log(`[keymux:${name}] Smart scoring enabled: rpm=${this.rpmLimit || "∞"} tpm=${this.tpmLimit || "∞"} rpd=${this.rpdLimit || "∞"}`);
+    }
+
     // Models cache
     this._modelsCache = null;
     this._modelsCacheExpiry = 0;
@@ -149,6 +444,10 @@ class Provider {
 
   // ── Key rotation ───────────────────────────────────────────────────────────
   getNextKey() {
+    // Smart scoring path
+    if (this.scorer) return this.scorer.selectKey();
+
+    // Fallback: original round-robin for providers without rate limits configured
     const now = Date.now();
     for (let i = 0; i < this.keys.length; i++) {
       const candidate = this.keys[(this.index + i) % this.keys.length];
@@ -178,6 +477,7 @@ class Provider {
   // ── Circuit breaker ────────────────────────────────────────────────────────
   cbRecordError() {
     if (!this.cbThreshold) return;
+    if (this.cbOpenUntil > Date.now()) return; // Already tripped, avoid duplicate
     const now = Date.now();
     this.cbErrors.push(now);
     this.cbErrors = this.cbErrors.filter((t) => now - t < this.cbWindow);
@@ -198,6 +498,27 @@ class Provider {
   }
 
   cbIsOpen() {
+    // With scorer: global CB only fires when ALL keys are individually broken
+    if (this.scorer) {
+      if (this.scorer.isAllKeysCircuitOpen()) {
+        if (this.cbOpenUntil === 0) {
+          this.cbOpenUntil = Date.now() + this.cbCooldown;
+          const day = getProviderDay(this.name);
+          day.circuitBreaks = (day.circuitBreaks || 0) + 1;
+          statsDirty = true;
+          sendAlert("circuit_open", `[${this.name}] All keys circuit-broken. Blocking for ${this.cbCooldown / 1000}s.`);
+          console.error(`[keymux:${this.name}] ALL KEYS CIRCUIT OPEN — blocking for ${this.cbCooldown / 1000}s`);
+        }
+        return Date.now() < this.cbOpenUntil;
+      }
+      if (this.cbOpenUntil > 0) {
+        this.cbOpenUntil = 0;
+        console.log(`[keymux:${this.name}] Circuit breaker closed — resuming requests`);
+      }
+      return false;
+    }
+
+    // Original global CB (no scorer)
     if (!this.cbThreshold) return false;
     if (Date.now() < this.cbOpenUntil) return true;
     if (this.cbOpenUntil > 0) {
@@ -412,6 +733,47 @@ if (providers.size === 0) {
 }
 
 // ── Auth helpers ─────────────────────────────────────────────────────────────
+// Per-IP rate limiting on auth failures (brute-force protection)
+const AUTH_FAIL_WINDOW = 60000;  // 1 minute
+const AUTH_FAIL_MAX = 10;        // max failures per IP per window
+const AUTH_BLOCK_DURATION = 300000; // 5 minutes block after exceeding
+const authFailures = new Map();  // ip → { count, windowStart, blockedUntil }
+
+function isAuthBlocked(ip) {
+  const entry = authFailures.get(ip);
+  if (!entry) return false;
+  const now = Date.now();
+  if (entry.blockedUntil && now < entry.blockedUntil) return true;
+  if (entry.blockedUntil && now >= entry.blockedUntil) {
+    authFailures.delete(ip);
+    return false;
+  }
+  return false;
+}
+
+function recordAuthFailure(ip) {
+  const now = Date.now();
+  let entry = authFailures.get(ip);
+  if (!entry || (now - entry.windowStart) > AUTH_FAIL_WINDOW) {
+    entry = { count: 0, windowStart: now, blockedUntil: 0 };
+  }
+  entry.count++;
+  if (entry.count >= AUTH_FAIL_MAX) {
+    entry.blockedUntil = now + AUTH_BLOCK_DURATION;
+    console.warn(`[keymux] AUTH: IP ${ip} blocked for ${AUTH_BLOCK_DURATION / 1000}s (${entry.count} failures)`);
+  }
+  authFailures.set(ip, entry);
+}
+
+// Periodic cleanup of stale auth failure entries (every 5 min)
+setInterval(() => {
+  const now = Date.now();
+  for (const [ip, entry] of authFailures) {
+    if (entry.blockedUntil && now >= entry.blockedUntil) authFailures.delete(ip);
+    else if ((now - entry.windowStart) > AUTH_FAIL_WINDOW * 2) authFailures.delete(ip);
+  }
+}, 300000);
+
 function checkAuth(req, requiredKey) {
   if (!requiredKey) return true;
   const auth = req.headers["authorization"] || "";
@@ -423,7 +785,9 @@ function checkAuth(req, requiredKey) {
 // Effective admin key: ADMIN_KEY if set, otherwise fall back to PROXY_KEY
 const EFFECTIVE_ADMIN_KEY = ADMIN_KEY || PROXY_KEY;
 
-function sendUnauthorized(res) {
+function sendUnauthorized(res, req) {
+  const ip = req?.socket?.remoteAddress || "unknown";
+  recordAuthFailure(ip);
   res.writeHead(401, { "content-type": "application/json" });
   res.end(JSON.stringify({ error: "unauthorized" }));
 }
@@ -510,6 +874,12 @@ function handleHealth(req, res) {
         circuitBreaks: day.circuitBreaks || 0,
         perKey: day.perKey,
       };
+      if (prov.scorer) {
+        entry.scoring = {
+          limits: { rpm: prov.rpmLimit || "∞", tpm: prov.tpmLimit || "∞", rpd: prov.rpdLimit || "∞" },
+          keys: prov.scorer.keyStatuses(),
+        };
+      }
     }
 
     providerStatuses[name] = entry;
@@ -517,16 +887,16 @@ function handleHealth(req, res) {
 
   const statusCode = anyDegraded ? 503 : 200;
   res.writeHead(statusCode, { "content-type": "application/json" });
-  res.end(JSON.stringify({
-    status: anyDegraded ? "degraded" : "ok",
-    uptime: formatUptime(now - stats.startedAt),
-    providers: providerStatuses,
-  }));
+  // Only show provider details to authenticated callers
+  const payload = isAdmin
+    ? { status: anyDegraded ? "degraded" : "ok", uptime: formatUptime(now - stats.startedAt), providers: providerStatuses }
+    : { status: anyDegraded ? "degraded" : "ok" };
+  res.end(JSON.stringify(payload));
 }
 
 // ── Route: /stats ────────────────────────────────────────────────────────────
 function handleStats(req, res) {
-  if (!checkAuth(req, EFFECTIVE_ADMIN_KEY)) return sendUnauthorized(res);
+  if (!checkAuth(req, EFFECTIVE_ADMIN_KEY)) return sendUnauthorized(res, req);
   const now = Date.now();
 
   const providerStatuses = {};
@@ -553,7 +923,7 @@ function handleStats(req, res) {
 
 // ── Route: /:provider/key (rotation mode) ────────────────────────────────────
 function handleKeyRequest(req, res, prov) {
-  if (!checkAuth(req, PROXY_KEY)) return sendUnauthorized(res);
+  if (!checkAuth(req, PROXY_KEY)) return sendUnauthorized(res, req);
 
   if (prov.cbIsOpen()) {
     res.writeHead(503, { "content-type": "application/json" });
@@ -575,7 +945,7 @@ function handleKeyRequest(req, res, prov) {
 
 // ── Route: /:provider/key/:id/cooldown (rotation mode) ──────────────────────
 function handleCooldownReport(req, res, prov, keyFragment) {
-  if (!checkAuth(req, PROXY_KEY)) return sendUnauthorized(res);
+  if (!checkAuth(req, PROXY_KEY)) return sendUnauthorized(res, req);
 
   if (keyFragment.length < 4) {
     res.writeHead(400, { "content-type": "application/json" });
@@ -619,7 +989,7 @@ function handleCooldownReport(req, res, prov, keyFragment) {
 
 // ── Route: /:provider/* (proxy mode) ─────────────────────────────────────────
 async function handleProxy(req, res, prov, proxyPath) {
-  if (!checkAuth(req, PROXY_KEY)) return sendUnauthorized(res);
+  if (!checkAuth(req, PROXY_KEY)) return sendUnauthorized(res, req);
 
   if (prov.cbIsOpen()) {
     res.writeHead(503, { "content-type": "application/json" });
@@ -658,11 +1028,14 @@ async function handleProxy(req, res, prov, proxyPath) {
   let body = Buffer.concat(chunks);
   const headers = { ...req.headers };
 
-  // Sanitize: strip non-standard OpenAI params that upstream providers reject
-  // (e.g. Gemini rejects "store", "reasoning_effort", "thinking", "strict" in tools)
+  // Sanitize: strip non-standard OpenAI params and enforce token caps
+  // (e.g. Gemini rejects "store", "reasoning_effort", "thinking"; Groq caps max_completion_tokens)
   if (req.url.includes("chat/completions") && body.length > 0) {
     try {
       const p = JSON.parse(body);
+      let modified = false;
+
+      // Strip non-standard keys
       const allowed = new Set([
         "model", "messages", "stream", "stream_options",
         "max_tokens", "max_completion_tokens", "temperature",
@@ -674,9 +1047,24 @@ async function handleProxy(req, res, prov, proxyPath) {
       const removed = Object.keys(p).filter(k => !allowed.has(k));
       if (removed.length > 0) {
         for (const k of removed) delete p[k];
+        modified = true;
+        console.log("[sanitize] stripped non-standard keys:", removed.join(", "));
+      }
+
+      // Cap max output tokens if provider has a limit
+      if (prov.maxOutputTokens > 0) {
+        for (const field of ["max_tokens", "max_completion_tokens"]) {
+          if (typeof p[field] === "number" && p[field] > prov.maxOutputTokens) {
+            console.log(`[sanitize] capped ${field}: ${p[field]} → ${prov.maxOutputTokens}`);
+            p[field] = prov.maxOutputTokens;
+            modified = true;
+          }
+        }
+      }
+
+      if (modified) {
         body = Buffer.from(JSON.stringify(p));
         headers["content-length"] = String(body.length);
-        console.log("[sanitize] stripped non-standard keys:", removed.join(", "));
       }
     } catch (e) { /* not JSON, pass through */ }
   }
@@ -694,6 +1082,10 @@ async function handleProxy(req, res, prov, proxyPath) {
 
     prov.recordRequest(key);
 
+    // Estimate input tokens for scorer
+    const inputTokens = prov.scorer ? estimateInputTokens(body) : 0;
+    if (prov.scorer) prov.scorer.recordRequest(key, inputTokens);
+
     try {
       const upstream = await prov.forward(key, req.method, proxyPath, headers, body);
 
@@ -703,6 +1095,7 @@ async function handleProxy(req, res, prov, proxyPath) {
           prov.cooldownKey(key, upstream.headers["retry-after"]);
         }
         prov.cbRecordError();
+        if (prov.scorer) prov.scorer.recordError(key, upstream.statusCode);
         if (attempt < attempts - 1) continue;
         res.writeHead(upstream.statusCode, { "content-type": "application/json" });
         return res.end(JSON.stringify({ error: `upstream returned ${upstream.statusCode}`, provider: prov.name }));
@@ -711,8 +1104,10 @@ async function handleProxy(req, res, prov, proxyPath) {
       // Non-retryable response — record success only for 2xx/3xx
       if (upstream.statusCode < 400) {
         prov.cbRecordSuccess();
+        if (prov.scorer) prov.scorer.recordSuccess(key);
       } else {
         prov.cbRecordError();
+        if (prov.scorer) prov.scorer.recordError(key, upstream.statusCode);
       }
       const safeHeaders = filterResponseHeaders(upstream.headers);
       res.writeHead(upstream.statusCode, safeHeaders);
@@ -721,19 +1116,56 @@ async function handleProxy(req, res, prov, proxyPath) {
         upstream.destroy();
         if (!res.writableEnded) res.end();
       }, prov.requestTimeout);
-      upstream.on("end", () => clearTimeout(pipeTimeout));
       upstream.on("error", (err) => {
         clearTimeout(pipeTimeout);
         console.error(`[keymux:${prov.name}] upstream pipe error: ${err.message}`);
         if (!res.writableEnded) res.end();
       });
-      res.on("close", () => { clearTimeout(pipeTimeout); upstream.destroy(); });
-      upstream.pipe(res);
+      res.on("close", () => { clearTimeout(pipeTimeout); upstream.removeAllListeners(); upstream.destroy(); });
+
+      // Token tracking: intercept response to extract usage data
+      if (prov.scorer) {
+        const isStreaming = ((upstream.headers["content-type"] || "").includes("text/event-stream"));
+        let usageExtracted = false;
+        const extractUsage = (str) => {
+          if (usageExtracted) return;
+          try {
+            const lines = str.includes("data: ") ? str.split("\n").filter(l => l.startsWith("data: ")) : [str];
+            for (const line of lines) {
+              const json = line.startsWith("data: ") ? line.slice(6) : line;
+              if (json === "[DONE]") continue;
+              const parsed = JSON.parse(json);
+              if (parsed?.usage) {
+                const outTokens = parsed.usage.completion_tokens || parsed.usage.total_tokens || 0;
+                if (outTokens > 0) {
+                  prov.scorer.recordResponse(key, outTokens);
+                  usageExtracted = true;
+                }
+              }
+            }
+          } catch { /* partial chunk, ignore */ }
+        };
+
+        upstream.on("data", (chunk) => {
+          if (!res.writableEnded && !res.destroyed) res.write(chunk);
+          // Check for usage in response (streaming: SSE chunks; non-streaming: JSON body)
+          const str = chunk.toString();
+          if (str.includes('"usage"')) extractUsage(str);
+        });
+        upstream.on("end", () => {
+          clearTimeout(pipeTimeout);
+          if (!res.writableEnded) res.end();
+        });
+      } else {
+        upstream.on("end", () => clearTimeout(pipeTimeout));
+        upstream.pipe(res);
+      }
       return;
     } catch (err) {
       console.error(`[keymux:${prov.name}] ${prov.keyId(key)} error: ${err.message}`);
       prov.recordError(key);
       prov.cbRecordError();
+      if (prov.scorer) prov.scorer.recordError(key);
       if (attempt === attempts - 1) {
         res.writeHead(502, { "content-type": "application/json" });
         return res.end(JSON.stringify({ error: "upstream error", provider: prov.name }));
@@ -744,6 +1176,13 @@ async function handleProxy(req, res, prov, proxyPath) {
 
 // ── Request router ───────────────────────────────────────────────────────────
 async function handleRequest(req, res) {
+  // Per-IP brute-force protection
+  const clientIp = req.socket?.remoteAddress || "unknown";
+  if (isAuthBlocked(clientIp)) {
+    res.writeHead(429, { "content-type": "application/json" });
+    return res.end(JSON.stringify({ error: "too many auth failures, try again later" }));
+  }
+
   // Strip query string for route matching
   const reqPath = req.url.split("?")[0];
 
@@ -753,7 +1192,7 @@ async function handleRequest(req, res) {
 
   // Aggregated models from all proxy-mode providers
   if (req.method === "GET" && reqPath === "/models") {
-    if (!checkAuth(req, PROXY_KEY)) return sendUnauthorized(res);
+    if (!checkAuth(req, PROXY_KEY)) return sendUnauthorized(res, req);
     const allModels = [];
     const promises = [];
     for (const [, prov] of providers) {
@@ -766,7 +1205,7 @@ async function handleRequest(req, res) {
 
   // List providers (requires PROXY_KEY)
   if (req.method === "GET" && reqPath === "/providers") {
-    if (!checkAuth(req, PROXY_KEY)) return sendUnauthorized(res);
+    if (!checkAuth(req, PROXY_KEY)) return sendUnauthorized(res, req);
     const list = {};
     for (const [name, prov] of providers) {
       list[name] = { mode: prov.mode };
@@ -779,7 +1218,7 @@ async function handleRequest(req, res) {
   const match = req.url.match(/^\/([a-z0-9][a-z0-9_-]*)(\/.*)?$/);
   if (!match) {
     res.writeHead(404, { "content-type": "application/json" });
-    return res.end(JSON.stringify({ error: "not found", endpoints: ["/health", "/stats", "/models", "/providers", "/:provider/..."] }));
+    return res.end(JSON.stringify({ error: "not found" }));
   }
 
   const providerName = match[1];
@@ -801,12 +1240,7 @@ async function handleRequest(req, res) {
     }
 
     res.writeHead(404, { "content-type": "application/json" });
-    return res.end(JSON.stringify({
-      error: "not found",
-      provider: prov.name,
-      mode: "rotation",
-      endpoints: [`/${prov.name}/key`, `/${prov.name}/key/:id/cooldown`],
-    }));
+    return res.end(JSON.stringify({ error: "not found" }));
   }
 
   // Proxy mode — forward subPath to upstream

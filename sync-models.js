@@ -4,6 +4,9 @@
 //
 // Reads KEYMUX_URL and KEYMUX_PROXY_KEY from env (or defaults to localhost:8002).
 // Merges discovered models into the existing models.json, preserving non-KeyMux providers.
+//
+// Context windows and max tokens are fetched dynamically from each provider's API.
+// A static fallback table (MODEL_SPECS) is used only when the API doesn't provide values.
 
 const http = require("http");
 const https = require("https");
@@ -15,40 +18,41 @@ const KEYMUX_PROXY_KEY = process.env.KEYMUX_PROXY_KEY || "";
 const MODELS_JSON = process.argv[2] || path.join(process.env.HOME, ".openclaw", "agents", "main", "agent", "models.json");
 const OPENCLAW_JSON = process.env.OPENCLAW_JSON || path.join(process.env.HOME, ".openclaw", "openclaw.json");
 
-// Known model specs — the OpenAI-compat /models endpoint often omits context_window
-// and max_completion_tokens, so we maintain accurate values here.
-// These override API-reported values (which default to 131072/8192).
-const MODEL_SPECS = {
-  // Gemini
+// Static fallback specs — used ONLY when the provider API doesn't return context_window
+// or max_completion_tokens. Prefer dynamic values from the API.
+const MODEL_SPECS_FALLBACK = {
+  // Gemini (native API returns these, but fallback in case it fails)
   "gemini-2.5-flash":           { contextWindow: 1048576, maxTokens: 65536 },
   "gemini-2.5-pro":             { contextWindow: 1048576, maxTokens: 65536 },
   "gemini-2.0-flash":           { contextWindow: 1048576, maxTokens: 8192 },
-  "gemini-flash-latest":        { contextWindow: 1048576, maxTokens: 65536 },
-  "gemini-flash-lite-latest":   { contextWindow: 1048576, maxTokens: 65536 },
-  "gemini-pro-latest":          { contextWindow: 1048576, maxTokens: 65536 },
-  "gemini-2.5-flash-lite":      { contextWindow: 1048576, maxTokens: 65536 },
-  "gemini-2.5-flash-image":     { contextWindow: 1048576, maxTokens: 65536 },
-  "gemini-3-pro-preview":       { contextWindow: 1048576, maxTokens: 65536 },
-  "gemini-3-flash-preview":     { contextWindow: 1048576, maxTokens: 65536 },
-  "gemini-3.1-pro-preview":     { contextWindow: 1048576, maxTokens: 65536 },
-  "gemini-3.1-flash-lite-preview": { contextWindow: 1048576, maxTokens: 65536 },
-  // Groq
-  "llama-3.3-70b-versatile":    { contextWindow: 131072, maxTokens: 32768 },
-  "llama-3.1-8b-instant":       { contextWindow: 131072, maxTokens: 8192 },
-  "meta-llama/llama-4-scout-17b-16e-instruct": { contextWindow: 131072, maxTokens: 8192 },
-  "qwen/qwen3-32b":             { contextWindow: 131072, maxTokens: 32768 },
-  "moonshotai/kimi-k2-instruct": { contextWindow: 131072, maxTokens: 16384 },
-  "deepseek-r1-distill-llama-70b": { contextWindow: 131072, maxTokens: 16384 },
+  // Groq (API returns these, but fallback for safety)
+  "qwen/qwen3-32b":             { contextWindow: 131072, maxTokens: 4096 },
 };
 
-function fetch(url, headers) {
+// Provider-specific native API endpoints for fetching model details
+// Used when the OpenAI-compat /models endpoint doesn't return context_window
+const NATIVE_MODEL_APIS = {
+  gemini: {
+    // Gemini's native API returns inputTokenLimit and outputTokenLimit
+    urlTemplate: (modelId) =>
+      `https://generativelanguage.googleapis.com/v1beta/models/${modelId}`,
+    authScheme: "query", // ?key=API_KEY
+    parse: (data) => ({
+      contextWindow: data.inputTokenLimit || 0,
+      maxTokens: data.outputTokenLimit || 0,
+    }),
+  },
+};
+
+function httpGet(url, headers) {
   return new Promise((resolve, reject) => {
     const mod = url.startsWith("https") ? https : http;
     const req = mod.get(url, { headers, timeout: 15000 }, (res) => {
       const chunks = [];
       res.on("data", (c) => chunks.push(c));
+      res.on("error", reject);
       res.on("end", () => {
-        if (res.statusCode !== 200) return reject(new Error(`HTTP ${res.statusCode}: ${Buffer.concat(chunks).toString()}`));
+        if (res.statusCode !== 200) return reject(new Error(`HTTP ${res.statusCode}: ${Buffer.concat(chunks).toString().slice(0, 200)}`));
         resolve(JSON.parse(Buffer.concat(chunks).toString()));
       });
     });
@@ -57,17 +61,54 @@ function fetch(url, headers) {
   });
 }
 
+// Fetch model specs from a provider's native API (e.g. Gemini's /v1beta/models)
+async function fetchNativeModelSpecs(provName, modelIds, apiKey) {
+  const api = NATIVE_MODEL_APIS[provName];
+  if (!api || !apiKey) return {};
+
+  const specs = {};
+  const batchSize = 5; // parallel requests, be gentle
+  for (let i = 0; i < modelIds.length; i += batchSize) {
+    const batch = modelIds.slice(i, i + batchSize);
+    const results = await Promise.allSettled(batch.map(async (id) => {
+      let url = api.urlTemplate(id);
+      if (api.authScheme === "query") url += `?key=${apiKey}`;
+      const headers = api.authScheme === "bearer" ? { authorization: `Bearer ${apiKey}` } : {};
+      const data = await httpGet(url, headers);
+      return { id, ...api.parse(data) };
+    }));
+    for (const r of results) {
+      if (r.status === "fulfilled" && r.value.contextWindow > 0) {
+        specs[r.value.id] = { contextWindow: r.value.contextWindow, maxTokens: r.value.maxTokens };
+      }
+    }
+  }
+  return specs;
+}
+
+// Extract first API key from KeyMux env (for native API calls)
+function getFirstApiKey(provName) {
+  const envVars = {
+    gemini: "GEMINI_KEYS",
+    groq: "GROQ_KEYS",
+  };
+  const varName = envVars[provName];
+  if (!varName) return null;
+  const keys = (process.env[varName] || "").split(",").map(k => k.trim()).filter(Boolean);
+  return keys[0] || null;
+}
+
 async function main() {
   // 1. Fetch aggregated models from KeyMux
   const headers = {};
   if (KEYMUX_PROXY_KEY) headers.authorization = `Bearer ${KEYMUX_PROXY_KEY}`;
 
   console.log(`[sync] Fetching models from ${KEYMUX_URL}/models ...`);
-  const { data: models } = await fetch(`${KEYMUX_URL}/models`, headers);
+  const { data: models } = await httpGet(`${KEYMUX_URL}/models`, headers);
   console.log(`[sync] Got ${models.length} models`);
 
   // 2. Fetch providers list
-  const { providers: providerList } = await fetch(`${KEYMUX_URL}/providers`, headers);
+  const { providers: providerList } = await httpGet(`${KEYMUX_URL}/providers`, headers);
   console.log(`[sync] Providers: ${Object.keys(providerList).join(", ")}`);
 
   // 3. Group models by provider
@@ -99,19 +140,28 @@ async function main() {
     // Filter to chat-capable models (skip embedding, imagen, veo, audio, deprecated, etc.)
     const chatModels = provModels.filter((m) => {
       const id = m.id || "";
-      // Non-chat model types
-      if (/embed|imagen|veo|lyria|aqa|tts|audio|live|robotics|nano-banana|generate|clip|gemma|guard|whisper|distil|tool-use/.test(id)) return false;
-      // Deprecated/dead Gemini versions
+      if (/embed|imagen|veo|lyria|aqa|tts|audio|live|robotics|nano-banana|generate|clip|gemma|guard|whisper|distil|tool-use|prompt-guard/.test(id)) return false;
       if (/^models\/gemini-2\.0-flash-(001|lite-001|lite)$/.test(m.id || "")) return false;
       if (/gemini-2\.0-flash-001|gemini-2\.0-flash-lite-001|gemini-2\.0-flash-lite$/.test(id)) return false;
-      // Deep research uses Interactions API, not chat completions
       if (/deep-research/.test(id)) return false;
-      // Computer-use models need special API
       if (/computer-use/.test(id)) return false;
       return true;
     });
 
     if (chatModels.length === 0) continue;
+
+    // Fetch native model specs for providers that don't return context_window in /models
+    const cleanIds = chatModels.map(m => (m.id || "").replace(/^models\//, ""));
+    const needsNativeApi = chatModels.some(m => !m.context_window);
+    let nativeSpecs = {};
+    if (needsNativeApi && NATIVE_MODEL_APIS[provName]) {
+      const apiKey = getFirstApiKey(provName);
+      if (apiKey) {
+        console.log(`[sync] Fetching native model specs for ${provName} (${cleanIds.length} models)...`);
+        nativeSpecs = await fetchNativeModelSpecs(provName, cleanIds, apiKey);
+        console.log(`[sync]   Got specs for ${Object.keys(nativeSpecs).length} models`);
+      }
+    }
 
     existing.providers[`keymux-${provName}`] = {
       baseUrl: `${KEYMUX_URL}/${provName}/v1`,
@@ -127,20 +177,26 @@ async function main() {
       },
       models: chatModels.map((m) => {
         const cleanId = (m.id || "").replace(/^models\//, "");
-        // Gemini's OpenAI-compat endpoint does NOT support the "thinking" parameter —
-        // it returns 400 "Unknown name thinking". Gemini handles thinking internally.
-        // Groq also doesn't support it. So always false for keymux models.
         const isReasoning = false;
         const supportsImage = /gemini|flash|pro|vision|grok-4-fast|llama-4|scout/.test(cleanId);
-        const specs = MODEL_SPECS[cleanId] || {};
+
+        // Resolution order for context window and max tokens:
+        // 1. Native API (most accurate — e.g. Gemini's inputTokenLimit)
+        // 2. OpenAI-compat /models response (e.g. Groq returns context_window)
+        // 3. Static fallback table (last resort)
+        const native = nativeSpecs[cleanId] || {};
+        const fallback = MODEL_SPECS_FALLBACK[cleanId] || {};
+        const contextWindow = native.contextWindow || m.context_window || fallback.contextWindow || 131072;
+        const maxTokens = native.maxTokens || m.max_completion_tokens || fallback.maxTokens || 8192;
+
         return {
           id: cleanId,
           name: `${cleanId} (${provName})`,
           reasoning: isReasoning,
           input: supportsImage ? ["text", "image"] : ["text"],
           cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
-          contextWindow: specs.contextWindow || m.context_window || 131072,
-          maxTokens: specs.maxTokens || m.max_completion_tokens || 8192,
+          contextWindow,
+          maxTokens,
         };
       }),
     };
