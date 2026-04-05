@@ -30,8 +30,9 @@ const KEYMUX_URL = (process.env.KEYMUX_URL || "http://127.0.0.1:8002").replace(/
   }
 })();
 const KEYMUX_PROXY_KEY = process.env.KEYMUX_PROXY_KEY || "";
-const MODELS_JSON = process.argv[2] || path.join(process.env.HOME, ".openclaw", "agents", "main", "agent", "models.json");
-const OPENCLAW_JSON = process.env.OPENCLAW_JSON || path.join(process.env.HOME, ".openclaw", "openclaw.json");
+const HOME = process.env.HOME || require("os").homedir();
+const MODELS_JSON = process.argv[2] || path.join(HOME, ".openclaw", "agents", "main", "agent", "models.json");
+const OPENCLAW_JSON = process.env.OPENCLAW_JSON || path.join(HOME, ".openclaw", "openclaw.json");
 
 // Static fallback specs — used ONLY when the provider API doesn't return context_window
 // or max_completion_tokens. Prefer dynamic values from the API.
@@ -61,14 +62,18 @@ const NATIVE_MODEL_APIS = {
 
 function httpGet(url, headers) {
   return new Promise((resolve, reject) => {
-    const mod = url.startsWith("https") ? https : http;
+    const mod = url.startsWith("https://") ? https : http;
     const req = mod.get(url, { headers, timeout: 15000 }, (res) => {
       const chunks = [];
       res.on("data", (c) => chunks.push(c));
       res.on("error", reject);
       res.on("end", () => {
         if (res.statusCode !== 200) return reject(new Error(`HTTP ${res.statusCode}`));
-        resolve(JSON.parse(Buffer.concat(chunks).toString()));
+        try {
+          resolve(JSON.parse(Buffer.concat(chunks).toString()));
+        } catch {
+          reject(new Error(`Invalid JSON from ${url.split("?")[0]}`));
+        }
       });
     });
     req.on("error", reject);
@@ -120,11 +125,15 @@ async function main() {
   if (KEYMUX_PROXY_KEY) headers.authorization = `Bearer ${KEYMUX_PROXY_KEY}`;
 
   console.log(`[sync] Fetching models from ${KEYMUX_URL}/models ...`);
-  const { data: models } = await httpGet(`${KEYMUX_URL}/models`, headers);
+  const modelsResp = await httpGet(`${KEYMUX_URL}/models`, headers);
+  const models = modelsResp?.data;
+  if (!Array.isArray(models)) throw new Error(`/models response missing "data" array`);
   console.log(`[sync] Got ${models.length} models`);
 
   // 2. Fetch providers list
-  const { providers: providerList } = await httpGet(`${KEYMUX_URL}/providers`, headers);
+  const providersResp = await httpGet(`${KEYMUX_URL}/providers`, headers);
+  const providerList = providersResp?.providers;
+  if (!providerList || typeof providerList !== "object") throw new Error(`/providers response missing "providers" object`);
   console.log(`[sync] Providers: ${Object.keys(providerList).join(", ")}`);
 
   // 3. Group models by provider
@@ -241,7 +250,7 @@ async function main() {
       models: chatModels.map((m) => {
         const cleanId = (m.id || "").replace(/^models\//, "");
         const isReasoning = false;
-        const supportsImage = /gemini|flash|pro|vision|grok-4-fast|llama-4|scout|gemma-[34]/.test(cleanId);
+        const supportsImage = /\bgemini\b|\bflash\b|\bvision\b|\bgrok-4-fast\b|\bllama-4\b|\bscout\b|\bgemma-[34]/.test(cleanId);
 
         // Resolution order for context window and max tokens:
         // 1. Native API (most accurate — e.g. Gemini's inputTokenLimit)
@@ -299,6 +308,7 @@ async function main() {
   }
 
   // 8. Write updated models.json (atomic)
+  fs.mkdirSync(path.dirname(MODELS_JSON), { recursive: true });
   const tmp = MODELS_JSON + ".tmp";
   fs.writeFileSync(tmp, JSON.stringify(existing, null, 2));
   fs.renameSync(tmp, MODELS_JSON);

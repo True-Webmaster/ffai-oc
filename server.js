@@ -886,8 +886,10 @@ function checkAuth(req, requiredKey) {
   if (!requiredKey) return true;
   const auth = req.headers["authorization"] || "";
   const expected = `Bearer ${requiredKey}`;
-  if (auth.length !== expected.length) return false;
-  return crypto.timingSafeEqual(Buffer.from(auth), Buffer.from(expected));
+  const authBuf = Buffer.from(auth);
+  const expectedBuf = Buffer.from(expected);
+  if (authBuf.length !== expectedBuf.length) return false;
+  return crypto.timingSafeEqual(authBuf, expectedBuf);
 }
 
 // Admin key: ADMIN_KEY only — no fallback to PROXY_KEY (separation of concerns).
@@ -1117,7 +1119,7 @@ async function handleProxy(req, res, prov, proxyPath) {
 
   // Pre-check Content-Length
   const declaredLength = parseInt(req.headers["content-length"], 10);
-  if (declaredLength > prov.maxBodySize) {
+  if (Number.isFinite(declaredLength) && declaredLength > prov.maxBodySize) {
     res.writeHead(413, { "content-type": "application/json" });
     return res.end(JSON.stringify({ error: "request body too large", max: prov.maxBodySize }));
   }
@@ -1240,7 +1242,8 @@ async function handleProxy(req, res, prov, proxyPath) {
             let errMsg = "unknown";
             try {
               const raw = Buffer.concat(errChunks).toString();
-              const parsed = JSON.parse(raw.startsWith("[") ? raw.slice(1, -1) : raw);
+              let parsed = JSON.parse(raw);
+              if (Array.isArray(parsed)) parsed = parsed[0] || {};
               errMsg = parsed?.error?.message || parsed?.error?.status || "unparseable";
             } catch { errMsg = "non-JSON response"; }
             let reqSummary = "";
@@ -1266,7 +1269,7 @@ async function handleProxy(req, res, prov, proxyPath) {
         console.error(`[keymux:${prov.name}] upstream pipe error: ${err.message}`);
         if (!res.writableEnded) res.end();
       });
-      res.on("close", () => { clearTimeout(pipeTimeout); upstream.removeAllListeners(); upstream.destroy(); });
+      res.on("close", () => { clearTimeout(pipeTimeout); upstream.destroy(); });
 
       // Intercept response: extract usage data + thought signatures for Gemini 3
       const needsIntercept = prov.scorer || proxyPath.includes("chat/completions");
@@ -1454,16 +1457,18 @@ function shutdown(signal) {
 process.on("SIGTERM", () => shutdown("SIGTERM"));
 process.on("SIGINT", () => shutdown("SIGINT"));
 
+// Pre-flight safety checks (before server accepts connections)
+const hasRotation = [...providers.values()].some((p) => p.mode === "rotation");
+if (!PROXY_KEY && hasRotation) {
+  console.error(`[keymux] FATAL: PROXY_KEY is required when any provider uses rotation mode (raw keys are exposed)`);
+  process.exit(1);
+}
+
 server.listen(PORT, BIND_ADDRESS, () => {
   console.log(`[keymux] KeyMux on ${BIND_ADDRESS}:${PORT} with ${providers.size} provider(s)`);
   for (const [name, prov] of providers) {
     const ks = prov.keyStatus();
     console.log(`[keymux]   /${name} [${prov.mode}] ${ks.total} key(s)${prov.mode === "proxy" ? ` → ${prov.expectedHost}` : ""} (auth: ${prov.authScheme})`);
-  }
-  const hasRotation = [...providers.values()].some((p) => p.mode === "rotation");
-  if (!PROXY_KEY && hasRotation) {
-    console.error(`[keymux] FATAL: PROXY_KEY is required when any provider uses rotation mode (raw keys are exposed)`);
-    process.exit(1);
   }
   if (!PROXY_KEY && !ADMIN_KEY) console.warn(`[keymux] WARNING: No PROXY_KEY or ADMIN_KEY set — endpoints are open to anyone with network access`);
   if (PROXY_KEY) console.log(`[keymux] Inbound auth: PROXY_KEY required`);

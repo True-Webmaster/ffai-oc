@@ -3,7 +3,7 @@
 # Called by systemd ExecStartPre before gateway starts
 # Sources .env for PROXY_KEY and provider API keys (needed for native model spec fetching)
 
-set -euo pipefail
+set -uo pipefail
 
 KEYMUX_DIR="$(cd "$(dirname "$0")" && pwd)"
 
@@ -23,16 +23,21 @@ ALLOWED_KEYS="PROXY_KEY ADMIN_KEY PORT GEMINI_KEYS GROQ_KEYS XGROQ_KEYS OPENCLAW
 # Source env vars from .env — only whitelisted KEY=VALUE lines
 if [ -f "$KEYMUX_DIR/.env" ]; then
   # Secure permissions check
-  if [ "$(stat -c '%a' "$KEYMUX_DIR/.env" 2>/dev/null || stat -f '%Lp' "$KEYMUX_DIR/.env" 2>/dev/null)" != "600" ]; then
-    echo "[sync-all] WARNING: .env should have mode 600 (got $(stat -c '%a' "$KEYMUX_DIR/.env" 2>/dev/null || stat -f '%Lp' "$KEYMUX_DIR/.env" 2>/dev/null))"
+  envmode="$(stat -c '%a' "$KEYMUX_DIR/.env" 2>/dev/null || stat -f '%Lp' "$KEYMUX_DIR/.env" 2>/dev/null)"
+  if [ "$envmode" != "600" ]; then
+    echo "[sync-all] WARNING: .env should have mode 600 (got $envmode)"
   fi
 
   while IFS='=' read -r key value; do
     # Skip comments and empty lines
     case "$key" in \#*|"") continue;; esac
-    # Strip surrounding quotes from value
-    value="${value%\"}" ; value="${value#\"}"
-    value="${value%\'}" ; value="${value#\'}"
+    # Trim whitespace from key
+    key="$(echo "$key" | tr -d '[:space:]')"
+    # Single-pass quote stripping: detect opening quote character
+    case "$value" in
+      \"*) value="${value#\"}"; value="${value%\"}" ;;
+      \'*) value="${value#\'}"; value="${value%\'}" ;;
+    esac
     # Only export whitelisted keys
     case " $ALLOWED_KEYS " in
       *" $key "*) export "$key=$value" ;;
@@ -46,11 +51,26 @@ export KEYMUX_PROXY_KEY="${PROXY_KEY:-}"
 
 # Secure temp log file (avoid predictable /tmp paths)
 SYNC_LOG="$(mktemp /tmp/keymux-sync.XXXXXXXX.log)"
-trap 'rm -f "$SYNC_LOG"' EXIT
+trap 'cat "$SYNC_LOG" 2>/dev/null; rm -f "$SYNC_LOG"' EXIT
 
-for f in ~/.openclaw/agents/*/agent/models.json; do
-  "$NODE" "$KEYMUX_DIR/sync-models.js" "$f" >> "$SYNC_LOG" 2>&1
+# Iterate agents — handle no matches gracefully
+shopt -s nullglob
+agent_files=(~/.openclaw/agents/*/agent/models.json)
+shopt -u nullglob
+
+if [ ${#agent_files[@]} -eq 0 ]; then
+  echo "[sync-all] No agent models.json files found"
+  exit 0
+fi
+
+failures=0
+for f in "${agent_files[@]}"; do
+  if ! "$NODE" "$KEYMUX_DIR/sync-models.js" "$f" >> "$SYNC_LOG" 2>&1; then
+    echo "[sync-all] WARN: sync failed for $f" >> "$SYNC_LOG"
+    failures=$((failures + 1))
+  fi
 done
 
-# Show output for systemd journal / manual runs
-cat "$SYNC_LOG"
+if [ "$failures" -gt 0 ]; then
+  echo "[sync-all] $failures agent(s) failed to sync" >> "$SYNC_LOG"
+fi
