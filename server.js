@@ -440,9 +440,119 @@ class Provider {
     this._modelsCache = null;
     this._modelsCacheExpiry = 0;
     this.modelsCacheTtl = config.models_cache_ttl ?? 300000; // 5 min default
+
+    // Thought signature cache for Gemini 3 tool calling
+    // Maps tool_call.id → { signature, ts } with TTL-based eviction
+    this._thoughtSigCache = new Map();
+    this._thoughtSigMaxSize = 500;
+    this._thoughtSigTtl = 300000; // 5 min
   }
 
   keyId(k) { return this.keyIds.get(k) || "…" + k.slice(-4); }
+
+  // ── Thought signature cache (Gemini 3 tool calling) ─────────────────────────
+  cacheThoughtSignature(toolCallId, signature) {
+    if (!toolCallId || !signature) return;
+    // Evict oldest if at capacity
+    if (this._thoughtSigCache.size >= this._thoughtSigMaxSize) {
+      const oldest = this._thoughtSigCache.keys().next().value;
+      this._thoughtSigCache.delete(oldest);
+    }
+    this._thoughtSigCache.set(toolCallId, { signature, ts: Date.now() });
+  }
+
+  getThoughtSignature(toolCallId) {
+    if (!toolCallId) return null;
+    const entry = this._thoughtSigCache.get(toolCallId);
+    if (!entry) return null;
+    if (Date.now() - entry.ts > this._thoughtSigTtl) {
+      this._thoughtSigCache.delete(toolCallId);
+      return null;
+    }
+    return entry.signature;
+  }
+
+  // Extract and cache thought signatures from a parsed response object
+  extractThoughtSignatures(parsed) {
+    const choices = parsed?.choices;
+    if (!Array.isArray(choices)) return;
+    for (const choice of choices) {
+      const toolCalls = choice?.delta?.tool_calls || choice?.message?.tool_calls;
+      if (!Array.isArray(toolCalls)) continue;
+      for (const tc of toolCalls) {
+        const sig = tc?.extra_content?.google?.thought_signature;
+        if (sig && tc.id) {
+          this.cacheThoughtSignature(tc.id, sig);
+          console.log(`[keymux:${this.name}] cached thought_signature for tool_call ${tc.id.slice(0, 12)}…`);
+        }
+      }
+    }
+  }
+
+  // Inject cached thought signatures into outbound request messages.
+  // For tool_calls without a cached signature, compact them into text
+  // (Gemini 3 rejects tool_calls missing signatures in conversation history)
+  injectThoughtSignatures(messages) {
+    if (!Array.isArray(messages)) return false;
+    let modified = false;
+
+    for (let i = 0; i < messages.length; i++) {
+      const msg = messages[i];
+      if (msg.role !== "assistant" || !Array.isArray(msg.tool_calls)) continue;
+
+      let allHaveSig = true;
+      for (const tc of msg.tool_calls) {
+        if (!tc.id) { allHaveSig = false; continue; }
+        // Try to inject from cache
+        if (!tc.extra_content?.google?.thought_signature) {
+          const sig = this.getThoughtSignature(tc.id);
+          if (sig) {
+            if (!tc.extra_content) tc.extra_content = {};
+            if (!tc.extra_content.google) tc.extra_content.google = {};
+            tc.extra_content.google.thought_signature = sig;
+            modified = true;
+          } else {
+            allHaveSig = false;
+          }
+        }
+      }
+
+      // If any tool_calls still lack signatures, compact this assistant message
+      // and its corresponding tool result messages into plain text
+      if (!allHaveSig) {
+        const toolNames = msg.tool_calls.map(tc => tc.function?.name || "tool").join(", ");
+        const textContent = msg.content || "";
+        // Replace assistant message with text summary
+        messages[i] = {
+          role: "assistant",
+          content: textContent || `[Used tools: ${toolNames}]`,
+        };
+        modified = true;
+
+        // Also compact the following tool result messages into user messages
+        let j = i + 1;
+        while (j < messages.length && messages[j].role === "tool") {
+          const toolMsg = messages[j];
+          const resultPreview = typeof toolMsg.content === "string"
+            ? toolMsg.content.slice(0, 500)
+            : JSON.stringify(toolMsg.content).slice(0, 500);
+          messages[j] = {
+            role: "user",
+            content: `[Tool result from ${toolMsg.name || "tool"}: ${resultPreview}]`,
+          };
+          j++;
+          modified = true;
+        }
+
+        console.log(`[keymux:${this.name}] compacted tool_call round at msg[${i}] (${toolNames}) — no cached signatures`);
+      }
+    }
+
+    if (modified) {
+      console.log(`[keymux:${this.name}] thought_signature processing: modified conversation history`);
+    }
+    return modified;
+  }
 
   // ── Key rotation ───────────────────────────────────────────────────────────
   getNextKey() {
@@ -628,10 +738,12 @@ class Provider {
       const fwdHeaders = {};
       for (const [k, v] of Object.entries(headers)) {
         const lk = k.toLowerCase();
-        if (!HOP_HEADERS.has(lk) && lk !== "authorization" && lk !== this.authHeader) {
+        if (!HOP_HEADERS.has(lk) && lk !== "authorization" && lk !== this.authHeader && lk !== "accept-encoding") {
           fwdHeaders[k] = v;
         }
       }
+      // Request uncompressed responses so we can inspect/modify response bodies
+      fwdHeaders["accept-encoding"] = "identity";
 
       if (this.authScheme === "bearer") {
         fwdHeaders.authorization = `Bearer ${key}`;
@@ -1037,10 +1149,21 @@ async function handleProxy(req, res, prov, proxyPath) {
       const p = JSON.parse(body);
       let modified = false;
 
+      // Normalize max_completion_tokens → max_tokens BEFORE stripping
+      // Gemini's OpenAI-compat API only understands max_tokens, not max_completion_tokens
+      if (typeof p.max_completion_tokens === "number" && p.max_completion_tokens > 0) {
+        if (typeof p.max_tokens !== "number" || p.max_tokens <= 0) {
+          p.max_tokens = p.max_completion_tokens;
+        }
+        delete p.max_completion_tokens;
+        modified = true;
+        console.log(`[sanitize] normalized max_completion_tokens → max_tokens: ${p.max_tokens}`);
+      }
+
       // Strip non-standard keys
       const allowed = new Set([
         "model", "messages", "stream", "stream_options",
-        "max_tokens", "max_completion_tokens", "temperature",
+        "max_tokens", "temperature",
         "tools", "tool_choice", "top_p", "n", "stop",
         "parallel_tool_calls", "response_format", "seed",
         "frequency_penalty", "presence_penalty",
@@ -1055,13 +1178,16 @@ async function handleProxy(req, res, prov, proxyPath) {
 
       // Cap max output tokens if provider has a limit
       if (prov.maxOutputTokens > 0) {
-        for (const field of ["max_tokens", "max_completion_tokens"]) {
-          if (typeof p[field] === "number" && p[field] > prov.maxOutputTokens) {
-            console.log(`[sanitize] capped ${field}: ${p[field]} → ${prov.maxOutputTokens}`);
-            p[field] = prov.maxOutputTokens;
-            modified = true;
-          }
+        if (typeof p.max_tokens === "number" && p.max_tokens > prov.maxOutputTokens) {
+          console.log(`[sanitize] capped max_tokens: ${p.max_tokens} → ${prov.maxOutputTokens}`);
+          p.max_tokens = prov.maxOutputTokens;
+          modified = true;
         }
+      }
+
+      // Inject cached thought signatures for Gemini 3 tool calling
+      if (prov.injectThoughtSignatures(p.messages)) {
+        modified = true;
       }
 
       if (modified) {
@@ -1110,6 +1236,37 @@ async function handleProxy(req, res, prov, proxyPath) {
       } else {
         prov.cbRecordError();
         if (prov.scorer) prov.scorer.recordError(key, upstream.statusCode);
+        // Debug: log 400 errors with upstream response body and request summary
+        if (upstream.statusCode === 400) {
+          const zlib = require("zlib");
+          const errChunks = [];
+          upstream.on("data", (c) => errChunks.push(c));
+          upstream.on("end", () => {
+            const raw = Buffer.concat(errChunks);
+            const encoding = upstream.headers["content-encoding"] || "";
+            const decode = (buf) => {
+              try {
+                if (encoding === "gzip") return zlib.gunzipSync(buf).toString();
+                if (encoding === "br") return zlib.brotliDecompressSync(buf).toString();
+                if (encoding === "deflate") return zlib.inflateSync(buf).toString();
+                return buf.toString();
+              } catch { return buf.toString(); }
+            };
+            const errBody = decode(raw).slice(0, 2000);
+            let reqSummary = "";
+            try {
+              const p = JSON.parse(body);
+              reqSummary = `model=${p.model} keys=[${Object.keys(p).join(",")}] msgs=${(p.messages||[]).length} tools=${(p.tools||[]).length}`;
+              // Log last message role for tool-call debugging
+              const lastMsg = p.messages?.[p.messages.length - 1];
+              if (lastMsg) reqSummary += ` lastMsg.role=${lastMsg.role}`;
+            } catch {}
+            console.error(`[keymux:${prov.name}] 400 from upstream — ${errBody}`);
+            console.error(`[keymux:${prov.name}] 400 request summary: ${reqSummary}`);
+          });
+          res.writeHead(400, { "content-type": "application/json" });
+          return res.end(JSON.stringify({ error: "upstream returned 400" }));
+        }
       }
       const safeHeaders = filterResponseHeaders(upstream.headers);
       res.writeHead(upstream.statusCode, safeHeaders);
@@ -1125,37 +1282,63 @@ async function handleProxy(req, res, prov, proxyPath) {
       });
       res.on("close", () => { clearTimeout(pipeTimeout); upstream.removeAllListeners(); upstream.destroy(); });
 
-      // Token tracking: intercept response to extract usage data
-      if (prov.scorer) {
-        const isStreaming = ((upstream.headers["content-type"] || "").includes("text/event-stream"));
+      // Intercept response: extract usage data + thought signatures for Gemini 3
+      const needsIntercept = prov.scorer || proxyPath.includes("chat/completions");
+      if (needsIntercept) {
         let usageExtracted = false;
-        const extractUsage = (str) => {
-          if (usageExtracted) return;
-          try {
-            const lines = str.includes("data: ") ? str.split("\n").filter(l => l.startsWith("data: ")) : [str];
-            for (const line of lines) {
-              const json = line.startsWith("data: ") ? line.slice(6) : line;
-              if (json === "[DONE]") continue;
-              const parsed = JSON.parse(json);
-              if (parsed?.usage) {
-                const outTokens = parsed.usage.completion_tokens || parsed.usage.total_tokens || 0;
-                if (outTokens > 0) {
-                  prov.scorer.recordResponse(key, outTokens);
-                  usageExtracted = true;
+        const parseSSELines = (str) => {
+          const results = [];
+          const lines = str.includes("data: ") ? str.split("\n").filter(l => l.startsWith("data: ")) : [str];
+          for (const line of lines) {
+            const json = line.startsWith("data: ") ? line.slice(6) : line;
+            if (json === "[DONE]" || !json.trim()) continue;
+            try { results.push(JSON.parse(json)); } catch {}
+          }
+          return results;
+        };
+
+        let pendingSSE = ""; // Buffer for cross-chunk SSE parsing
+        upstream.on("data", (chunk) => {
+          if (!res.writableEnded && !res.destroyed) res.write(chunk);
+          const str = chunk.toString();
+
+          // Buffer SSE data for cross-chunk parsing of thought signatures
+          pendingSSE += str;
+          // Process complete SSE lines (delimited by \n\n)
+          const parts = pendingSSE.split("\n\n");
+          pendingSSE = parts.pop() || ""; // Keep incomplete last part
+          for (const part of parts) {
+            if (!part.trim()) continue;
+            // Extract thought signatures from tool_call responses
+            if (part.includes('"tool_calls"') || part.includes('"thought_signature"')) {
+              for (const parsed of parseSSELines(part)) {
+                prov.extractThoughtSignatures(parsed);
+              }
+            }
+            // Extract usage for scorer
+            if (prov.scorer && !usageExtracted && part.includes('"usage"')) {
+              for (const parsed of parseSSELines(part)) {
+                if (parsed?.usage) {
+                  const outTokens = parsed.usage.completion_tokens || parsed.usage.total_tokens || 0;
+                  if (outTokens > 0) {
+                    prov.scorer.recordResponse(key, outTokens);
+                    usageExtracted = true;
+                  }
                 }
               }
             }
-          } catch { /* partial chunk, ignore */ }
-        };
-
-        upstream.on("data", (chunk) => {
-          if (!res.writableEnded && !res.destroyed) res.write(chunk);
-          // Check for usage in response (streaming: SSE chunks; non-streaming: JSON body)
-          const str = chunk.toString();
-          if (str.includes('"usage"')) extractUsage(str);
+          }
         });
         upstream.on("end", () => {
           clearTimeout(pipeTimeout);
+          // Process any remaining buffered SSE data
+          if (pendingSSE.trim()) {
+            if (pendingSSE.includes('"tool_calls"') || pendingSSE.includes('"thought_signature"')) {
+              for (const parsed of parseSSELines(pendingSSE)) {
+                prov.extractThoughtSignatures(parsed);
+              }
+            }
+          }
           if (!res.writableEnded) res.end();
         });
       } else {
