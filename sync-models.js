@@ -14,6 +14,21 @@ const fs = require("fs");
 const path = require("path");
 
 const KEYMUX_URL = (process.env.KEYMUX_URL || "http://127.0.0.1:8002").replace(/\/+$/, "");
+
+// Security: Enforce HTTPS for non-loopback KEYMUX_URL
+(function enforceHttps() {
+  try {
+    const u = new (require("url").URL)(KEYMUX_URL);
+    const isLoopback = ["127.0.0.1", "localhost", "::1", "[::1]"].includes(u.hostname);
+    if (!isLoopback && u.protocol !== "https:") {
+      console.error(`[sync] FATAL: Remote KEYMUX_URL must use HTTPS (got ${u.protocol}//${u.hostname})`);
+      process.exit(1);
+    }
+  } catch (e) {
+    console.error(`[sync] FATAL: Invalid KEYMUX_URL: ${KEYMUX_URL}`);
+    process.exit(1);
+  }
+})();
 const KEYMUX_PROXY_KEY = process.env.KEYMUX_PROXY_KEY || "";
 const MODELS_JSON = process.argv[2] || path.join(process.env.HOME, ".openclaw", "agents", "main", "agent", "models.json");
 const OPENCLAW_JSON = process.env.OPENCLAW_JSON || path.join(process.env.HOME, ".openclaw", "openclaw.json");
@@ -36,7 +51,7 @@ const NATIVE_MODEL_APIS = {
     // Gemini's native API returns inputTokenLimit and outputTokenLimit
     urlTemplate: (modelId) =>
       `https://generativelanguage.googleapis.com/v1beta/models/${modelId}`,
-    authScheme: "query", // ?key=API_KEY
+    authScheme: "header", // x-goog-api-key header (not query param — avoids key in URL/logs)
     parse: (data) => ({
       contextWindow: data.inputTokenLimit || 0,
       maxTokens: data.outputTokenLimit || 0,
@@ -52,7 +67,7 @@ function httpGet(url, headers) {
       res.on("data", (c) => chunks.push(c));
       res.on("error", reject);
       res.on("end", () => {
-        if (res.statusCode !== 200) return reject(new Error(`HTTP ${res.statusCode}: ${Buffer.concat(chunks).toString().slice(0, 200)}`));
+        if (res.statusCode !== 200) return reject(new Error(`HTTP ${res.statusCode}`));
         resolve(JSON.parse(Buffer.concat(chunks).toString()));
       });
     });
@@ -72,8 +87,9 @@ async function fetchNativeModelSpecs(provName, modelIds, apiKey) {
     const batch = modelIds.slice(i, i + batchSize);
     const results = await Promise.allSettled(batch.map(async (id) => {
       let url = api.urlTemplate(id);
-      if (api.authScheme === "query") url += `?key=${apiKey}`;
-      const headers = api.authScheme === "bearer" ? { authorization: `Bearer ${apiKey}` } : {};
+      const headers = {};
+      if (api.authScheme === "header") headers["x-goog-api-key"] = apiKey;
+      else if (api.authScheme === "bearer") headers.authorization = `Bearer ${apiKey}`;
       const data = await httpGet(url, headers);
       return { id, ...api.parse(data) };
     }));

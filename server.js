@@ -529,18 +529,12 @@ class Provider {
         };
         modified = true;
 
-        // Also compact the following tool result messages into user messages
+        // Remove the following tool result messages (they reference tool_calls
+        // that no longer exist after compaction). Splice them out entirely rather
+        // than rewriting to "user" role (which would be a privilege escalation risk).
         let j = i + 1;
         while (j < messages.length && messages[j].role === "tool") {
-          const toolMsg = messages[j];
-          const resultPreview = typeof toolMsg.content === "string"
-            ? toolMsg.content.slice(0, 500)
-            : JSON.stringify(toolMsg.content).slice(0, 500);
-          messages[j] = {
-            role: "user",
-            content: `[Tool result from ${toolMsg.name || "tool"}: ${resultPreview}]`,
-          };
-          j++;
+          messages.splice(j, 1);
           modified = true;
         }
 
@@ -896,8 +890,9 @@ function checkAuth(req, requiredKey) {
   return crypto.timingSafeEqual(Buffer.from(auth), Buffer.from(expected));
 }
 
-// Effective admin key: ADMIN_KEY if set, otherwise fall back to PROXY_KEY
-const EFFECTIVE_ADMIN_KEY = ADMIN_KEY || PROXY_KEY;
+// Admin key: ADMIN_KEY only — no fallback to PROXY_KEY (separation of concerns).
+// If ADMIN_KEY is unset, admin endpoints (/stats, /health details) are inaccessible.
+const EFFECTIVE_ADMIN_KEY = ADMIN_KEY;
 
 function sendUnauthorized(res, req) {
   const ip = req?.socket?.remoteAddress || "unknown";
@@ -960,7 +955,7 @@ function formatUptime(ms) {
 // ── Route: /health ───────────────────────────────────────────────────────────
 function handleHealth(req, res) {
   const now = Date.now();
-  const isAdmin = checkAuth(req, EFFECTIVE_ADMIN_KEY);
+  const isAdmin = EFFECTIVE_ADMIN_KEY && checkAuth(req, EFFECTIVE_ADMIN_KEY);
   let anyDegraded = false;
 
   const providerStatuses = {};
@@ -1010,7 +1005,7 @@ function handleHealth(req, res) {
 
 // ── Route: /stats ────────────────────────────────────────────────────────────
 function handleStats(req, res) {
-  if (!checkAuth(req, EFFECTIVE_ADMIN_KEY)) return sendUnauthorized(res, req);
+  if (!EFFECTIVE_ADMIN_KEY || !checkAuth(req, EFFECTIVE_ADMIN_KEY)) return sendUnauthorized(res, req);
   const now = Date.now();
 
   const providerStatuses = {};
@@ -1238,31 +1233,22 @@ async function handleProxy(req, res, prov, proxyPath) {
         if (prov.scorer) prov.scorer.recordError(key, upstream.statusCode);
         // Debug: log 400 errors with upstream response body and request summary
         if (upstream.statusCode === 400) {
-          const zlib = require("zlib");
           const errChunks = [];
           upstream.on("data", (c) => errChunks.push(c));
           upstream.on("end", () => {
-            const raw = Buffer.concat(errChunks);
-            const encoding = upstream.headers["content-encoding"] || "";
-            const decode = (buf) => {
-              try {
-                if (encoding === "gzip") return zlib.gunzipSync(buf).toString();
-                if (encoding === "br") return zlib.brotliDecompressSync(buf).toString();
-                if (encoding === "deflate") return zlib.inflateSync(buf).toString();
-                return buf.toString();
-              } catch { return buf.toString(); }
-            };
-            const errBody = decode(raw).slice(0, 2000);
+            // Scrub: only log structured error fields, not raw response bodies
+            let errMsg = "unknown";
+            try {
+              const raw = Buffer.concat(errChunks).toString();
+              const parsed = JSON.parse(raw.startsWith("[") ? raw.slice(1, -1) : raw);
+              errMsg = parsed?.error?.message || parsed?.error?.status || "unparseable";
+            } catch { errMsg = "non-JSON response"; }
             let reqSummary = "";
             try {
               const p = JSON.parse(body);
-              reqSummary = `model=${p.model} keys=[${Object.keys(p).join(",")}] msgs=${(p.messages||[]).length} tools=${(p.tools||[]).length}`;
-              // Log last message role for tool-call debugging
-              const lastMsg = p.messages?.[p.messages.length - 1];
-              if (lastMsg) reqSummary += ` lastMsg.role=${lastMsg.role}`;
+              reqSummary = `model=${p.model} msgs=${(p.messages||[]).length} tools=${(p.tools||[]).length}`;
             } catch {}
-            console.error(`[keymux:${prov.name}] 400 from upstream — ${errBody}`);
-            console.error(`[keymux:${prov.name}] 400 request summary: ${reqSummary}`);
+            console.error(`[keymux:${prov.name}] 400 from upstream: ${errMsg} | ${reqSummary}`);
           });
           res.writeHead(400, { "content-type": "application/json" });
           return res.end(JSON.stringify({ error: "upstream returned 400" }));
@@ -1481,6 +1467,7 @@ server.listen(PORT, BIND_ADDRESS, () => {
   }
   if (!PROXY_KEY && !ADMIN_KEY) console.warn(`[keymux] WARNING: No PROXY_KEY or ADMIN_KEY set — endpoints are open to anyone with network access`);
   if (PROXY_KEY) console.log(`[keymux] Inbound auth: PROXY_KEY required`);
-  if (EFFECTIVE_ADMIN_KEY) console.log(`[keymux] Admin auth: ${ADMIN_KEY ? "ADMIN_KEY" : "PROXY_KEY (fallback)"} required for /stats`);
+  if (EFFECTIVE_ADMIN_KEY) console.log(`[keymux] Admin auth: ADMIN_KEY required for /stats`);
+  else console.warn(`[keymux] WARNING: ADMIN_KEY not set — /stats and /health details are disabled`);
   console.log(`[keymux] Stats: ${fs.existsSync(STATS_FILE) ? "loaded from disk" : "fresh start"}`);
 });
