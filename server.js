@@ -44,10 +44,22 @@ const DEFAULTS = {
   max_output_tokens: 0,
 };
 
-// Hop-by-hop headers that should not be forwarded
-const HOP_HEADERS = new Set([
-  "connection", "keep-alive", "transfer-encoding", "te",
-  "trailer", "upgrade", "proxy-authorization", "proxy-connection",
+// Allowlisted outbound request headers (to upstream providers)
+const FORWARD_REQUEST_HEADERS = new Set([
+  "content-type", "content-length", "user-agent", "accept",
+  "x-request-id", "x-stainless-lang", "x-stainless-os",
+  "x-stainless-arch", "x-stainless-runtime", "x-stainless-runtime-version",
+  "x-stainless-package-version", "x-stainless-retry-count",
+]);
+
+// Allowlisted response headers (back to client)
+const FORWARD_RESPONSE_HEADERS = new Set([
+  "content-type", "content-length", "content-encoding",
+  "cache-control", "date", "vary", "access-control-allow-origin",
+  "x-request-id", "x-ratelimit-limit-requests", "x-ratelimit-limit-tokens",
+  "x-ratelimit-remaining-requests", "x-ratelimit-remaining-tokens",
+  "x-ratelimit-reset-requests", "x-ratelimit-reset-tokens",
+  "retry-after", "openai-processing-ms", "openai-model", "openai-organization",
 ]);
 
 // ── Load providers.json ──────────────────────────────────────────────────────
@@ -741,7 +753,7 @@ class Provider {
       const fwdHeaders = {};
       for (const [k, v] of Object.entries(headers)) {
         const lk = k.toLowerCase();
-        if (!HOP_HEADERS.has(lk) && lk !== "authorization" && lk !== this.authHeader && lk !== "accept-encoding") {
+        if (FORWARD_REQUEST_HEADERS.has(lk)) {
           fwdHeaders[k] = v;
         }
       }
@@ -960,7 +972,7 @@ function sendAlert(event, message) {
 function filterResponseHeaders(rawHeaders) {
   const filtered = {};
   for (const [k, v] of Object.entries(rawHeaders)) {
-    if (!HOP_HEADERS.has(k.toLowerCase())) {
+    if (FORWARD_RESPONSE_HEADERS.has(k.toLowerCase())) {
       filtered[k] = v;
     }
   }
