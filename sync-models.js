@@ -90,13 +90,13 @@ function httpGet(url, headers) {
         if (res.statusCode !== 200) return done(reject, new Error(`HTTP ${res.statusCode}`));
         try {
           done(resolve, JSON.parse(Buffer.concat(chunks).toString()));
-        } catch {
-          done(reject, new Error(`Invalid JSON from ${url.split("?")[0]}`));
+        } catch (parseErr) {
+          done(reject, new Error(`Invalid JSON from ${url.split("?")[0]}: ${parseErr.message}`));
         }
       });
     });
     req.on("error", (e) => { clearTimeout(wallTimer); done(reject, e); });
-    req.on("timeout", () => { req.destroy(new Error("socket timeout")); });
+    req.on("timeout", () => { clearTimeout(wallTimer); req.destroy(new Error("socket timeout")); });
   });
 }
 
@@ -127,6 +127,8 @@ async function fetchNativeModelSpecs(provName, modelIds, apiKey) {
     for (const r of results) {
       if (r.status === "fulfilled" && r.value.contextWindow > 0) {
         specs[r.value.id] = { contextWindow: r.value.contextWindow, maxTokens: r.value.maxTokens };
+      } else if (r.status === "rejected") {
+        console.warn(`[sync] Native spec fetch failed: ${r.reason?.message || r.reason}`);
       }
     }
   }
@@ -199,7 +201,9 @@ async function main() {
       console.log(`[sync] No existing ${MODELS_JSON}, creating fresh`);
     } else {
       console.error(`[sync] WARNING: Corrupt ${MODELS_JSON}: ${err.message} — backing up and creating fresh`);
-      try { fs.copyFileSync(MODELS_JSON, MODELS_JSON + ".corrupt"); } catch {}
+      try { fs.copyFileSync(MODELS_JSON, MODELS_JSON + ".corrupt"); } catch (backupErr) {
+        console.error(`[sync] ERROR: Failed to backup corrupt file: ${backupErr.message}`);
+      }
     }
   }
   if (!existing.providers) existing.providers = {};
@@ -407,7 +411,7 @@ async function main() {
     fs.renameSync(ocTmp, OPENCLAW_JSON);
     console.log(`[sync] Updated ${OPENCLAW_JSON} (${Object.keys(ocProviders).length} providers, ${allowlistCount} models in allowlist)`);
   } catch (err) {
-    console.log(`[sync] Skipping openclaw.json update: ${err.message}`);
+    console.error(`[sync] Failed to update openclaw.json: ${err.code || ""} ${err.message}`);
   }
 }
 

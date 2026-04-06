@@ -32,8 +32,10 @@ ALLOWED_KEYS="PROXY_KEY ADMIN_KEY PORT GEMINI_KEYS GROQ_KEYS XGROQ_KEYS OPENCLAW
 if [ -f "$KEYMUX_DIR/.env" ]; then
   # Secure permissions check (capture once, default on failure to avoid set -e abort)
   envmode="$(stat -c '%a' "$KEYMUX_DIR/.env" 2>/dev/null || stat -f '%Lp' "$KEYMUX_DIR/.env" 2>/dev/null || echo "unknown")"
-  if [ "$envmode" != "600" ]; then
-    echo "[sync-all] WARNING: .env should have mode 600 (got $envmode)"
+  if [ "$envmode" = "unknown" ]; then
+    echo "[sync-all] WARNING: Could not determine .env permissions (file may have been removed)" >&2
+  elif [ "$envmode" != "600" ]; then
+    echo "[sync-all] WARNING: .env should have mode 600 (got $envmode)" >&2
   fi
 
   while IFS='=' read -r key value; do
@@ -41,13 +43,13 @@ if [ -f "$KEYMUX_DIR/.env" ]; then
     case "$key" in \#*|"") continue;; esac
     # Trim whitespace from key
     key="$(echo "$key" | tr -d '[:space:]')"
+    # Trim leading/trailing whitespace from value first
+    value="$(echo "$value" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
     # Single-pass quote stripping: detect opening quote character
     case "$value" in
       \"*) value="${value#\"}"; value="${value%\"}" ;;
       \'*) value="${value#\'}"; value="${value%\'}" ;;
     esac
-    # Trim leading/trailing whitespace from value
-    value="$(echo "$value" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
     # Only export whitelisted keys
     case " $ALLOWED_KEYS " in
       *" $key "*) export "$key=$value" ;;
@@ -65,8 +67,8 @@ rm -f /tmp/keymux-sync.*.log 2>/dev/null || true
 # Secure temp log file — restrictive umask, guard mktemp
 umask 077
 SYNC_LOG="$(mktemp /tmp/keymux-sync.XXXXXXXX.log)" || { echo "[sync-all] FATAL: mktemp failed" >&2; exit 1; }
-# Only cat log on failure; always clean up
-trap 'exitcode=$?; if [ "$exitcode" -ne 0 ]; then cat "$SYNC_LOG" 2>/dev/null; fi; rm -f "$SYNC_LOG"' EXIT INT TERM
+# Cleanup temp file on exit (log display handled explicitly below)
+trap 'rm -f "$SYNC_LOG"' EXIT INT TERM
 
 # Guard HOME for tilde expansion
 if [ -z "${HOME:-}" ]; then
@@ -80,20 +82,23 @@ agent_files=("$HOME"/.openclaw/agents/*/agent/models.json)
 shopt -u nullglob
 
 if [ ${#agent_files[@]} -eq 0 ]; then
-  echo "[sync-all] No agent models.json files found"
+  echo "[sync-all] No agent models.json files found" >&2
   exit 0
 fi
 
 failures=0
 for f in "${agent_files[@]}"; do
+  # Extract agent name from path for log attribution
+  agent_name="$(echo "$f" | sed 's|.*/agents/\([^/]*\)/.*|\1|')"
+  echo "--- [sync-all] agent=$agent_name ---" >> "$SYNC_LOG"
   # 30s timeout per agent to prevent hung provider API from blocking startup
   exitcode=0
   timeout 30 "$NODE" "$KEYMUX_DIR/sync-models.js" "$f" >> "$SYNC_LOG" 2>&1 || exitcode=$?
   if [ "$exitcode" -ne 0 ]; then
     if [ "$exitcode" -eq 124 ]; then
-      echo "[sync-all] WARN: sync TIMED OUT for $f" >> "$SYNC_LOG"
+      echo "[sync-all] WARN: sync TIMED OUT for agent=$agent_name" >> "$SYNC_LOG"
     else
-      echo "[sync-all] WARN: sync failed (exit $exitcode) for $f" >> "$SYNC_LOG"
+      echo "[sync-all] WARN: sync failed (exit $exitcode) for agent=$agent_name" >> "$SYNC_LOG"
     fi
     failures=$((failures + 1))
   fi

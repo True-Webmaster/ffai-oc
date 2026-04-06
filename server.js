@@ -799,7 +799,8 @@ function loadStats() {
     const parsed = JSON.parse(raw);
     if (!parsed.startedAt || !parsed.days || typeof parsed.days !== "object") throw new Error("invalid");
     return parsed;
-  } catch {
+  } catch (err) {
+    if (err.code !== "ENOENT") console.warn(`[keymux] stats file corrupt or invalid, starting fresh: ${err.message}`);
     return { startedAt: Date.now(), days: {} };
   }
 }
@@ -955,9 +956,9 @@ function sendAlert(event, message) {
         headers: { "content-type": "application/json", "content-length": String(Buffer.byteLength(payload)) },
         timeout: ALERT_TIMEOUT,
       });
-      req.on("response", (res) => res.resume());
+      req.on("response", (r) => { r.resume(); if (r.statusCode >= 400) console.warn(`[keymux] alert webhook non-2xx: ${r.statusCode}`); });
       req.on("error", (err) => console.error(`[keymux] alert webhook error: ${err.message}`));
-      req.on("timeout", () => req.destroy());
+      req.on("timeout", () => { console.warn(`[keymux] alert webhook timeout (${ALERT_TIMEOUT}ms)`); req.destroy(); });
       req.write(payload);
       req.end();
     } catch (err) {
@@ -1137,6 +1138,10 @@ function handleCooldownReport(req, res, prov, keyFragment) {
 async function handleProxy(req, res, prov, proxyPath) {
   if (!checkAuth(req, PROXY_KEY)) return sendUnauthorized(res, req);
 
+  // Request correlation ID for log grouping
+  const rid = crypto.randomBytes(4).toString("hex");
+  const rlog = (level, msg) => console[level](`[keymux:${prov.name}:${rid}] ${msg}`);
+
   if (prov.cbIsOpen()) {
     res.writeHead(503, { "content-type": "application/json" });
     return res.end(JSON.stringify({ error: "circuit breaker open", provider: prov.name }));
@@ -1282,31 +1287,42 @@ async function handleProxy(req, res, prov, proxyPath) {
           let errBytes = 0;
           upstream.on("data", (c) => {
             errBytes += c.length;
-            if (errBytes <= 8192) errChunks.push(c); // Cap error body read
+            if (errBytes <= 8192) errChunks.push(c);
           });
           upstream.on("end", () => {
-            upstream.destroy(); // Ensure socket is released
-            // Scrub: only log structured error fields, not raw response bodies
+            upstream.destroy();
             let errMsg = "unknown";
+            let clientError = { error: "upstream returned 400" };
             try {
               const raw = Buffer.concat(errChunks).toString();
               let parsed = JSON.parse(raw);
               if (Array.isArray(parsed)) parsed = parsed[0] || {};
               errMsg = parsed?.error?.message || parsed?.error?.status || "unparseable";
+              // Forward sanitized error detail to client
+              if (parsed?.error) clientError = { error: { message: errMsg, type: parsed.error.type || "upstream_error" } };
             } catch { errMsg = "non-JSON response"; }
             let reqSummary = "";
             try {
               const p = JSON.parse(body);
               reqSummary = `model=${p.model} msgs=${(p.messages||[]).length} tools=${(p.tools||[]).length}`;
             } catch {}
-            console.error(`[keymux:${prov.name}] 400 from upstream: ${errMsg} | ${reqSummary}`);
+            rlog("error", `400 from upstream: ${errMsg} | ${reqSummary}`);
+            if (!res.headersSent) {
+              res.writeHead(400, { "content-type": "application/json" });
+              res.end(JSON.stringify(clientError));
+            }
           });
-          upstream.on("error", () => {}); // Swallow errors during drain
-          res.writeHead(400, { "content-type": "application/json" });
-          return res.end(JSON.stringify({ error: "upstream returned 400" }));
+          upstream.on("error", (e) => rlog("error", `400 drain error: ${e.message}`));
+          // If end fires before we can write headers (shouldn't happen), guard with headersSent
+          if (!res.headersSent) {
+            // Wait for end handler to send response
+            return;
+          }
+          return;
         }
       }
       const safeHeaders = filterResponseHeaders(upstream.headers);
+      safeHeaders["x-request-id"] = rid;
       res.writeHead(upstream.statusCode, safeHeaders);
       // Use longer timeout for streaming responses (SSE can take minutes)
       const isStreaming = (upstream.headers["content-type"] || "").includes("text/event-stream");
@@ -1314,14 +1330,14 @@ async function handleProxy(req, res, prov, proxyPath) {
       let pipeTimedOut = false;
       const pipeTimeout = setTimeout(() => {
         pipeTimedOut = true;
-        console.error(`[keymux:${prov.name}] response pipe timeout (${streamTimeout / 1000}s) — destroying upstream`);
+        rlog("error", `response pipe timeout (${streamTimeout / 1000}s) — destroying upstream`);
         upstream.destroy();
         if (!res.writableEnded) res.end();
       }, streamTimeout);
       upstream.on("error", (err) => {
         pipeTimedOut = true;
         clearTimeout(pipeTimeout);
-        console.error(`[keymux:${prov.name}] upstream pipe error: ${err.message}`);
+        rlog("error", `upstream pipe error: ${err.message}`);
         if (!res.writableEnded) res.end();
       });
       res.on("close", () => { pipeTimedOut = true; clearTimeout(pipeTimeout); upstream.destroy(); });
@@ -1397,7 +1413,7 @@ async function handleProxy(req, res, prov, proxyPath) {
       }
       return;
     } catch (err) {
-      console.error(`[keymux:${prov.name}] ${prov.keyId(key)} error: ${err.message}`);
+      rlog("error", `${prov.keyId(key)} error: ${err.message}`);
       prov.recordError(key);
       prov.cbRecordError();
       if (prov.scorer) prov.scorer.recordError(key);
@@ -1496,7 +1512,7 @@ async function handleRequest(req, res) {
 // ── Server ───────────────────────────────────────────────────────────────────
 const server = http.createServer((req, res) => {
   handleRequest(req, res).catch((err) => {
-    console.error(`[keymux] unhandled: ${err.message}`);
+    console.error(`[keymux] unhandled: ${req.method} ${req.url} — ${err.stack || err.message}`);
     if (!res.headersSent) {
       res.writeHead(500, { "content-type": "application/json" });
       res.end(JSON.stringify({ error: "internal error" }));
@@ -1506,10 +1522,10 @@ const server = http.createServer((req, res) => {
 
 // Global error handlers
 process.on("unhandledRejection", (err) => {
-  console.error(`[keymux] unhandled rejection: ${err?.message || err}`);
+  console.error(`[keymux] unhandled rejection: ${err?.stack || err?.message || err}`);
 });
 process.on("uncaughtException", (err) => {
-  console.error(`[keymux] uncaught exception: ${err.message}`);
+  console.error(`[keymux] uncaught exception: ${err.stack || err.message}`);
   flushStats();
   process.exit(1);
 });
