@@ -19,7 +19,7 @@ const KEYMUX_URL = (process.env.KEYMUX_URL || "http://127.0.0.1:8002").replace(/
 (function enforceHttps() {
   try {
     const u = new (require("url").URL)(KEYMUX_URL);
-    const isLoopback = ["127.0.0.1", "localhost", "::1", "[::1]"].includes(u.hostname);
+    const isLoopback = ["127.0.0.1", "localhost", "::1"].includes(u.hostname);
     if (!isLoopback && u.protocol !== "https:") {
       console.error(`[sync] FATAL: Remote KEYMUX_URL must use HTTPS (got ${u.protocol}//${u.hostname})`);
       process.exit(1);
@@ -314,8 +314,8 @@ async function main() {
         // 3. Static fallback table (last resort)
         const native = nativeSpecs[cleanId] || {};
         const fallback = MODEL_SPECS_FALLBACK[cleanId] || {};
-        const contextWindow = native.contextWindow || m.context_window || fallback.contextWindow || 131072;
-        const maxTokens = native.maxTokens || m.max_completion_tokens || fallback.maxTokens || 8192;
+        const contextWindow = native.contextWindow ?? m.context_window ?? fallback.contextWindow ?? 131072;
+        const maxTokens = native.maxTokens ?? m.max_completion_tokens ?? fallback.maxTokens ?? 8192;
 
         return {
           id: cleanId,
@@ -347,7 +347,13 @@ async function main() {
       console.log(`[sync] keymux-${provName}: dropped ${beforeCount - afterCount} models below minimums`);
     }
 
-    console.log(`[sync] keymux-${provName}: ${afterCount} chat models`);
+    // Remove empty provider entries (all models filtered out)
+    if (afterCount === 0) {
+      console.warn(`[sync] keymux-${provName}: all models below minimums, removing provider entry`);
+      delete existing.providers[`keymux-${provName}`];
+    } else {
+      console.log(`[sync] keymux-${provName}: ${afterCount} chat models`);
+    }
   }
 
   // 7. Build provider entry for openclaw.json (structured apiKey format)
@@ -412,6 +418,7 @@ async function main() {
     console.log(`[sync] Updated ${OPENCLAW_JSON} (${Object.keys(ocProviders).length} providers, ${allowlistCount} models in allowlist)`);
   } catch (err) {
     console.error(`[sync] Failed to update openclaw.json: ${err.code || ""} ${err.message}`);
+    process.exitCode = 1;
   }
 }
 

@@ -33,18 +33,20 @@ if [ -f "$KEYMUX_DIR/.env" ]; then
   # Secure permissions check (capture once, default on failure to avoid set -e abort)
   envmode="$(stat -c '%a' "$KEYMUX_DIR/.env" 2>/dev/null || stat -f '%Lp' "$KEYMUX_DIR/.env" 2>/dev/null || echo "unknown")"
   if [ "$envmode" = "unknown" ]; then
-    echo "[sync-all] WARNING: Could not determine .env permissions (file may have been removed)" >&2
+    echo "[sync-all] FATAL: Could not determine .env permissions (file may have been removed)" >&2
+    exit 1
   elif [ "$envmode" != "600" ]; then
-    echo "[sync-all] WARNING: .env should have mode 600 (got $envmode)" >&2
+    echo "[sync-all] FATAL: .env must have mode 600 (got $envmode) — run: chmod 600 .env" >&2
+    exit 1
   fi
 
   while IFS='=' read -r key value; do
     # Skip comments and empty lines
     case "$key" in \#*|"") continue;; esac
     # Trim whitespace from key
-    key="$(echo "$key" | tr -d '[:space:]')"
+    key="$(printf '%s' "$key" | tr -d '[:space:]')"
     # Trim leading/trailing whitespace from value first
-    value="$(echo "$value" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
+    value="$(printf '%s' "$value" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
     # Single-pass quote stripping: detect opening quote character
     case "$value" in
       \"*) value="${value#\"}"; value="${value%\"}" ;;
@@ -61,6 +63,10 @@ fi
 export KEYMUX_URL="http://127.0.0.1:${PORT:-8002}"
 export KEYMUX_PROXY_KEY="${PROXY_KEY:-}"
 
+if [ -z "$KEYMUX_PROXY_KEY" ]; then
+  echo "[sync-all] WARNING: PROXY_KEY is empty — sync requests will have no auth" >&2
+fi
+
 # Clean stale temp files from prior crash-restart loops
 rm -f /tmp/keymux-sync.*.log 2>/dev/null || true
 
@@ -74,6 +80,12 @@ trap 'rm -f "$SYNC_LOG"' EXIT INT TERM
 if [ -z "${HOME:-}" ]; then
   echo "[sync-all] FATAL: HOME is not set" >&2
   exit 1
+fi
+
+# Verify timeout command exists (may be absent in minimal Docker images)
+TIMEOUT_CMD="$(command -v timeout 2>/dev/null || true)"
+if [ -z "$TIMEOUT_CMD" ]; then
+  echo "[sync-all] WARNING: timeout command not found, running without per-agent timeouts" >&2
 fi
 
 # Iterate agents — handle no matches gracefully
@@ -93,7 +105,11 @@ for f in "${agent_files[@]}"; do
   echo "--- [sync-all] agent=$agent_name ---" >> "$SYNC_LOG"
   # 30s timeout per agent to prevent hung provider API from blocking startup
   exitcode=0
-  timeout 30 "$NODE" "$KEYMUX_DIR/sync-models.js" "$f" >> "$SYNC_LOG" 2>&1 || exitcode=$?
+  if [ -n "$TIMEOUT_CMD" ]; then
+    "$TIMEOUT_CMD" 30 "$NODE" "$KEYMUX_DIR/sync-models.js" "$f" >> "$SYNC_LOG" 2>&1 || exitcode=$?
+  else
+    "$NODE" "$KEYMUX_DIR/sync-models.js" "$f" >> "$SYNC_LOG" 2>&1 || exitcode=$?
+  fi
   if [ "$exitcode" -ne 0 ]; then
     if [ "$exitcode" -eq 124 ]; then
       echo "[sync-all] WARN: sync TIMED OUT for agent=$agent_name" >> "$SYNC_LOG"

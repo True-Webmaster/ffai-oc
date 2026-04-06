@@ -9,6 +9,10 @@ const path = require("path");
 const PORT = parseInt(process.env.PORT || "8002", 10);
 const BIND_ADDRESS = (process.env.BIND_ADDRESS || "127.0.0.1").trim();
 const PROXY_KEY = (process.env.PROXY_KEY || "").trim();
+if (process.env.PROXY_KEY && !PROXY_KEY) {
+  console.error("[keymux] FATAL: PROXY_KEY is set but empty after trimming whitespace");
+  process.exit(1);
+}
 const ADMIN_KEY = (process.env.ADMIN_KEY || "").trim();
 const ALERT_WEBHOOK_URL = (process.env.ALERT_WEBHOOK_URL || "").trim();
 const ALERT_TIMEOUT = parseInt(process.env.ALERT_TIMEOUT || "5000", 10);
@@ -204,6 +208,7 @@ class KeyScorer {
     let bestKey = null;
     let bestScore = -Infinity;
     let allCircuitOpen = true;
+    let anyKeyAvailable = false;
 
     for (const key of this.keys) {
       // Per-key circuit breaker
@@ -213,6 +218,7 @@ class KeyScorer {
 
       // Cooldown from 429
       if ((cooldowns.get(key) || 0) > now) continue;
+      anyKeyAvailable = true;
 
       const score = this._scoreKey(key, now);
       if (score > bestScore) {
@@ -222,7 +228,7 @@ class KeyScorer {
     }
 
     if (allCircuitOpen && this.keys.length > 0) return null;
-    if (!bestKey) return null;
+    if (!anyKeyAvailable || !bestKey) return null;
 
     // Immediately mark as used to prevent TOCTOU (concurrent requests picking same key)
     this.lastUsed.set(bestKey, Date.now());
@@ -579,8 +585,17 @@ class Provider {
   }
 
   cooldownKey(key, retryAfterHeader) {
+    let raw;
     const parsed = parseInt(retryAfterHeader, 10);
-    const raw = (Number.isFinite(parsed) && parsed >= 0) ? parsed : this.defaultCooldown;
+    if (Number.isFinite(parsed) && parsed >= 0) {
+      raw = parsed;
+    } else if (retryAfterHeader) {
+      // Try HTTP-date format (e.g. "Thu, 01 Dec 2025 16:00:00 GMT")
+      const httpDate = Date.parse(retryAfterHeader);
+      raw = Number.isFinite(httpDate) ? Math.max(0, Math.ceil((httpDate - Date.now()) / 1000)) : this.defaultCooldown;
+    } else {
+      raw = this.defaultCooldown;
+    }
     const secs = Math.max(0, Math.min(raw, this.maxCooldown));
     this.cooldowns.set(key, Date.now() + secs * 1000);
     console.log(`[keymux:${this.name}] ${this.keyId(key)} rate-limited, cooling ${secs}s`);
@@ -734,13 +749,26 @@ class Provider {
   // ── Forwarding (proxy mode) ────────────────────────────────────────────────
   forward(key, method, urlPath, headers, body) {
     return new Promise((resolve, reject) => {
-      // Reject path traversal and null bytes
+      // Reject path traversal and null bytes (check both raw and decoded forms)
       if (urlPath.includes("\0") || /(?:^|\/)\.\.(?:\/|$)/.test(urlPath)) {
         return reject(new Error("blocked: path traversal or null byte"));
+      }
+      try {
+        const decoded = decodeURIComponent(urlPath);
+        if (decoded.includes("\0") || /(?:^|\/)\.\.(?:\/|$)/.test(decoded)) {
+          return reject(new Error("blocked: double-encoded path traversal"));
+        }
+      } catch (e) {
+        return reject(new Error("blocked: malformed percent-encoding in path"));
       }
 
       const base = new URL(this.upstreamUrl);
       const url = new URL(base.pathname.replace(/\/+$/, "") + urlPath, base.origin);
+
+      // Post-construction check: verify resolved path has no traversal
+      if (/(?:^|\/)\.\.(?:\/|$)/.test(url.pathname)) {
+        return reject(new Error("blocked: resolved path contains traversal"));
+      }
 
       if (url.hostname !== this.expectedHost) {
         return reject(new Error(`SSRF blocked: ${url.hostname} != ${this.expectedHost}`));
@@ -1086,7 +1114,10 @@ function handleKeyRequest(req, res, prov) {
   }
 
   prov.recordRequest(key);
-  res.writeHead(200, { "content-type": "application/json" });
+  const rotationRid = crypto.randomBytes(4).toString("hex");
+  const clientIp = req.socket.remoteAddress || "unknown";
+  console.log(`[keymux:${prov.name}:rotation:${rotationRid}] vended key=${prov.keyId(key)} to=${clientIp}`);
+  res.writeHead(200, { "content-type": "application/json", "x-request-id": rotationRid });
   res.end(JSON.stringify({ key, upstream_url: prov.upstreamUrl || null, provider: prov.name }));
 }
 
@@ -1099,11 +1130,16 @@ function handleCooldownReport(req, res, prov, keyFragment) {
     return res.end(JSON.stringify({ error: "key fragment must be at least 4 characters" }));
   }
 
-  const match = prov.keys.find((k) => k.endsWith(keyFragment));
-  if (!match) {
+  const matches = prov.keys.filter((k) => k.endsWith(keyFragment));
+  if (matches.length === 0) {
     res.writeHead(404, { "content-type": "application/json" });
     return res.end(JSON.stringify({ error: "key not found", provider: prov.name }));
   }
+  if (matches.length > 1) {
+    res.writeHead(400, { "content-type": "application/json" });
+    return res.end(JSON.stringify({ error: "ambiguous key fragment — matches multiple keys, use longer suffix", provider: prov.name }));
+  }
+  const match = matches[0];
 
   const chunks = [];
   let totalSize = 0;
@@ -1181,6 +1217,10 @@ async function handleProxy(req, res, prov, proxyPath) {
   }
   let body = Buffer.concat(chunks);
   const headers = { ...req.headers };
+
+  // Save original body for retry — thought signatures mutate messages in-place
+  const originalBody = Buffer.from(body);
+  const originalContentLength = headers["content-length"];
 
   // Sanitize: strip non-standard OpenAI params and enforce token caps
   // (e.g. Gemini rejects "store", "reasoning_effort", "thinking"; Groq caps max_completion_tokens)
@@ -1265,6 +1305,9 @@ async function handleProxy(req, res, prov, proxyPath) {
         prov.cbRecordError();
         if (prov.scorer) prov.scorer.recordError(key, upstream.statusCode);
         if (attempt < attempts - 1) {
+          // Reset body to original before retry (thought signatures mutate in-place)
+          body = Buffer.from(originalBody);
+          headers["content-length"] = originalContentLength;
           // Exponential backoff: 100ms, 200ms, 400ms, ... capped at 2s
           const backoffMs = Math.min(100 * Math.pow(2, attempt), 2000);
           await new Promise(r => setTimeout(r, backoffMs));
@@ -1418,6 +1461,9 @@ async function handleProxy(req, res, prov, proxyPath) {
       prov.cbRecordError();
       if (prov.scorer) prov.scorer.recordError(key);
       if (attempt < attempts - 1) {
+        // Reset body to original before retry (thought signatures mutate in-place)
+        body = Buffer.from(originalBody);
+        headers["content-length"] = originalContentLength;
         const backoffMs = Math.min(100 * Math.pow(2, attempt), 2000);
         await new Promise(r => setTimeout(r, backoffMs));
       }
