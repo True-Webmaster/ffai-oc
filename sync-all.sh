@@ -86,57 +86,29 @@ if [ -z "$TIMEOUT_CMD" ]; then
   echo "[sync-all] WARNING: timeout command not found, running without per-agent timeouts" >&2
 fi
 
-# Iterate agents — handle no matches gracefully
-shopt -s nullglob
-agent_files=("$HOME"/.openclaw/agents/*/agent/models.json)
-shopt -u nullglob
-
-if [ ${#agent_files[@]} -eq 0 ]; then
-  echo "[sync-all] No agent models.json files found" >&2
-  exit 0
-fi
-
-# Phase 1: Per-agent models.json updates (--skip-openclaw avoids N+1 global rewrites)
-failures=0
-for f in "${agent_files[@]}"; do
-  # Extract agent name from path for log attribution
-  agent_name="$(echo "$f" | sed 's|.*/agents/\([^/]*\)/.*|\1|')"
-  echo "--- [sync-all] agent=$agent_name ---" >> "$SYNC_LOG"
-  # 30s timeout per agent to prevent hung provider API from blocking startup
-  exitcode=0
-  if [ -n "$TIMEOUT_CMD" ]; then
-    "$TIMEOUT_CMD" 30 "$NODE" "$KEYMUX_DIR/sync-models.js" "$f" --skip-openclaw >> "$SYNC_LOG" 2>&1 || exitcode=$?
-  else
-    "$NODE" "$KEYMUX_DIR/sync-models.js" "$f" --skip-openclaw >> "$SYNC_LOG" 2>&1 || exitcode=$?
-  fi
-  if [ "$exitcode" -ne 0 ]; then
-    if [ "$exitcode" -eq 124 ]; then
-      echo "[sync-all] WARN: sync TIMED OUT for agent=$agent_name" >> "$SYNC_LOG"
-    else
-      echo "[sync-all] WARN: sync failed (exit $exitcode) for agent=$agent_name" >> "$SYNC_LOG"
-    fi
-    failures=$((failures + 1))
-  fi
-done
-
-# Phase 2: Single global openclaw.json update (uses first agent's models.json as reference)
-echo "--- [sync-all] global openclaw.json update ---" >> "$SYNC_LOG"
+# Single invocation: discover once, write all agents + openclaw.json once
+# --all-agents mode eliminates N+1 discovery overhead
 exitcode=0
-first_agent="${agent_files[0]}"
+SYNC_TIMEOUT=120  # 2 min total for all agents (discovery + writes)
 if [ -n "$TIMEOUT_CMD" ]; then
-  "$TIMEOUT_CMD" 30 "$NODE" "$KEYMUX_DIR/sync-models.js" "$first_agent" --openclaw-only >> "$SYNC_LOG" 2>&1 || exitcode=$?
+  "$TIMEOUT_CMD" "$SYNC_TIMEOUT" "$NODE" "$KEYMUX_DIR/sync-models.js" --all-agents >> "$SYNC_LOG" 2>&1 || exitcode=$?
 else
-  "$NODE" "$KEYMUX_DIR/sync-models.js" "$first_agent" --openclaw-only >> "$SYNC_LOG" 2>&1 || exitcode=$?
+  "$NODE" "$KEYMUX_DIR/sync-models.js" --all-agents >> "$SYNC_LOG" 2>&1 || exitcode=$?
 fi
+failures=0
 if [ "$exitcode" -ne 0 ]; then
-  echo "[sync-all] WARN: openclaw.json update failed (exit $exitcode)" >> "$SYNC_LOG"
-  failures=$((failures + 1))
+  if [ "$exitcode" -eq 124 ]; then
+    echo "[sync-all] WARN: sync TIMED OUT after ${SYNC_TIMEOUT}s" >> "$SYNC_LOG"
+  else
+    echo "[sync-all] WARN: sync failed (exit $exitcode)" >> "$SYNC_LOG"
+  fi
+  failures=1
 fi
 
 # Always show output for systemd journal / manual runs
 cat "$SYNC_LOG"
 
 if [ "$failures" -gt 0 ]; then
-  echo "[sync-all] $failures/${#agent_files[@]} agent(s) failed to sync" >&2
+  echo "[sync-all] sync failed" >&2
   exit 1
 fi

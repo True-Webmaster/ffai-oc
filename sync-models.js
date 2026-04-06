@@ -1,6 +1,11 @@
 #!/usr/bin/env node
 // sync-models.js — Fetches models from KeyMux /models and updates OpenClaw models.json
-// Usage: node sync-models.js [path-to-models.json]
+//
+// Usage:
+//   node sync-models.js [path-to-models.json]              # Single agent (discovers + writes models.json + openclaw.json)
+//   node sync-models.js [path] --skip-openclaw              # Single agent, skip openclaw.json
+//   node sync-models.js [path] --openclaw-only              # Skip models.json, write openclaw.json only
+//   node sync-models.js --all-agents                        # Discover once, write all agents + openclaw.json once
 //
 // Reads KEYMUX_URL and KEYMUX_PROXY_KEY from env (or defaults to localhost:8002).
 // Merges discovered models into the existing models.json, preserving non-KeyMux providers.
@@ -32,7 +37,8 @@ const KEYMUX_URL = (process.env.KEYMUX_URL || "http://127.0.0.1:8002").replace(/
 const KEYMUX_PROXY_KEY = process.env.KEYMUX_PROXY_KEY || "";
 const HOME = process.env.HOME || require("os").homedir();
 
-// Mode flags: --skip-openclaw (agent-only), --openclaw-only (global-only)
+// Mode flags
+const ALL_AGENTS = process.argv.includes("--all-agents");
 const SKIP_OPENCLAW = process.argv.includes("--skip-openclaw");
 const OPENCLAW_ONLY = process.argv.includes("--openclaw-only");
 // Filter flags from positional args
@@ -153,11 +159,12 @@ function getFirstApiKey(provName) {
   return keys[0] || null;
 }
 
-async function main() {
-  // 1. Fetch aggregated models from KeyMux
+// ── Discovery: fetch models, providers, native specs — returns resolved provider data ──
+async function discover() {
   const headers = {};
   if (KEYMUX_PROXY_KEY) headers.authorization = `Bearer ${KEYMUX_PROXY_KEY}`;
 
+  // 1. Fetch aggregated models from KeyMux
   console.log(`[sync] Fetching models from ${KEYMUX_URL}/models ...`);
   let modelsResp;
   for (let attempt = 0; attempt < 3; attempt++) {
@@ -174,7 +181,7 @@ async function main() {
   if (!Array.isArray(models)) throw new Error(`/models response missing "data" array`);
   console.log(`[sync] Got ${models.length} models`);
 
-  // 2. Fetch providers list (with retries, same as /models)
+  // 2. Fetch providers list
   let providersResp;
   for (let attempt = 0; attempt < 3; attempt++) {
     try {
@@ -198,70 +205,40 @@ async function main() {
     byProvider[prov].push(m);
   }
 
-  // 4. Read existing models.json
-  let existing = { providers: {} };
-  try {
-    existing = JSON.parse(fs.readFileSync(MODELS_JSON, "utf8"));
-  } catch (err) {
-    if (err.code === "ENOENT") {
-      console.log(`[sync] No existing ${MODELS_JSON}, creating fresh`);
-    } else {
-      console.error(`[sync] WARNING: Corrupt ${MODELS_JSON}: ${err.message} — backing up and creating fresh`);
-      try { fs.copyFileSync(MODELS_JSON, MODELS_JSON + ".corrupt"); } catch (backupErr) {
-        console.error(`[sync] ERROR: Failed to backup corrupt file: ${backupErr.message}`);
-      }
-    }
-  }
-  if (!existing.providers) existing.providers = {};
+  // 4. Build resolved keymux provider entries (filter + native specs)
+  const keymuxProviders = {};
+  const ocProviders = {};
 
-  // 5. Remove old keymux-* providers
-  for (const key of Object.keys(existing.providers)) {
-    if (key.startsWith("keymux-")) delete existing.providers[key];
-  }
+  const MIN_CONTEXT_WINDOW = 8192;
+  const MIN_OUTPUT_TOKENS = 4096;
+  const MIN_PARAM_BILLIONS = 4;
 
-  // 6. Add KeyMux providers with discovered models
   for (const [provName, provConfig] of Object.entries(providerList)) {
     const provModels = byProvider[provName] || [];
     if (provModels.length === 0) continue;
 
-    // ── Programmatic model filtering (no hardcoded model names) ──────────────
-    // All rules are pattern-based so new models are auto-included or excluded.
-    const MIN_CONTEXT_WINDOW = 8192;  // Min ctx for multi-turn conversations
-    const MIN_OUTPUT_TOKENS = 4096;   // Min output for useful responses
-    const MIN_PARAM_BILLIONS = 4;     // Skip tiny models (1b, 2b, 3b)
-
-    // Collect all IDs for dedup detection
     const allIds = new Set(provModels.map(m => (m.id || "").replace(/^models\//, "")));
 
     const chatModels = provModels.filter((m) => {
       const id = (m.id || "").replace(/^models\//, "");
       const idLower = id.toLowerCase();
 
-      // 1. Skip non-chat model categories (by keyword in ID)
       const NON_CHAT_KEYWORDS = /embed|imagen|veo|lyria|aqa|tts|audio|live|robotics|generate|clip|guard|whisper|distil|orpheus|safeguard/;
       if (NON_CHAT_KEYWORDS.test(idLower)) return false;
-
-      // 2. Skip image-generation models (contain "image" in the name)
       if (/\bimage\b/.test(idLower)) return false;
-
-      // 3. Skip special-purpose models
       if (/deep-research|computer-use|customtools/.test(idLower)) return false;
 
-      // 4. Skip "-latest" aliases (they point to a versioned model we already include)
       if (/-latest$/.test(idLower)) {
         console.log(`[sync] Skipping alias ${id}`);
         return false;
       }
 
-      // 5. Skip versioned duplicates: if "model-001" exists and "model" also exists, skip "-001"
       const deVersioned = id.replace(/-\d{3}$/, "");
       if (deVersioned !== id && allIds.has(deVersioned)) {
         console.log(`[sync] Skipping versioned duplicate ${id} (have ${deVersioned})`);
         return false;
       }
 
-      // 6. Skip tiny models by parameter count in the name
-      //    Matches: "-4b-", "-31b-it", "e2b-it" (effective params), "-1b-"
       const paramMatch = idLower.match(/(?:^|[/-])(\d+(?:\.\d+)?)b(?:[^a-z]|$)/) ||
                          idLower.match(/[/-]e(\d+(?:\.\d+)?)b(?:[^a-z]|$)/);
       if (paramMatch) {
@@ -272,7 +249,6 @@ async function main() {
         }
       }
 
-      // 7. Filter by context window (pre-check — applied again after native spec resolution)
       const ctx = m.context_window || 0;
       if (ctx > 0 && ctx < MIN_CONTEXT_WINDOW) {
         console.log(`[sync] Skipping ${id}: context_window ${ctx} < ${MIN_CONTEXT_WINDOW}`);
@@ -285,7 +261,6 @@ async function main() {
     if (chatModels.length === 0) continue;
 
     // Fetch native model specs only for models that actually lack context_window
-    const cleanIds = chatModels.map(m => (m.id || "").replace(/^models\//, ""));
     const missingSpecIds = chatModels
       .filter(m => !m.context_window)
       .map(m => (m.id || "").replace(/^models\//, ""));
@@ -299,11 +274,10 @@ async function main() {
       }
     }
 
-    existing.providers[`keymux-${provName}`] = {
+    const provEntry = {
       baseUrl: `${KEYMUX_URL}/${provName}/v1`,
       api: "openai-completions",
       apiKey: "KEYMUX_PROXY_KEY",
-      // Compat: Gemini/Groq OpenAI-compat endpoints reject unknown fields
       compat: {
         supportsStore: false,
         supportsDeveloperRole: false,
@@ -319,10 +293,6 @@ async function main() {
         // Regex heuristic — review when new model families are added.
         const supportsImage = /\bgemini\b|\bflash\b|\bvision\b|\bgrok-4-fast\b|\bllama-4\b|\bscout\b|\bgemma-[34]/.test(cleanId);
 
-        // Resolution order for context window and max tokens:
-        // 1. Native API (most accurate — e.g. Gemini's inputTokenLimit)
-        // 2. OpenAI-compat /models response (e.g. Groq returns context_window)
-        // 3. Static fallback table (last resort)
         const native = nativeSpecs[cleanId] || {};
         const fallback = MODEL_SPECS_FALLBACK[cleanId] || {};
         const contextWindow = native.contextWindow ?? m.context_window ?? fallback.contextWindow ?? 131072;
@@ -341,8 +311,8 @@ async function main() {
     };
 
     // Post-filter: remove models with resolved specs below minimums
-    const beforeCount = existing.providers[`keymux-${provName}`].models.length;
-    existing.providers[`keymux-${provName}`].models = existing.providers[`keymux-${provName}`].models.filter((m) => {
+    const beforeCount = provEntry.models.length;
+    provEntry.models = provEntry.models.filter((m) => {
       if (m.contextWindow < MIN_CONTEXT_WINDOW) {
         console.log(`[sync] Dropping ${m.id}: contextWindow ${m.contextWindow} < ${MIN_CONTEXT_WINDOW}`);
         return false;
@@ -353,99 +323,180 @@ async function main() {
       }
       return true;
     });
-    const afterCount = existing.providers[`keymux-${provName}`].models.length;
+    const afterCount = provEntry.models.length;
     if (afterCount < beforeCount) {
       console.log(`[sync] keymux-${provName}: dropped ${beforeCount - afterCount} models below minimums`);
     }
 
-    // Remove empty provider entries (all models filtered out)
     if (afterCount === 0) {
       console.warn(`[sync] keymux-${provName}: all models below minimums, removing provider entry`);
-      delete existing.providers[`keymux-${provName}`];
-    } else {
-      console.log(`[sync] keymux-${provName}: ${afterCount} chat models`);
+      continue;
     }
-  }
 
-  // 7. Build provider entry for openclaw.json (structured apiKey format)
-  const ocProviders = {};
-  for (const [provName] of Object.entries(providerList)) {
-    const key = `keymux-${provName}`;
-    if (!existing.providers[key]) continue;
-    // openclaw.json schema does NOT allow "compat" — strip it
-    const { compat, ...rest } = existing.providers[key];
-    ocProviders[key] = {
+    console.log(`[sync] keymux-${provName}: ${afterCount} chat models`);
+    keymuxProviders[`keymux-${provName}`] = provEntry;
+
+    // Build openclaw.json provider entry (strip compat, use structured apiKey)
+    const { compat, ...rest } = provEntry;
+    ocProviders[`keymux-${provName}`] = {
       ...rest,
       apiKey: { source: "env", provider: "default", id: "KEYMUX_PROXY_KEY" },
     };
   }
 
-  // Wipe protection: if we ended up with zero keymux providers but had some before, abort
+  return { providerList, keymuxProviders, ocProviders };
+}
+
+// ── Write a single agent's models.json using pre-discovered data ──
+function writeAgentModels(modelsJsonPath, keymuxProviders) {
+  let existing = { providers: {} };
+  try {
+    existing = JSON.parse(fs.readFileSync(modelsJsonPath, "utf8"));
+  } catch (err) {
+    if (err.code === "ENOENT") {
+      console.log(`[sync] No existing ${modelsJsonPath}, creating fresh`);
+    } else {
+      console.error(`[sync] WARNING: Corrupt ${modelsJsonPath}: ${err.message} — backing up and creating fresh`);
+      try { fs.copyFileSync(modelsJsonPath, modelsJsonPath + ".corrupt"); } catch (backupErr) {
+        console.error(`[sync] ERROR: Failed to backup corrupt file: ${backupErr.message}`);
+      }
+    }
+  }
+  if (!existing.providers) existing.providers = {};
+
+  // Remove old keymux-* providers, add discovered ones
+  for (const key of Object.keys(existing.providers)) {
+    if (key.startsWith("keymux-")) delete existing.providers[key];
+  }
+  Object.assign(existing.providers, keymuxProviders);
+
+  // Wipe protection
   const newKeymuxCount = Object.keys(existing.providers).filter(k => k.startsWith("keymux-")).length;
-  if (newKeymuxCount === 0 && Object.keys(providerList).length > 0) {
-    console.error("[sync] ABORT: All keymux providers ended up with 0 models — refusing to write empty config");
-    process.exitCode = 1;
-    return;
+  if (newKeymuxCount === 0 && Object.keys(keymuxProviders).length > 0) {
+    console.error(`[sync] ABORT: All keymux providers ended up with 0 models for ${modelsJsonPath}`);
+    return false;
   }
 
-  // 8. Write models.json (skip if --openclaw-only)
+  fs.mkdirSync(path.dirname(modelsJsonPath), { recursive: true });
+  const tmp = modelsJsonPath + ".tmp";
+  fs.writeFileSync(tmp, JSON.stringify(existing, null, 2));
+  fs.renameSync(tmp, modelsJsonPath);
+  console.log(`[sync] Updated ${modelsJsonPath}`);
+  console.log(`[sync] Total providers: ${Object.keys(existing.providers).join(", ")}`);
+  return true;
+}
+
+// ── Write openclaw.json using pre-discovered data ──
+function writeOpenclawJson(ocProviders, keymuxProviders, providerList) {
+  let allowlistCount = 0;
+  try {
+    const oc = JSON.parse(fs.readFileSync(OPENCLAW_JSON, "utf8"));
+
+    if (!oc.models) oc.models = {};
+    if (!oc.models.providers) oc.models.providers = {};
+    for (const key of Object.keys(oc.models.providers)) {
+      if (key.startsWith("keymux-")) delete oc.models.providers[key];
+    }
+    Object.assign(oc.models.providers, ocProviders);
+
+    if (!oc.agents) oc.agents = {};
+    if (!oc.agents.defaults) oc.agents.defaults = {};
+    if (!oc.agents.defaults.models) oc.agents.defaults.models = {};
+    const allowlist = oc.agents.defaults.models;
+
+    for (const key of Object.keys(allowlist)) {
+      if (key.startsWith("keymux-")) delete allowlist[key];
+    }
+
+    for (const [provKey, provData] of Object.entries(keymuxProviders)) {
+      if (!provData || !provData.models) continue;
+      for (const model of provData.models) {
+        allowlist[`${provKey}/${model.id}`] = {};
+        allowlistCount++;
+      }
+    }
+
+    const ocTmp = OPENCLAW_JSON + ".tmp";
+    fs.writeFileSync(ocTmp, JSON.stringify(oc, null, 2));
+    fs.renameSync(ocTmp, OPENCLAW_JSON);
+    console.log(`[sync] Updated ${OPENCLAW_JSON} (${Object.keys(ocProviders).length} providers, ${allowlistCount} models in allowlist)`);
+    return true;
+  } catch (err) {
+    console.error(`[sync] Failed to update openclaw.json: ${err.code || ""} ${err.message}`);
+    return false;
+  }
+}
+
+// ── Main: single-agent mode (backward compatible) ──
+async function mainSingle() {
+  const { providerList, keymuxProviders, ocProviders } = await discover();
+
   if (!OPENCLAW_ONLY) {
-    fs.mkdirSync(path.dirname(MODELS_JSON), { recursive: true });
-    const modelsTmp = MODELS_JSON + ".tmp";
-    fs.writeFileSync(modelsTmp, JSON.stringify(existing, null, 2));
-    fs.renameSync(modelsTmp, MODELS_JSON);
-    console.log(`[sync] Updated ${MODELS_JSON}`);
-    console.log(`[sync] Total providers: ${Object.keys(existing.providers).join(", ")}`);
+    if (!writeAgentModels(MODELS_JSON, keymuxProviders)) {
+      process.exitCode = 1;
+      return;
+    }
   }
 
-  // 9. Write openclaw.json (skip if --skip-openclaw)
   if (!SKIP_OPENCLAW) {
-    let allowlistCount = 0;
-    try {
-      const oc = JSON.parse(fs.readFileSync(OPENCLAW_JSON, "utf8"));
-
-      // 9a. Update models.providers (for config-based provider resolution)
-      if (!oc.models) oc.models = {};
-      if (!oc.models.providers) oc.models.providers = {};
-      for (const key of Object.keys(oc.models.providers)) {
-        if (key.startsWith("keymux-")) delete oc.models.providers[key];
-      }
-      Object.assign(oc.models.providers, ocProviders);
-
-      // 9b. Update agents.defaults.models allowlist (required for /models visibility)
-      if (!oc.agents) oc.agents = {};
-      if (!oc.agents.defaults) oc.agents.defaults = {};
-      if (!oc.agents.defaults.models) oc.agents.defaults.models = {};
-      const allowlist = oc.agents.defaults.models;
-
-      // Remove old keymux-* allowlist entries
-      for (const key of Object.keys(allowlist)) {
-        if (key.startsWith("keymux-")) delete allowlist[key];
-      }
-
-      // Add all discovered keymux models to allowlist
-      for (const [provName] of Object.entries(providerList)) {
-        const key = `keymux-${provName}`;
-        const prov = existing.providers[key];
-        if (!prov || !prov.models) continue;
-        for (const model of prov.models) {
-          allowlist[`${key}/${model.id}`] = {};
-          allowlistCount++;
-        }
-      }
-
-      const ocTmp = OPENCLAW_JSON + ".tmp";
-      fs.writeFileSync(ocTmp, JSON.stringify(oc, null, 2));
-      fs.renameSync(ocTmp, OPENCLAW_JSON);
-      console.log(`[sync] Updated ${OPENCLAW_JSON} (${Object.keys(ocProviders).length} providers, ${allowlistCount} models in allowlist)`);
-    } catch (err) {
-      console.error(`[sync] Failed to update openclaw.json: ${err.code || ""} ${err.message}`);
+    if (!writeOpenclawJson(ocProviders, keymuxProviders, providerList)) {
       process.exitCode = 1;
     }
   }
 }
 
-main().catch((err) => {
+// ── Main: all-agents mode (discover once, write all agents + openclaw once) ──
+async function mainAllAgents() {
+  const { providerList, keymuxProviders, ocProviders } = await discover();
+
+  // Find all agent models.json files
+  const agentsDir = path.join(HOME, ".openclaw", "agents");
+  let agentDirs;
+  try {
+    agentDirs = fs.readdirSync(agentsDir).filter(d => {
+      const modelsPath = path.join(agentsDir, d, "agent", "models.json");
+      // Include if directory has agent/models.json OR agent/ directory exists (create fresh)
+      try {
+        fs.statSync(path.join(agentsDir, d, "agent"));
+        return true;
+      } catch { return false; }
+    });
+  } catch (err) {
+    console.error(`[sync] FATAL: Cannot read agents directory ${agentsDir}: ${err.message}`);
+    process.exitCode = 1;
+    return;
+  }
+
+  if (agentDirs.length === 0) {
+    console.log("[sync] No agents found");
+    return;
+  }
+
+  console.log(`[sync] Writing models.json for ${agentDirs.length} agent(s)`);
+  let failures = 0;
+  for (const agentName of agentDirs) {
+    const modelsPath = path.join(agentsDir, agentName, "agent", "models.json");
+    console.log(`--- [sync] agent=${agentName} ---`);
+    if (!writeAgentModels(modelsPath, keymuxProviders)) {
+      failures++;
+    }
+  }
+
+  // Single openclaw.json write
+  console.log("--- [sync] global openclaw.json update ---");
+  if (!writeOpenclawJson(ocProviders, keymuxProviders, providerList)) {
+    failures++;
+  }
+
+  if (failures > 0) {
+    console.error(`[sync] ${failures} write(s) failed`);
+    process.exitCode = 1;
+  }
+}
+
+// ── Entry point ──
+const mainFn = ALL_AGENTS ? mainAllAgents : mainSingle;
+mainFn().catch((err) => {
   console.error(`[sync] ERROR: ${err.stack || err.message}`);
   process.exit(1);
 });
