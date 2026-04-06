@@ -31,7 +31,13 @@ const KEYMUX_URL = (process.env.KEYMUX_URL || "http://127.0.0.1:8002").replace(/
 })();
 const KEYMUX_PROXY_KEY = process.env.KEYMUX_PROXY_KEY || "";
 const HOME = process.env.HOME || require("os").homedir();
-const MODELS_JSON = process.argv[2] || path.join(HOME, ".openclaw", "agents", "main", "agent", "models.json");
+
+// Mode flags: --skip-openclaw (agent-only), --openclaw-only (global-only)
+const SKIP_OPENCLAW = process.argv.includes("--skip-openclaw");
+const OPENCLAW_ONLY = process.argv.includes("--openclaw-only");
+// Filter flags from positional args
+const positionalArgs = process.argv.slice(2).filter(a => !a.startsWith("--"));
+const MODELS_JSON = positionalArgs[0] || path.join(HOME, ".openclaw", "agents", "main", "agent", "models.json");
 const OPENCLAW_JSON = process.env.OPENCLAW_JSON || path.join(HOME, ".openclaw", "openclaw.json");
 
 // Static fallback specs — used ONLY when the provider API doesn't return context_window
@@ -278,15 +284,17 @@ async function main() {
 
     if (chatModels.length === 0) continue;
 
-    // Fetch native model specs for providers that don't return context_window in /models
+    // Fetch native model specs only for models that actually lack context_window
     const cleanIds = chatModels.map(m => (m.id || "").replace(/^models\//, ""));
-    const needsNativeApi = chatModels.some(m => !m.context_window);
+    const missingSpecIds = chatModels
+      .filter(m => !m.context_window)
+      .map(m => (m.id || "").replace(/^models\//, ""));
     let nativeSpecs = {};
-    if (needsNativeApi && NATIVE_MODEL_APIS[provName]) {
+    if (missingSpecIds.length > 0 && NATIVE_MODEL_APIS[provName]) {
       const apiKey = getFirstApiKey(provName);
       if (apiKey) {
-        console.log(`[sync] Fetching native model specs for ${provName} (${cleanIds.length} models)...`);
-        nativeSpecs = await fetchNativeModelSpecs(provName, cleanIds, apiKey);
+        console.log(`[sync] Fetching native model specs for ${provName} (${missingSpecIds.length} models need specs)...`);
+        nativeSpecs = await fetchNativeModelSpecs(provName, missingSpecIds, apiKey);
         console.log(`[sync]   Got specs for ${Object.keys(nativeSpecs).length} models`);
       }
     }
@@ -306,6 +314,9 @@ async function main() {
       models: chatModels.map((m) => {
         const cleanId = (m.id || "").replace(/^models\//, "");
         const isReasoning = false;
+        // TODO: Image capability should ideally come from upstream API metadata.
+        // Neither OpenAI-compat /models nor Gemini native API reliably expose this.
+        // Regex heuristic — review when new model families are added.
         const supportsImage = /\bgemini\b|\bflash\b|\bvision\b|\bgrok-4-fast\b|\bllama-4\b|\bscout\b|\bgemma-[34]/.test(cleanId);
 
         // Resolution order for context window and max tokens:
@@ -377,66 +388,60 @@ async function main() {
     return;
   }
 
-  // 8. Prepare both files as .tmp first (atomic dual-write to prevent partial-update window)
-  fs.mkdirSync(path.dirname(MODELS_JSON), { recursive: true });
-  const modelsTmp = MODELS_JSON + ".tmp";
-  fs.writeFileSync(modelsTmp, JSON.stringify(existing, null, 2));
-
-  let ocTmp = null;
-  let ocProviderCount = 0;
-  let allowlistCount = 0;
-  try {
-    const oc = JSON.parse(fs.readFileSync(OPENCLAW_JSON, "utf8"));
-
-    // 9a. Update models.providers (for config-based provider resolution)
-    if (!oc.models) oc.models = {};
-    if (!oc.models.providers) oc.models.providers = {};
-    for (const key of Object.keys(oc.models.providers)) {
-      if (key.startsWith("keymux-")) delete oc.models.providers[key];
-    }
-    Object.assign(oc.models.providers, ocProviders);
-
-    // 9b. Update agents.defaults.models allowlist (required for /models visibility)
-    if (!oc.agents) oc.agents = {};
-    if (!oc.agents.defaults) oc.agents.defaults = {};
-    if (!oc.agents.defaults.models) oc.agents.defaults.models = {};
-    const allowlist = oc.agents.defaults.models;
-
-    // Remove old keymux-* allowlist entries
-    for (const key of Object.keys(allowlist)) {
-      if (key.startsWith("keymux-")) delete allowlist[key];
-    }
-
-    // Add all discovered keymux models to allowlist
-    for (const [provName] of Object.entries(providerList)) {
-      const key = `keymux-${provName}`;
-      const prov = existing.providers[key];
-      if (!prov || !prov.models) continue;
-      for (const model of prov.models) {
-        allowlist[`${key}/${model.id}`] = {};
-        allowlistCount++;
-      }
-    }
-
-    ocTmp = OPENCLAW_JSON + ".tmp";
-    fs.writeFileSync(ocTmp, JSON.stringify(oc, null, 2));
-    ocProviderCount = Object.keys(ocProviders).length;
-  } catch (err) {
-    // Clean up models.json .tmp since we won't rename it
-    try { fs.unlinkSync(modelsTmp); } catch {}
-    console.error(`[sync] Failed to prepare openclaw.json: ${err.code || ""} ${err.message}`);
-    process.exitCode = 1;
-    return;
+  // 8. Write models.json (skip if --openclaw-only)
+  if (!OPENCLAW_ONLY) {
+    fs.mkdirSync(path.dirname(MODELS_JSON), { recursive: true });
+    const modelsTmp = MODELS_JSON + ".tmp";
+    fs.writeFileSync(modelsTmp, JSON.stringify(existing, null, 2));
+    fs.renameSync(modelsTmp, MODELS_JSON);
+    console.log(`[sync] Updated ${MODELS_JSON}`);
+    console.log(`[sync] Total providers: ${Object.keys(existing.providers).join(", ")}`);
   }
 
-  // 9. Both .tmp files ready — rename both (minimizes partial-update window)
-  fs.renameSync(modelsTmp, MODELS_JSON);
-  console.log(`[sync] Updated ${MODELS_JSON}`);
-  console.log(`[sync] Total providers: ${Object.keys(existing.providers).join(", ")}`);
+  // 9. Write openclaw.json (skip if --skip-openclaw)
+  if (!SKIP_OPENCLAW) {
+    let allowlistCount = 0;
+    try {
+      const oc = JSON.parse(fs.readFileSync(OPENCLAW_JSON, "utf8"));
 
-  if (ocTmp) {
-    fs.renameSync(ocTmp, OPENCLAW_JSON);
-    console.log(`[sync] Updated ${OPENCLAW_JSON} (${ocProviderCount} providers, ${allowlistCount} models in allowlist)`);
+      // 9a. Update models.providers (for config-based provider resolution)
+      if (!oc.models) oc.models = {};
+      if (!oc.models.providers) oc.models.providers = {};
+      for (const key of Object.keys(oc.models.providers)) {
+        if (key.startsWith("keymux-")) delete oc.models.providers[key];
+      }
+      Object.assign(oc.models.providers, ocProviders);
+
+      // 9b. Update agents.defaults.models allowlist (required for /models visibility)
+      if (!oc.agents) oc.agents = {};
+      if (!oc.agents.defaults) oc.agents.defaults = {};
+      if (!oc.agents.defaults.models) oc.agents.defaults.models = {};
+      const allowlist = oc.agents.defaults.models;
+
+      // Remove old keymux-* allowlist entries
+      for (const key of Object.keys(allowlist)) {
+        if (key.startsWith("keymux-")) delete allowlist[key];
+      }
+
+      // Add all discovered keymux models to allowlist
+      for (const [provName] of Object.entries(providerList)) {
+        const key = `keymux-${provName}`;
+        const prov = existing.providers[key];
+        if (!prov || !prov.models) continue;
+        for (const model of prov.models) {
+          allowlist[`${key}/${model.id}`] = {};
+          allowlistCount++;
+        }
+      }
+
+      const ocTmp = OPENCLAW_JSON + ".tmp";
+      fs.writeFileSync(ocTmp, JSON.stringify(oc, null, 2));
+      fs.renameSync(ocTmp, OPENCLAW_JSON);
+      console.log(`[sync] Updated ${OPENCLAW_JSON} (${Object.keys(ocProviders).length} providers, ${allowlistCount} models in allowlist)`);
+    } catch (err) {
+      console.error(`[sync] Failed to update openclaw.json: ${err.code || ""} ${err.message}`);
+      process.exitCode = 1;
+    }
   }
 }
 

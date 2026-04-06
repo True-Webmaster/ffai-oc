@@ -604,8 +604,17 @@ class Provider {
 
   keyStatus() {
     const now = Date.now();
-    const cooling = this.keys.filter((k) => (this.cooldowns.get(k) || 0) > now).length;
-    return { total: this.keys.length, available: this.keys.length - cooling, coolingDown: cooling };
+    let cooling = 0;
+    let keyCbOpen = 0;
+    let selectable = 0;
+    for (const k of this.keys) {
+      const inCooldown = (this.cooldowns.get(k) || 0) > now;
+      const inKeyCb = this.scorer && (this.scorer.keyCbUntil.get(k) || 0) > now;
+      if (inCooldown) cooling++;
+      if (inKeyCb) keyCbOpen++;
+      if (!inCooldown && !inKeyCb) selectable++;
+    }
+    return { total: this.keys.length, available: selectable, coolingDown: cooling, keyCbOpen };
   }
 
   // ── Circuit breaker ────────────────────────────────────────────────────────
@@ -1070,6 +1079,7 @@ function handleHealth(req, res) {
       mode: prov.mode,
       available: ks.available,
       coolingDown: ks.coolingDown,
+      keyCbOpen: ks.keyCbOpen || 0,
       circuitBreaker: prov.cbThreshold ? (circuitOpen ? "open" : "closed") : "disabled",
     };
 
@@ -1118,6 +1128,7 @@ function handleStats(req, res) {
       keys: ks.total,
       available: ks.available,
       coolingDown: ks.coolingDown,
+      keyCbOpen: ks.keyCbOpen || 0,
       circuitBreaker: prov.cbThreshold ? (prov.cbIsOpen() ? "open" : "closed") : "disabled",
     };
   }
@@ -1150,6 +1161,8 @@ function handleKeyRequest(req, res, prov) {
   }
 
   prov.recordRequest(key);
+  // Record rotation issuance into scorer state (prevents stale usage data / over-issuing same key)
+  if (prov.scorer) prov.scorer.recordRequest(key, 0);
   const rotationRid = crypto.randomBytes(4).toString("hex");
   const clientIp = req.socket.remoteAddress || "unknown";
   console.log(`[keymux:${prov.name}:rotation:${rotationRid}] vended key=${prov.keyId(key)} to=${clientIp}`);

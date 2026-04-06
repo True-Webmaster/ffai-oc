@@ -96,6 +96,7 @@ if [ ${#agent_files[@]} -eq 0 ]; then
   exit 0
 fi
 
+# Phase 1: Per-agent models.json updates (--skip-openclaw avoids N+1 global rewrites)
 failures=0
 for f in "${agent_files[@]}"; do
   # Extract agent name from path for log attribution
@@ -104,9 +105,9 @@ for f in "${agent_files[@]}"; do
   # 30s timeout per agent to prevent hung provider API from blocking startup
   exitcode=0
   if [ -n "$TIMEOUT_CMD" ]; then
-    "$TIMEOUT_CMD" 30 "$NODE" "$KEYMUX_DIR/sync-models.js" "$f" >> "$SYNC_LOG" 2>&1 || exitcode=$?
+    "$TIMEOUT_CMD" 30 "$NODE" "$KEYMUX_DIR/sync-models.js" "$f" --skip-openclaw >> "$SYNC_LOG" 2>&1 || exitcode=$?
   else
-    "$NODE" "$KEYMUX_DIR/sync-models.js" "$f" >> "$SYNC_LOG" 2>&1 || exitcode=$?
+    "$NODE" "$KEYMUX_DIR/sync-models.js" "$f" --skip-openclaw >> "$SYNC_LOG" 2>&1 || exitcode=$?
   fi
   if [ "$exitcode" -ne 0 ]; then
     if [ "$exitcode" -eq 124 ]; then
@@ -117,6 +118,20 @@ for f in "${agent_files[@]}"; do
     failures=$((failures + 1))
   fi
 done
+
+# Phase 2: Single global openclaw.json update (uses first agent's models.json as reference)
+echo "--- [sync-all] global openclaw.json update ---" >> "$SYNC_LOG"
+exitcode=0
+first_agent="${agent_files[0]}"
+if [ -n "$TIMEOUT_CMD" ]; then
+  "$TIMEOUT_CMD" 30 "$NODE" "$KEYMUX_DIR/sync-models.js" "$first_agent" --openclaw-only >> "$SYNC_LOG" 2>&1 || exitcode=$?
+else
+  "$NODE" "$KEYMUX_DIR/sync-models.js" "$first_agent" --openclaw-only >> "$SYNC_LOG" 2>&1 || exitcode=$?
+fi
+if [ "$exitcode" -ne 0 ]; then
+  echo "[sync-all] WARN: openclaw.json update failed (exit $exitcode)" >> "$SYNC_LOG"
+  failures=$((failures + 1))
+fi
 
 # Always show output for systemd journal / manual runs
 cat "$SYNC_LOG"
