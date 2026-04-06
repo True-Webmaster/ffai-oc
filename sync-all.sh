@@ -8,7 +8,8 @@ set -euo pipefail
 KEYMUX_DIR="$(cd "$(dirname "$0")" && pwd)"
 
 # Exclusive lock — prevent concurrent instances from stomping each other
-LOCKFILE="/tmp/keymux-sync.lock"
+# Lock in KEYMUX_DIR (not /tmp) to avoid symlink-race on multi-user hosts
+LOCKFILE="$KEYMUX_DIR/.sync.lock"
 exec 9>"$LOCKFILE"
 if ! flock -n 9; then
   echo "[sync-all] Another instance is running, exiting" >&2
@@ -66,9 +67,6 @@ export KEYMUX_PROXY_KEY="${PROXY_KEY:-}"
 if [ -z "$KEYMUX_PROXY_KEY" ]; then
   echo "[sync-all] WARNING: PROXY_KEY is empty — sync requests will have no auth" >&2
 fi
-
-# Clean stale temp files from prior crash-restart loops
-rm -f /tmp/keymux-sync.*.log 2>/dev/null || true
 
 # Secure temp log file — restrictive umask, guard mktemp
 umask 077

@@ -17,10 +17,10 @@ const ADMIN_KEY = (process.env.ADMIN_KEY || "").trim();
 const ALERT_WEBHOOK_URL = (process.env.ALERT_WEBHOOK_URL || "").trim();
 const ALERT_TIMEOUT = parseInt(process.env.ALERT_TIMEOUT || "5000", 10);
 const SHUTDOWN_TIMEOUT = parseInt(process.env.SHUTDOWN_TIMEOUT || "5000", 10);
-const STATS_FILE = process.env.STATS_FILE || path.join(".", "data", "stats.json");
+const STATS_FILE = process.env.STATS_FILE || path.join(__dirname, "data", "stats.json");
 const STATS_FLUSH_INTERVAL = parseInt(process.env.STATS_FLUSH_INTERVAL || "60000", 10);
 const STATS_RETENTION_DAYS = parseInt(process.env.STATS_RETENTION_DAYS || "7", 10);
-const PROVIDERS_FILE = process.env.PROVIDERS_FILE || path.join(".", "providers.json");
+const PROVIDERS_FILE = process.env.PROVIDERS_FILE || path.join(__dirname, "providers.json");
 
 // Global defaults — providers inherit these unless they override
 const DEFAULTS = {
@@ -855,7 +855,30 @@ function pruneDays() {
   }
 }
 
-function flushStats() {
+let _flushing = false;
+async function flushStats() {
+  if (!statsDirty || _flushing) return;
+  _flushing = true;
+  pruneDays();
+  // Snapshot before async write to avoid mid-flight mutations
+  const snapshot = JSON.stringify(stats, null, 2);
+  try {
+    const dir = path.dirname(STATS_FILE);
+    await fs.promises.mkdir(dir, { recursive: true }).catch(() => {});
+    const tmp = STATS_FILE + ".tmp";
+    await fs.promises.writeFile(tmp, snapshot);
+    await fs.promises.rename(tmp, STATS_FILE);
+    statsDirty = false;
+  } catch (err) {
+    console.error(`[keymux] stats flush error: ${err.message}`);
+    try { await fs.promises.unlink(STATS_FILE + ".tmp"); } catch {}
+  } finally {
+    _flushing = false;
+  }
+}
+
+// Synchronous flush for shutdown/crash paths only
+function flushStatsSync() {
   if (!statsDirty) return;
   pruneDays();
   try {
@@ -923,10 +946,23 @@ function recordAuthFailure(ip) {
     console.warn(`[keymux] AUTH: IP ${ip} blocked for ${AUTH_BLOCK_DURATION / 1000}s (${entry.count} failures)`);
   }
   authFailures.set(ip, entry);
-  // Evict oldest entries if map grows too large (distributed brute-force protection)
+  // Evict stale entries if map grows too large (prefer expired blocks, then oldest windows)
   if (authFailures.size > AUTH_FAILURES_MAX) {
-    const iter = authFailures.keys();
-    for (let i = 0; i < 1000; i++) authFailures.delete(iter.next().value);
+    const now2 = Date.now();
+    let evicted = 0;
+    // First pass: remove expired entries
+    for (const [eip, e] of authFailures) {
+      if (evicted >= 1000) break;
+      if ((e.blockedUntil && now2 >= e.blockedUntil) || (now2 - e.windowStart > AUTH_FAIL_WINDOW * 2)) {
+        authFailures.delete(eip);
+        evicted++;
+      }
+    }
+    // Second pass: FIFO fallback if still over limit
+    if (evicted === 0) {
+      const iter = authFailures.keys();
+      for (let i = 0; i < 1000; i++) authFailures.delete(iter.next().value);
+    }
   }
 }
 
@@ -1224,6 +1260,7 @@ async function handleProxy(req, res, prov, proxyPath) {
 
   // Sanitize: strip non-standard OpenAI params and enforce token caps
   // (e.g. Gemini rejects "store", "reasoning_effort", "thinking"; Groq caps max_completion_tokens)
+  let bodySanitized = false;
   if (req.url.includes("chat/completions") && body.length > 0) {
     try {
       const p = JSON.parse(body);
@@ -1273,6 +1310,7 @@ async function handleProxy(req, res, prov, proxyPath) {
       if (modified) {
         body = Buffer.from(JSON.stringify(p));
         headers["content-length"] = String(body.length);
+        bodySanitized = true;
       }
     } catch (e) { /* not JSON, pass through */ }
   }
@@ -1366,9 +1404,14 @@ async function handleProxy(req, res, prov, proxyPath) {
       }
       const safeHeaders = filterResponseHeaders(upstream.headers);
       safeHeaders["x-request-id"] = rid;
+      if (bodySanitized) safeHeaders["x-keymux-modified"] = "true";
       res.writeHead(upstream.statusCode, safeHeaders);
       // Use longer timeout for streaming responses (SSE can take minutes)
       const isStreaming = (upstream.headers["content-type"] || "").includes("text/event-stream");
+      if (isStreaming) {
+        activeSSEConnections.add(res);
+        res.on("close", () => activeSSEConnections.delete(res));
+      }
       const streamTimeout = isStreaming ? Math.max(prov.requestTimeout * 3, 360000) : prov.requestTimeout;
       let pipeTimedOut = false;
       const pipeTimeout = setTimeout(() => {
@@ -1555,6 +1598,9 @@ async function handleRequest(req, res) {
   return handleProxy(req, res, prov, subPath);
 }
 
+// ── SSE connection tracking for graceful shutdown ───────────────────────────
+const activeSSEConnections = new Set();
+
 // ── Server ───────────────────────────────────────────────────────────────────
 const server = http.createServer((req, res) => {
   handleRequest(req, res).catch((err) => {
@@ -1572,7 +1618,7 @@ process.on("unhandledRejection", (err) => {
 });
 process.on("uncaughtException", (err) => {
   console.error(`[keymux] uncaught exception: ${err.stack || err.message}`);
-  flushStats();
+  flushStatsSync();
   process.exit(1);
 });
 
@@ -1580,8 +1626,16 @@ process.on("uncaughtException", (err) => {
 let forceExitTimer;
 function shutdown(signal) {
   console.log(`[keymux] ${signal} received, shutting down...`);
-  flushStats();
+  flushStatsSync();
   clearInterval(flushInterval);
+  // Gracefully close active SSE connections
+  if (activeSSEConnections.size > 0) {
+    console.log(`[keymux] closing ${activeSSEConnections.size} active SSE connection(s)`);
+    for (const sseRes of activeSSEConnections) {
+      try { sseRes.write("data: [DONE]\n\n"); sseRes.end(); } catch {}
+    }
+    activeSSEConnections.clear();
+  }
   server.close(() => {
     clearTimeout(forceExitTimer);
     process.exit(0);

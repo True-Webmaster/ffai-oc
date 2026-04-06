@@ -369,25 +369,32 @@ async function main() {
     };
   }
 
-  // 8. Write updated models.json (atomic)
-  fs.mkdirSync(path.dirname(MODELS_JSON), { recursive: true });
-  const tmp = MODELS_JSON + ".tmp";
-  fs.writeFileSync(tmp, JSON.stringify(existing, null, 2));
-  fs.renameSync(tmp, MODELS_JSON);
-  console.log(`[sync] Updated ${MODELS_JSON}`);
-  console.log(`[sync] Total providers: ${Object.keys(existing.providers).join(", ")}`);
+  // Wipe protection: if we ended up with zero keymux providers but had some before, abort
+  const newKeymuxCount = Object.keys(existing.providers).filter(k => k.startsWith("keymux-")).length;
+  if (newKeymuxCount === 0 && Object.keys(providerList).length > 0) {
+    console.error("[sync] ABORT: All keymux providers ended up with 0 models — refusing to write empty config");
+    process.exitCode = 1;
+    return;
+  }
 
-  // 9. Update openclaw.json — providers + model allowlist
+  // 8. Prepare both files as .tmp first (atomic dual-write to prevent partial-update window)
+  fs.mkdirSync(path.dirname(MODELS_JSON), { recursive: true });
+  const modelsTmp = MODELS_JSON + ".tmp";
+  fs.writeFileSync(modelsTmp, JSON.stringify(existing, null, 2));
+
+  let ocTmp = null;
+  let ocProviderCount = 0;
+  let allowlistCount = 0;
   try {
     const oc = JSON.parse(fs.readFileSync(OPENCLAW_JSON, "utf8"));
 
     // 9a. Update models.providers (for config-based provider resolution)
-    if (oc.models && oc.models.providers) {
-      for (const key of Object.keys(oc.models.providers)) {
-        if (key.startsWith("keymux-")) delete oc.models.providers[key];
-      }
-      Object.assign(oc.models.providers, ocProviders);
+    if (!oc.models) oc.models = {};
+    if (!oc.models.providers) oc.models.providers = {};
+    for (const key of Object.keys(oc.models.providers)) {
+      if (key.startsWith("keymux-")) delete oc.models.providers[key];
     }
+    Object.assign(oc.models.providers, ocProviders);
 
     // 9b. Update agents.defaults.models allowlist (required for /models visibility)
     if (!oc.agents) oc.agents = {};
@@ -401,7 +408,6 @@ async function main() {
     }
 
     // Add all discovered keymux models to allowlist
-    let allowlistCount = 0;
     for (const [provName] of Object.entries(providerList)) {
       const key = `keymux-${provName}`;
       const prov = existing.providers[key];
@@ -412,13 +418,25 @@ async function main() {
       }
     }
 
-    const ocTmp = OPENCLAW_JSON + ".tmp";
+    ocTmp = OPENCLAW_JSON + ".tmp";
     fs.writeFileSync(ocTmp, JSON.stringify(oc, null, 2));
-    fs.renameSync(ocTmp, OPENCLAW_JSON);
-    console.log(`[sync] Updated ${OPENCLAW_JSON} (${Object.keys(ocProviders).length} providers, ${allowlistCount} models in allowlist)`);
+    ocProviderCount = Object.keys(ocProviders).length;
   } catch (err) {
-    console.error(`[sync] Failed to update openclaw.json: ${err.code || ""} ${err.message}`);
+    // Clean up models.json .tmp since we won't rename it
+    try { fs.unlinkSync(modelsTmp); } catch {}
+    console.error(`[sync] Failed to prepare openclaw.json: ${err.code || ""} ${err.message}`);
     process.exitCode = 1;
+    return;
+  }
+
+  // 9. Both .tmp files ready — rename both (minimizes partial-update window)
+  fs.renameSync(modelsTmp, MODELS_JSON);
+  console.log(`[sync] Updated ${MODELS_JSON}`);
+  console.log(`[sync] Total providers: ${Object.keys(existing.providers).join(", ")}`);
+
+  if (ocTmp) {
+    fs.renameSync(ocTmp, OPENCLAW_JSON);
+    console.log(`[sync] Updated ${OPENCLAW_JSON} (${ocProviderCount} providers, ${allowlistCount} models in allowlist)`);
   }
 }
 
