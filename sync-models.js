@@ -467,22 +467,22 @@ async function mainAllAgents() {
     return;
   }
 
-  if (agentDirs.length === 0) {
-    console.log("[sync] No agents found");
-    return;
-  }
-
-  console.log(`[sync] Writing models.json for ${agentDirs.length} agent(s)`);
   let failures = 0;
-  for (const agentName of agentDirs) {
-    const modelsPath = path.join(agentsDir, agentName, "agent", "models.json");
-    console.log(`--- [sync] agent=${agentName} ---`);
-    if (!writeAgentModels(modelsPath, keymuxProviders)) {
-      failures++;
+
+  if (agentDirs.length === 0) {
+    console.log("[sync] No agent directories found — skipping per-agent models.json writes");
+  } else {
+    console.log(`[sync] Writing models.json for ${agentDirs.length} agent(s)`);
+    for (const agentName of agentDirs) {
+      const modelsPath = path.join(agentsDir, agentName, "agent", "models.json");
+      console.log(`--- [sync] agent=${agentName} ---`);
+      if (!writeAgentModels(modelsPath, keymuxProviders)) {
+        failures++;
+      }
     }
   }
 
-  // Single openclaw.json write
+  // Always update openclaw.json — global provider/allowlist state is not dependent on agent existence
   console.log("--- [sync] global openclaw.json update ---");
   if (!writeOpenclawJson(ocProviders, keymuxProviders, providerList)) {
     failures++;
