@@ -7,6 +7,14 @@ set -euo pipefail
 
 KEYMUX_DIR="$(cd "$(dirname "$0")" && pwd)"
 
+# Exclusive lock — prevent concurrent instances from stomping each other
+LOCKFILE="/tmp/keymux-sync.lock"
+exec 9>"$LOCKFILE"
+if ! flock -n 9; then
+  echo "[sync-all] Another instance is running, exiting" >&2
+  exit 0
+fi
+
 # Absolute path to node — avoid PATH hijacking
 NODE="/usr/bin/node"
 if [ ! -x "$NODE" ]; then
@@ -22,8 +30,8 @@ ALLOWED_KEYS="PROXY_KEY ADMIN_KEY PORT GEMINI_KEYS GROQ_KEYS XGROQ_KEYS OPENCLAW
 
 # Source env vars from .env — only whitelisted KEY=VALUE lines
 if [ -f "$KEYMUX_DIR/.env" ]; then
-  # Secure permissions check (capture once to avoid TOCTOU)
-  envmode="$(stat -c '%a' "$KEYMUX_DIR/.env" 2>/dev/null || stat -f '%Lp' "$KEYMUX_DIR/.env" 2>/dev/null)"
+  # Secure permissions check (capture once, default on failure to avoid set -e abort)
+  envmode="$(stat -c '%a' "$KEYMUX_DIR/.env" 2>/dev/null || stat -f '%Lp' "$KEYMUX_DIR/.env" 2>/dev/null || echo "unknown")"
   if [ "$envmode" != "600" ]; then
     echo "[sync-all] WARNING: .env should have mode 600 (got $envmode)"
   fi
@@ -38,6 +46,8 @@ if [ -f "$KEYMUX_DIR/.env" ]; then
       \"*) value="${value#\"}"; value="${value%\"}" ;;
       \'*) value="${value#\'}"; value="${value%\'}" ;;
     esac
+    # Trim leading/trailing whitespace from value
+    value="$(echo "$value" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
     # Only export whitelisted keys
     case " $ALLOWED_KEYS " in
       *" $key "*) export "$key=$value" ;;
@@ -55,11 +65,18 @@ rm -f /tmp/keymux-sync.*.log 2>/dev/null || true
 # Secure temp log file — restrictive umask, guard mktemp
 umask 077
 SYNC_LOG="$(mktemp /tmp/keymux-sync.XXXXXXXX.log)" || { echo "[sync-all] FATAL: mktemp failed" >&2; exit 1; }
-trap 'cat "$SYNC_LOG" 2>/dev/null; rm -f "$SYNC_LOG"' EXIT INT TERM
+# Only cat log on failure; always clean up
+trap 'exitcode=$?; if [ "$exitcode" -ne 0 ]; then cat "$SYNC_LOG" 2>/dev/null; fi; rm -f "$SYNC_LOG"' EXIT INT TERM
+
+# Guard HOME for tilde expansion
+if [ -z "${HOME:-}" ]; then
+  echo "[sync-all] FATAL: HOME is not set" >&2
+  exit 1
+fi
 
 # Iterate agents — handle no matches gracefully
 shopt -s nullglob
-agent_files=(~/.openclaw/agents/*/agent/models.json)
+agent_files=("$HOME"/.openclaw/agents/*/agent/models.json)
 shopt -u nullglob
 
 if [ ${#agent_files[@]} -eq 0 ]; then
@@ -70,13 +87,22 @@ fi
 failures=0
 for f in "${agent_files[@]}"; do
   # 30s timeout per agent to prevent hung provider API from blocking startup
-  if ! timeout 30 "$NODE" "$KEYMUX_DIR/sync-models.js" "$f" >> "$SYNC_LOG" 2>&1; then
-    echo "[sync-all] WARN: sync failed for $f" >> "$SYNC_LOG"
+  exitcode=0
+  timeout 30 "$NODE" "$KEYMUX_DIR/sync-models.js" "$f" >> "$SYNC_LOG" 2>&1 || exitcode=$?
+  if [ "$exitcode" -ne 0 ]; then
+    if [ "$exitcode" -eq 124 ]; then
+      echo "[sync-all] WARN: sync TIMED OUT for $f" >> "$SYNC_LOG"
+    else
+      echo "[sync-all] WARN: sync failed (exit $exitcode) for $f" >> "$SYNC_LOG"
+    fi
     failures=$((failures + 1))
   fi
 done
 
+# Always show output for systemd journal / manual runs
+cat "$SYNC_LOG"
+
 if [ "$failures" -gt 0 ]; then
-  echo "[sync-all] $failures/${#agent_files[@]} agent(s) failed to sync" >> "$SYNC_LOG"
+  echo "[sync-all] $failures/${#agent_files[@]} agent(s) failed to sync" >&2
   exit 1
 fi

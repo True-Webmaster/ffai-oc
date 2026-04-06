@@ -428,6 +428,7 @@ class Provider {
     // Circuit breaker state
     this.cbErrors = [];
     this.cbOpenUntil = 0;
+    this._cbEpisodeActive = false;
 
     // Smart key scorer (activates when any rate limit is configured)
     this.scorer = (this.rpmLimit || this.tpmLimit || this.rpdLimit)
@@ -607,7 +608,8 @@ class Provider {
     // With scorer: global CB only fires when ALL keys are individually broken
     if (this.scorer) {
       if (this.scorer.isAllKeysCircuitOpen()) {
-        if (this.cbOpenUntil === 0) {
+        if (!this._cbEpisodeActive) {
+          this._cbEpisodeActive = true;
           this.cbOpenUntil = Date.now() + this.cbCooldown;
           const day = getProviderDay(this.name);
           day.circuitBreaks = (day.circuitBreaks || 0) + 1;
@@ -617,7 +619,8 @@ class Provider {
         }
         return Date.now() < this.cbOpenUntil;
       }
-      if (this.cbOpenUntil > 0) {
+      if (this._cbEpisodeActive) {
+        this._cbEpisodeActive = false;
         this.cbOpenUntil = 0;
         console.log(`[keymux:${this.name}] Circuit breaker closed — resuming requests`);
       }
@@ -1150,9 +1153,12 @@ async function handleProxy(req, res, prov, proxyPath) {
   for await (const chunk of req) {
     totalSize += chunk.length;
     if (totalSize > prov.maxBodySize) {
-      req.destroy();
-      res.writeHead(413, { "content-type": "application/json" });
-      return res.end(JSON.stringify({ error: "request body too large", max: prov.maxBodySize }));
+      req.resume(); // Drain remaining data without destroying
+      if (!res.headersSent) {
+        res.writeHead(413, { "content-type": "application/json" });
+        res.end(JSON.stringify({ error: "request body too large", max: prov.maxBodySize }));
+      }
+      return;
     }
     chunks.push(chunk);
   }
@@ -1261,8 +1267,13 @@ async function handleProxy(req, res, prov, proxyPath) {
         // Debug: log 400 errors with upstream response body and request summary
         if (upstream.statusCode === 400) {
           const errChunks = [];
-          upstream.on("data", (c) => errChunks.push(c));
+          let errBytes = 0;
+          upstream.on("data", (c) => {
+            errBytes += c.length;
+            if (errBytes <= 8192) errChunks.push(c); // Cap error body read
+          });
           upstream.on("end", () => {
+            upstream.destroy(); // Ensure socket is released
             // Scrub: only log structured error fields, not raw response bodies
             let errMsg = "unknown";
             try {
@@ -1278,6 +1289,7 @@ async function handleProxy(req, res, prov, proxyPath) {
             } catch {}
             console.error(`[keymux:${prov.name}] 400 from upstream: ${errMsg} | ${reqSummary}`);
           });
+          upstream.on("error", () => {}); // Swallow errors during drain
           res.writeHead(400, { "content-type": "application/json" });
           return res.end(JSON.stringify({ error: "upstream returned 400" }));
         }
@@ -1353,9 +1365,15 @@ async function handleProxy(req, res, prov, proxyPath) {
           clearTimeout(pipeTimeout);
           // Process any remaining buffered SSE data
           if (pendingSSE.trim()) {
-            if (pendingSSE.includes('"tool_calls"') || pendingSSE.includes('"thought_signature"')) {
-              for (const parsed of parseSSELines(pendingSSE)) {
-                prov.extractThoughtSignatures(parsed);
+            for (const parsed of parseSSELines(pendingSSE)) {
+              prov.extractThoughtSignatures(parsed);
+              // Extract usage from final chunk (non-streaming responses)
+              if (prov.scorer && !usageExtracted && parsed?.usage) {
+                const outTokens = parsed.usage.completion_tokens || parsed.usage.total_tokens || 0;
+                if (outTokens > 0) {
+                  prov.scorer.recordResponse(key, outTokens);
+                  usageExtracted = true;
+                }
               }
             }
           }
@@ -1371,6 +1389,10 @@ async function handleProxy(req, res, prov, proxyPath) {
       prov.recordError(key);
       prov.cbRecordError();
       if (prov.scorer) prov.scorer.recordError(key);
+      if (attempt < attempts - 1) {
+        const backoffMs = Math.min(100 * Math.pow(2, attempt), 2000);
+        await new Promise(r => setTimeout(r, backoffMs));
+      }
       if (attempt === attempts - 1) {
         res.writeHead(502, { "content-type": "application/json" });
         return res.end(JSON.stringify({ error: "upstream error", provider: prov.name }));

@@ -78,6 +78,7 @@ function httpGet(url, headers) {
       res.on("data", (c) => {
         totalBytes += c.length;
         if (totalBytes > HTTP_MAX_BODY) {
+          clearTimeout(wallTimer);
           req.destroy();
           return done(reject, new Error("response too large"));
         }
@@ -165,8 +166,18 @@ async function main() {
   if (!Array.isArray(models)) throw new Error(`/models response missing "data" array`);
   console.log(`[sync] Got ${models.length} models`);
 
-  // 2. Fetch providers list
-  const providersResp = await httpGet(`${KEYMUX_URL}/providers`, headers);
+  // 2. Fetch providers list (with retries, same as /models)
+  let providersResp;
+  for (let attempt = 0; attempt < 3; attempt++) {
+    try {
+      providersResp = await httpGet(`${KEYMUX_URL}/providers`, headers);
+      break;
+    } catch (err) {
+      if (attempt === 2) throw err;
+      console.warn(`[sync] /providers attempt ${attempt + 1} failed: ${err.message}, retrying in 2s...`);
+      await new Promise(r => setTimeout(r, 2000));
+    }
+  }
   const providerList = providersResp?.providers;
   if (!providerList || typeof providerList !== "object") throw new Error(`/providers response missing "providers" object`);
   console.log(`[sync] Providers: ${Object.keys(providerList).join(", ")}`);
@@ -191,6 +202,7 @@ async function main() {
       try { fs.copyFileSync(MODELS_JSON, MODELS_JSON + ".corrupt"); } catch {}
     }
   }
+  if (!existing.providers) existing.providers = {};
 
   // 5. Remove old keymux-* providers
   for (const key of Object.keys(existing.providers)) {
