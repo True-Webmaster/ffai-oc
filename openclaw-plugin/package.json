@@ -1,0 +1,12 @@
+{
+  "name": "@openclaw/ffai-provider",
+  "version": "1.0.0",
+  "private": true,
+  "description": "OpenClaw FFAI provider plugin — free-tier AI key-pooling proxy",
+  "type": "module",
+  "openclaw": {
+    "extensions": [
+      "./index.ts"
+    ]
+  }
+}

@@ -3,5 +3,9 @@ data/
 stats/
 .env
 providers.json
+config.json
 *.log
+import-audit.log
+*.bak
+*.pre-security-audit
 .claude/

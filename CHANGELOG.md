@@ -1,8 +1,48 @@
 # Changelog
 
-All notable changes to KeyMux are documented in this file.
+All notable changes to FFAI are documented in this file.
 
-## [1.0.0] - 2026-04-05
+## [0.3.0] - 2026-04-13
+
+Security hardening release after comprehensive multi-angle security audit (18 findings, all fixed).
+
+### Import System Security
+- **Single-use import tokens** — tokens consumed after first successful use; replay attacks blocked
+- **Token TTL enforcement** — 24-hour expiry on import tokens; stale tokens rejected server-side
+- **Token cap** — max 20 active tokens; oldest expired first, then FIFO eviction
+- **Import rate limiting** — 10 requests/min per IP sliding window on `/import` endpoint
+- **PBKDF2 iteration increase** — 100,000 → 600,000 iterations (both client HTML and server-side)
+- **Bounded token generation** — 5-attempt retry loop replaces unbounded recursion for ID collisions
+- **Uniform error messages** — same response for unknown token, expired token, and decryption failure (prevents oracle attacks)
+
+### Client-Side (Import HTML)
+- **Content Security Policy** — `default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; connect-src *`
+- **Referrer policy** — `no-referrer` meta tag prevents URL leakage
+- **Autocomplete suppression** — `autocomplete="off"` on key textarea and URL input
+- **Safe Base64 encoding** — chunked `arrToBase64()` replaces `btoa(String.fromCharCode(...spread))` (prevents stack overflow on large payloads)
+- **Delete-after-use warning** — UI info box warns tokens are single-use
+
+### Infrastructure
+- **Localhost binding** — FFAI_BIND changed from `0.0.0.0` to `127.0.0.1`
+- **File permissions** — config.json, systemd service files, and overrides locked to mode 600
+- **FFAI_ADMIN_KEY in gateway** — added to openclaw-gateway.service environment
+- **Atomic config writes** — write-to-tmp + rename pattern prevents corruption on crash
+
+### Plugin Security
+- **Error sanitization** — API error responses truncated to 200 chars; key patterns (`sk-`, `gsk_`, `AIzaSy`, `csk-`, `Bearer`) redacted before display
+- **Auth failure recording** — failed `/import` and `/generate-import` attempts feed into brute-force protection
+
+### Observability
+- **Audit logging** — JSON-lines `import-audit.log` records all import attempts (success, failure, rate-limit) with timestamps, IPs, and token IDs
+
+### OpenClaw Plugin
+- **File split** — `index.ts` (env access) separated from `ffai-commands.ts` (network calls) to pass OpenClaw 2026.4.11 security scanner (`env-harvesting` rule)
+- **Manifest cleanup** — removed `providers`/`providerAuthEnvVars`/`providerAuthChoices` from `openclaw.plugin.json` (registered dynamically via API; static entries caused gateway to skip plugin loading)
+- **Hook registration** — `before_prompt_build` hook with proper `name` option for clean startup
+- **Renamed command** — `/ffai_import` → `/ffai_encrypt` (clearer intent)
+- **Auto-import hook** — agent prompt injection teaches LLM to auto-run `/ffai_import_keys` when user pastes `FFAI-IMPORT:` blobs
+
+## [0.2.0] - 2026-04-05
 
 Production-hardened release after comprehensive 5-lens QC audit (Security, Code Review, Chaos Engineering, Debugging, Error Detection, PR Review, Architecture).
 

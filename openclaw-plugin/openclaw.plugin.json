@@ -1,0 +1,35 @@
+{
+  "id": "ffai",
+  "name": "FFAI Provider",
+  "description": "Free-tier AI key-pooling proxy with multi-provider model discovery",
+  "version": "1.0.0",
+  "entryPoint": "index.ts",
+  "enabledByDefault": true,
+  "configSchema": {
+    "type": "object",
+    "additionalProperties": false,
+    "properties": {
+      "baseUrl": {
+        "type": "string",
+        "description": "FFAI server URL (e.g., http://127.0.0.1:8010)"
+      },
+      "favorites": {
+        "type": "array",
+        "items": {
+          "type": "string"
+        },
+        "description": "Model IDs to include in the ffai-favorites provider group"
+      }
+    }
+  },
+  "uiHints": {
+    "baseUrl": {
+      "label": "FFAI Server URL",
+      "help": "URL of your FFAI key-pooling proxy (default: http://127.0.0.1:8010)"
+    },
+    "favorites": {
+      "label": "Favorite Models",
+      "help": "List of model IDs to group under ffai-favorites for quick access in /models"
+    }
+  }
+}
