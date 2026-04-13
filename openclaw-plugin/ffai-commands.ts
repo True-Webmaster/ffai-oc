@@ -6,7 +6,7 @@
  * All env-derived values are passed in as resolved parameters.
  */
 
-// ── Smush stats types ─────────────────────────────────────────────────────
+// ── FFAI compression stats types ─────────────────────────────────────────────────────
 
 type SmushPeriodStats = {
   requests: number;
@@ -76,7 +76,7 @@ function formatPeriod(label: string, s: SmushPeriodStats): string {
 
 function formatSmushStats(data: SmushStatsResponse): string {
   const sections = [
-    "Smush Compression Stats",
+    "FFAI Compression Stats",
     "━━━━━━━━━━━━━━━━━━━━━━━━━",
     formatPeriod("Today", data.today),
     "",
@@ -108,7 +108,7 @@ export async function handleFfaiStats(params: {
   const { baseUrl, apiKey } = params;
 
   if (!apiKey) {
-    return { text: "FFAI_KEY not configured. Cannot fetch smush stats.", isError: true };
+    return { text: "FFAI_KEY not configured. Cannot fetch compression stats.", isError: true };
   }
 
   try {
@@ -125,7 +125,7 @@ export async function handleFfaiStats(params: {
     const data = await resp.json() as SmushStatsResponse;
 
     if (!data.enabled) {
-      return { text: "Smush compression is disabled in FFAI config." };
+      return { text: "FFAI compression is disabled in config." };
     }
 
     return { text: formatSmushStats(data) };
