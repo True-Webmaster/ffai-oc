@@ -6,7 +6,15 @@
  * All env-derived values are passed in as resolved parameters.
  */
 
-// ── FFAI compression stats types ─────────────────────────────────────────────────────
+// ── FFAI savings types ──────────────────────────────────────────────────────────
+
+type UsagePeriodStats = {
+  requests: number;
+  inputTokens: number;
+  outputTokens: number;
+  estimatedCostAvoided: number;
+  byProvider: Record<string, { requests: number; inputTokens: number; outputTokens: number; estimatedCostAvoided: number }>;
+};
 
 type SmushPeriodStats = {
   requests: number;
@@ -20,77 +28,82 @@ type SmushPeriodStats = {
   byProvider: Record<string, { requests: number; tokensSaved: number; costSaved: number }>;
 };
 
-type SmushStatsResponse = {
-  enabled: boolean;
-  today: SmushPeriodStats;
-  month: SmushPeriodStats;
-  lifetime: SmushPeriodStats;
+type SavingsPeriod = {
+  usage: UsagePeriodStats;
+  compression: SmushPeriodStats;
+};
+
+type SavingsResponse = {
+  today: SavingsPeriod;
+  month: SavingsPeriod;
+  lifetime: SavingsPeriod;
+  smushEnabled: boolean;
   cacheSize: number;
 };
 
-// ── Formatters ────────────────────────────────────────────────────────────
+// ── Formatters ────────────────────────────────────────────────────────────────────
 
-function fmtTokens(n: number): string {
+function fmtNum(n: number): string {
   if (n >= 1_000_000) return `${(n / 1_000_000).toFixed(1)}M`;
   if (n >= 1_000) return `${(n / 1_000).toFixed(1)}K`;
-  return String(n);
+  return n.toLocaleString();
 }
 
 function fmtCost(n: number): string {
   if (n < 0.001) return "<$0.001";
-  return `$${n.toFixed(3)}`;
+  if (n >= 100) return `$${n.toFixed(2)}`;
+  return `$${n.toFixed(n >= 10 ? 2 : 3)}`;
 }
 
-function fmtBytes(n: number): string {
-  if (n >= 1_048_576) return `${(n / 1_048_576).toFixed(1)}MB`;
-  if (n >= 1_024) return `${(n / 1_024).toFixed(1)}KB`;
-  return `${n}B`;
-}
+function formatSavingsPeriod(label: string, period: SavingsPeriod, smushEnabled: boolean): string {
+  const u = period.usage;
+  if (u.requests === 0) return `${label}:\n  no data`;
 
-function formatPeriod(label: string, s: SmushPeriodStats): string {
-  if (s.requests === 0) return `${label}: no data`;
-
+  const totalTokens = u.inputTokens + u.outputTokens;
   const lines = [
     `${label}:`,
-    `  ${s.requests} requests compressed`,
-    `  ~${fmtTokens(s.tokensSaved)} tokens saved (${fmtBytes(s.bytesSaved)})`,
-    `  Est. savings: ${fmtCost(s.costSaved)}`,
+    `  ${fmtNum(u.requests)} requests \u00b7 ${fmtNum(totalTokens)} tokens (in: ${fmtNum(u.inputTokens)}, out: ${fmtNum(u.outputTokens)})`,
+    `  \ud83d\udcb0 Cost avoided: ${fmtCost(u.estimatedCostAvoided)}`,
   ];
 
-  const parts: string[] = [];
-  if (s.cacheHits > 0) parts.push(`cache: ${s.cacheHits}`);
-  if (s.cmdCompressed > 0) parts.push(`cmd: ${s.cmdCompressed}`);
-  if (s.summarized > 0) parts.push(`summary: ${s.summarized}`);
-  if (s.textCompressed > 0) parts.push(`text: ${s.textCompressed}`);
-  if (parts.length > 0) lines.push(`  ${parts.join(" · ")}`);
-
-  const providers = Object.entries(s.byProvider);
-  if (providers.length > 0) {
-    for (const [name, p] of providers) {
-      lines.push(`  ${name}: ${p.requests} req, ~${fmtTokens(p.tokensSaved)} tokens`);
+  if (smushEnabled) {
+    const c = period.compression;
+    if (c.tokensSaved > 0) {
+      lines.push(`  \ud83d\udddc\ufe0f Compression: ~${fmtNum(c.tokensSaved)} tokens saved (${fmtCost(c.costSaved)})`);
     }
   }
 
   return lines.join("\n");
 }
 
-function formatSmushStats(data: SmushStatsResponse): string {
+function formatSavingsStats(data: SavingsResponse): string {
   const sections = [
-    "FFAI Compression Stats",
-    "━━━━━━━━━━━━━━━━━━━━━━━━━",
-    formatPeriod("Today", data.today),
+    "FFAI Usage & Savings",
+    "\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501",
+    formatSavingsPeriod("Today", data.today, data.smushEnabled),
     "",
-    formatPeriod("Last 30 days", data.month),
+    formatSavingsPeriod("Last 30 days", data.month, data.smushEnabled),
     "",
-    formatPeriod("Lifetime", data.lifetime),
-    "",
-    `File cache: ${data.cacheSize} entries`,
+    formatSavingsPeriod("Lifetime", data.lifetime, data.smushEnabled),
   ];
+
+  // Top providers for lifetime only
+  const providers = Object.entries(data.lifetime.usage.byProvider)
+    .filter(([, p]) => p.requests > 0)
+    .sort((a, b) => b[1].estimatedCostAvoided - a[1].estimatedCostAvoided);
+
+  if (providers.length > 0) {
+    sections.push("");
+    sections.push("Top providers:");
+    for (const [name, p] of providers) {
+      sections.push(`  ${name}: ${fmtNum(p.requests)} req \u00b7 ${fmtCost(p.estimatedCostAvoided)} saved`);
+    }
+  }
 
   return sections.join("\n");
 }
 
-// ── Command handlers ──────────────────────────────────────────────────────
+// ── Command handlers ────────────────────────────────────────────────────────────
 
 export type CommandResult = {
   text: string;
@@ -108,11 +121,11 @@ export async function handleFfaiStats(params: {
   const { baseUrl, apiKey } = params;
 
   if (!apiKey) {
-    return { text: "FFAI_KEY not configured. Cannot fetch compression stats.", isError: true };
+    return { text: "FFAI_KEY not configured. Cannot fetch stats.", isError: true };
   }
 
   try {
-    const resp = await fetch(`${baseUrl}/smush`, {
+    const resp = await fetch(`${baseUrl}/savings`, {
       headers: { Authorization: `Bearer ${apiKey}` },
       signal: AbortSignal.timeout(10000),
     });
@@ -122,13 +135,8 @@ export async function handleFfaiStats(params: {
       return { text: `FFAI returned ${resp.status}: ${errBody}`, isError: true };
     }
 
-    const data = await resp.json() as SmushStatsResponse;
-
-    if (!data.enabled) {
-      return { text: "FFAI compression is disabled in config." };
-    }
-
-    return { text: formatSmushStats(data) };
+    const data = await resp.json() as SavingsResponse;
+    return { text: formatSavingsStats(data) };
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
     return { text: `Failed to reach FFAI: ${msg}`, isError: true };

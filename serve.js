@@ -157,6 +157,18 @@ const pool = new Pool({
   pricing: config.pricing || {},
 });
 
+
+// __ Model pricing for savings estimation ($ per 1M tokens) ________________
+const MODEL_PRICING = {
+  gemini:     { input: 1.25, output: 5.00 },    // Gemini 2.5 Pro avg
+  groq:       { input: 0.05, output: 0.10 },    // Groq free-tier models avg
+  cerebras:   { input: 0.10, output: 0.10 },    // Cerebras free-tier avg
+  openai:     { input: 2.50, output: 10.00 },   // GPT-4.1 avg
+  openrouter: { input: 1.00, output: 3.00 },    // OpenRouter avg
+  mistral:    { input: 0.50, output: 1.50 },    // Mistral avg
+  default:    { input: 0.50, output: 1.50 },    // Fallback
+};
+
 const deprecationTracker = new DeprecationTracker({ logger: console });
 pool.deprecationTracker = deprecationTracker;
 
@@ -1457,6 +1469,42 @@ function handleSmush(req, res) {
   sendJson(res, 200, result);
 }
 
+
+// __ Route: /savings _________________________________________________________
+function handleSavings(req, res) {
+  const today = new Date().toISOString().slice(0, 10);
+
+  // Last 30 days
+  const monthKeys = [];
+  for (let i = 0; i < 30; i++) {
+    const d = new Date();
+    d.setDate(d.getDate() - i);
+    monthKeys.push(d.toISOString().slice(0, 10));
+  }
+
+  // All available days
+  const allKeys = Object.keys(pool.stats.data.days);
+
+  const result = {
+    today: {
+      usage: pool.stats.aggregateUsage([today], MODEL_PRICING),
+      compression: pool.stats.aggregateSmush([today]),
+    },
+    month: {
+      usage: pool.stats.aggregateUsage(monthKeys, MODEL_PRICING),
+      compression: pool.stats.aggregateSmush(monthKeys),
+    },
+    lifetime: {
+      usage: pool.stats.aggregateUsage(allKeys, MODEL_PRICING),
+      compression: pool.stats.aggregateSmush(allKeys),
+    },
+    smushEnabled: !!config.smush?.enabled,
+    cacheSize: getSmushStats().cacheSize,
+  };
+
+  sendJson(res, 200, result);
+}
+
 // ── Route: /providers ───────────────────────────────────────────────────────
 function handleProviders(req, res) {
   const result = {};
@@ -1829,6 +1877,13 @@ async function handleRequest(req, res) {
   if (pathname === "/smush" && req.method === "GET") {
     if (!requireAuth()) return sendJson(res, 401, { error: "unauthorized" });
     return handleSmush(req, res);
+  }
+
+
+  // /savings
+  if (pathname === "/savings" && req.method === "GET") {
+    if (!requireAuth()) return sendJson(res, 401, { error: "unauthorized" });
+    return handleSavings(req, res);
   }
 
   // /families
