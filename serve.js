@@ -54,7 +54,6 @@ const VALIDATE_KEYS = process.env.FFAI_VALIDATE_KEYS === "true" || process.env.F
 const SSE_TIMEOUT = envInt("FFAI_SSE_TIMEOUT", 0); // 0 = auto (3x REQUEST_TIMEOUT, min 360s)
 const STATS_RETENTION_DAYS = envInt("FFAI_STATS_RETENTION_DAYS", 7);
 const STATS_FLUSH_INTERVAL = envInt("FFAI_STATS_FLUSH_INTERVAL", 60000);
-const DISCOVERY_INTERVAL = envInt("FFAI_DISCOVERY_INTERVAL", 300000);
 const DISCOVERY_TIMEOUT = envInt("FFAI_DISCOVERY_TIMEOUT", 30000);
 const DISCOVERY_SOCKET_TIMEOUT = envInt("FFAI_DISCOVERY_SOCKET_TIMEOUT", 15000);
 const DISCOVERY_SPEC_TIMEOUT = envInt("FFAI_DISCOVERY_SPEC_TIMEOUT", 30000);
@@ -180,7 +179,6 @@ pool._upstreamUrls = upstreamUrls; // expose for discovery to read
 const MIN_TPM = envInt("FFAI_MIN_TPM", 20000);
 const discovery = new ModelDiscovery({
   pool, logger: console, minTpm: MIN_TPM,
-  refreshIntervalMs: DISCOVERY_INTERVAL,
   minContextWindow: MIN_CONTEXT_WINDOW,
   minOutputTokens: MIN_OUTPUT_TOKENS,
   minParamBillions: MIN_PARAM_BILLIONS,
@@ -1987,7 +1985,6 @@ async function shutdown(signal) {
   console.log(`[ffai] ${signal} received, shutting down...`);
 
   // Stop accepting new connections
-  discovery.stopPeriodicRefresh();
   server.close();
 
   // Drain active SSE connections with timeout
