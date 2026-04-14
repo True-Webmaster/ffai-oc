@@ -1200,11 +1200,14 @@ async function handleImport(req, res) {
   const match = tokens.find(t => t.id === envelope.id);
 
   // Fix #2: Check token TTL (don't reveal whether token existed — fall through to generic error)
-  const validMatch = match && (Date.now() - new Date(match.created).getTime()) <= IMPORT_TOKEN_TTL_MS;
+  const matchAge = match ? Date.now() - new Date(match.created).getTime() : null;
+  const validMatch = match && matchAge <= IMPORT_TOKEN_TTL_MS;
 
   // Fix #10: Same error message for unknown token and failed decryption
   if (!validMatch) {
-    auditLog({ event: "import_failed", reason: "unknown_or_expired_token", tokenId: envelope.id, ip });
+    // Distinguish expired vs unknown in the audit log (response body stays identical)
+    const reason = match ? "expired_token" : "unknown_token";
+    auditLog({ event: "import_failed", reason, tokenId: envelope.id, ip });
     // Fix #12: Record auth failure for IP blocking
     authGuard.recordFailure(ip);
     return sendJson(res, 403, { error: "import failed — token invalid, expired, or already used" });
