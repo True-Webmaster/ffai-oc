@@ -1125,11 +1125,14 @@ function handleGenerateImport(req, res) {
   // Fix #13: Prevent token ID collisions with bounded retry (not recursion)
   let finalToken = token;
   let finalTokenId = tokenId;
-  for (let attempt = 0; attempt < 5; attempt++) {
-    if (!currentConfig.import_tokens.some(t => t.id === finalTokenId)) break;
+  let collisionResolved = !currentConfig.import_tokens.some(t => t.id === finalTokenId);
+  for (let attempt = 0; attempt < 5 && !collisionResolved; attempt++) {
     finalToken = crypto.randomBytes(32).toString("hex");
     finalTokenId = finalToken.substring(0, 8);
-    if (attempt === 4) return sendJson(res, 500, { error: "token generation failed — try again" });
+    collisionResolved = !currentConfig.import_tokens.some(t => t.id === finalTokenId);
+  }
+  if (!collisionResolved) {
+    return sendJson(res, 500, { error: "token generation failed — try again" });
   }
 
   currentConfig.import_tokens.push({
@@ -1196,15 +1199,7 @@ async function handleImport(req, res) {
   const tokens = config.import_tokens || [];
   const match = tokens.find(t => t.id === envelope.id);
 
-  // Fix #2: Check token TTL
-  if (match) {
-    const age = Date.now() - new Date(match.created).getTime();
-    if (age > IMPORT_TOKEN_TTL_MS) {
-      console.warn(`[ffai] Import token ${envelope.id} expired (age: ${Math.round(age / 3600000)}h)`);
-      // Don't reveal whether it existed — fall through to generic error
-    }
-  }
-
+  // Fix #2: Check token TTL (don't reveal whether token existed — fall through to generic error)
   const validMatch = match && (Date.now() - new Date(match.created).getTime()) <= IMPORT_TOKEN_TTL_MS;
 
   // Fix #10: Same error message for unknown token and failed decryption
