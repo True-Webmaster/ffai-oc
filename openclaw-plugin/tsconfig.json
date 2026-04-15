@@ -1,0 +1,30 @@
+{
+  "compilerOptions": {
+    "target": "ES2022",
+    "module": "ES2022",
+    "moduleResolution": "bundler",
+    "lib": ["ES2022", "DOM"],
+    "strict": true,
+    "noImplicitAny": true,
+    "noImplicitOverride": true,
+    "noUnusedLocals": true,
+    "noUnusedParameters": false,
+    "exactOptionalPropertyTypes": false,
+    "esModuleInterop": true,
+    "forceConsistentCasingInFileNames": true,
+    "skipLibCheck": true,
+    "noEmit": true,
+    "isolatedModules": true,
+    "allowImportingTsExtensions": false,
+    "resolveJsonModule": true,
+    "types": ["node"]
+  },
+  "include": [
+    "index.ts",
+    "models.ts",
+    "provider-catalog.ts",
+    "onboard.ts",
+    "defaults.ts",
+    "ffai-commands.ts"
+  ]
+}

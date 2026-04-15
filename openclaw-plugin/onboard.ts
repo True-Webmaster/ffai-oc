@@ -1,5 +1,20 @@
 /**
  * FFAI onboarding — applies FFAI config to openclaw.json during setup.
+ *
+ * Runs exactly once, inside the auth.run callback when the user first pastes
+ * an API key. At that point we don't yet know which models FFAI will expose
+ * (discovery hasn't run), so this file intentionally avoids hard-coding a
+ * default model ref. Instead it:
+ *
+ *   - Registers the ffai provider shell (baseUrl, api, empty catalog).
+ *   - Optionally promotes a caller-supplied "preferred" model ref to the
+ *     agent default if one is passed in (e.g. the first configured
+ *     favorite). Callers who don't know a ref yet pass undefined and let
+ *     the first discovery cycle populate the catalog.
+ *
+ * The previous hard-coded `ffai-gemini/gemini-2.5-pro` default broke
+ * onboarding for users whose FFAI instance had no Gemini key, silently
+ * leaving them on a model ref that would never resolve.
  */
 import {
   applyAgentDefaultModelPrimary,
@@ -8,29 +23,18 @@ import {
 } from "openclaw/plugin-sdk/provider-onboard";
 import { FFAI_DEFAULT_BASE_URL } from "./defaults.js";
 
-export const FFAI_DEFAULT_MODEL_REF = "ffai-gemini/gemini-2.5-pro";
-
-export function applyFfaiProviderConfig(cfg: OpenClawConfig): OpenClawConfig {
-  const models = { ...cfg.agents?.defaults?.models };
-
-  // Add default favorite model to the allowlist
-  models[FFAI_DEFAULT_MODEL_REF] = {
-    ...models[FFAI_DEFAULT_MODEL_REF],
-    alias: models[FFAI_DEFAULT_MODEL_REF]?.alias ?? "FFAI",
-  };
-
-  return applyProviderConfigWithModelCatalog(cfg, {
-    agentModels: models,
+export function applyFfaiConfig(
+  cfg: OpenClawConfig,
+  options: { preferredModelRef?: string; baseUrl?: string } = {},
+): OpenClawConfig {
+  const root = (options.baseUrl ?? FFAI_DEFAULT_BASE_URL).replace(/\/+$/, "").replace(/\/v1$/i, "");
+  const withProvider = applyProviderConfigWithModelCatalog(cfg, {
+    agentModels: { ...cfg.agents?.defaults?.models },
     providerId: "ffai",
     api: "openai-completions",
-    baseUrl: `${FFAI_DEFAULT_BASE_URL}/v1`,
+    baseUrl: `${root}/v1`,
     catalogModels: [],
   });
-}
-
-export function applyFfaiConfig(cfg: OpenClawConfig): OpenClawConfig {
-  return applyAgentDefaultModelPrimary(
-    applyFfaiProviderConfig(cfg),
-    FFAI_DEFAULT_MODEL_REF,
-  );
+  if (!options.preferredModelRef) return withProvider;
+  return applyAgentDefaultModelPrimary(withProvider, options.preferredModelRef);
 }

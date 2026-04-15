@@ -1,12 +1,53 @@
 {
-  "name": "@openclaw/ffai-provider",
-  "version": "1.0.0",
-  "private": true,
-  "description": "OpenClaw FFAI provider plugin — free-tier AI key-pooling proxy",
+  "name": "@ffai/openclaw-plugin",
+  "version": "1.1.0",
+  "description": "OpenClaw FFAI provider plugin — free-tier AI key-pooling proxy with dynamic model discovery",
+  "license": "MIT",
   "type": "module",
+  "main": "./index.ts",
+  "exports": {
+    ".": "./index.ts",
+    "./plugin": "./openclaw.plugin.json"
+  },
+  "files": [
+    "index.ts",
+    "models.ts",
+    "provider-catalog.ts",
+    "onboard.ts",
+    "defaults.ts",
+    "ffai-commands.ts",
+    "openclaw.plugin.json",
+    "tsconfig.json",
+    "README.md"
+  ],
   "openclaw": {
     "extensions": [
       "./index.ts"
     ]
-  }
+  },
+  "scripts": {
+    "typecheck": "tsc --noEmit"
+  },
+  "peerDependencies": {
+    "openclaw": "*"
+  },
+  "devDependencies": {
+    "typescript": "^5.4.0"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "keywords": [
+    "openclaw",
+    "openclaw-plugin",
+    "ffai",
+    "llm",
+    "ai-proxy",
+    "provider"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/truewebmaster/ffai"
+  },
+  "homepage": "https://github.com/truewebmaster/ffai#openclaw-plugin"
 }
