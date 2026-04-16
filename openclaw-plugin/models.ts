@@ -162,7 +162,10 @@ function describe(err: unknown): string {
 // ── Convert FFAI model to OpenClaw format ───────────────────────────────────
 
 function isReasoningModelHeuristic(modelId: string): boolean {
-  return /think|reason|r1/i.test(modelId);
+  // Word-boundary anchored to avoid false positives like "rethink-mini",
+  // "unreasonable-v2", or "ar1t-base". Matches: "deepthink", "reasoning",
+  // "o1-mini", "r1-distill", "qwq" (Qwen reasoning), "thinking".
+  return /\bthink(?:ing)?\b|\breason(?:ing)?\b|\br1\b|\bo1\b|\bqwq\b/i.test(modelId);
 }
 
 export function buildFfaiModelDefinition(model: FfaiModel): ModelDefinitionConfig {

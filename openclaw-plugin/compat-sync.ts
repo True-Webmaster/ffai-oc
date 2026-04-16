@@ -43,14 +43,23 @@ import os from "node:os";
 
 import type { ModelProviderConfig } from "openclaw/plugin-sdk/provider-model-shared";
 import { buildFfaiProviders } from "./provider-catalog.js";
-import { FFAI_DEFAULT_BASE_URL } from "./defaults.js";
+import {
+  FFAI_DEFAULT_BASE_URL,
+  FFAI_PROVIDER_ID,
+  normalizeFfaiBaseUrl,
+  normalizePluginConfig,
+} from "./defaults.js";
 
-const PROVIDER_ID = "ffai";
+const PROVIDER_ID = FFAI_PROVIDER_ID;
 const PROVIDER_PREFIX = "ffai-";
 
 // Module-level guard — prevents re-entry when the config write triggers a
 // gateway reload that re-calls `register()` → `runCompatSync()`.
+// Set to true only after a SUCCESSFUL sync or when the native discovery path
+// is healthy. A failed attempt (FFAI down at startup) must not permanently
+// block retries for the life of the process.
 let syncHasFired = false;
+let syncInFlight = false;
 // Heartbeat lives under `<workspaceDir>/.plugin-state/ffai-compat-sync/` so
 // both the catalog hook (which gets `workspaceDir`) and the service shim
 // (which also reads from workspaceDir for the openclaw.json path) address
@@ -70,7 +79,7 @@ export type CompatSyncLogger = {
   error?: (msg: string) => void;
 };
 
-export type FfaiPluginConfig = {
+export type CompatSyncPluginConfig = {
   baseUrl?: string;
   favorites: readonly string[];
   compatSync: boolean;
@@ -215,30 +224,22 @@ export function mergeFfaiProvidersIntoConfig(
   return { next, changed: true };
 }
 
-// ── Config normalization (shared shape with index.ts / provider-discovery.ts)
-//
-// The shim cannot import from those files because they pull in the full
-// plugin-entry runtime; duplicating the 20-line helper is cheaper than a
-// shared file both sides pull in.
+// ── Config normalization ──────────────────────────────────────────────────
+// Base normalization (baseUrl, favorites) comes from the shared
+// normalizePluginConfig in defaults.ts. Compat-sync adds the `compatSync`
+// toggle on top.
 
-export function normalizeCompatSyncConfig(raw: unknown): FfaiPluginConfig {
+export function normalizeCompatSyncConfig(raw: unknown): CompatSyncPluginConfig {
+  const base = normalizePluginConfig(raw);
   const src = (raw && typeof raw === "object" ? raw : {}) as Record<string, unknown>;
-  const baseUrl = typeof src.baseUrl === "string" ? src.baseUrl.trim() || undefined : undefined;
-  const favorites = Array.isArray(src.favorites)
-    ? src.favorites.filter((x): x is string => typeof x === "string" && x.trim().length > 0)
-    : [];
   // Default: ON. This is the workaround window. Users who know upstream is
   // fixed on their host can flip it to false to disable the shim.
   const compatSync = src.compatSync === false ? false : true;
-  return { baseUrl, favorites, compatSync };
-}
-
-function normalizeFfaiBaseUrl(raw: string): string {
-  return raw.trim().replace(/\/+$/, "").replace(/\/v1$/i, "");
+  return { ...base, compatSync };
 }
 
 export function resolveCompatSyncBaseUrl(params: {
-  pluginConfig: FfaiPluginConfig;
+  pluginConfig: CompatSyncPluginConfig;
   env: NodeJS.ProcessEnv;
 }): string {
   const envUrl = params.env.FFAI_URL?.trim();
@@ -275,9 +276,11 @@ export type CompatSyncStartContext = {
  */
 export async function runCompatSync(ctx: CompatSyncStartContext): Promise<void> {
   // Prevent re-entry: config writes trigger gateway reloads that re-call
-  // register() → runCompatSync(). One sync per process is enough.
-  if (syncHasFired) return;
-  syncHasFired = true;
+  // register() → runCompatSync(). `syncHasFired` is permanent (success);
+  // `syncInFlight` prevents concurrent runs but resets on failure so the
+  // next register() call can retry.
+  if (syncHasFired || syncInFlight) return;
+  syncInFlight = true;
 
   const logger = ctx.logger;
   const env = ctx.env ?? process.env;
@@ -298,6 +301,7 @@ export async function runCompatSync(ctx: CompatSyncStartContext): Promise<void> 
 
   if (!pluginConfig.compatSync) {
     logger?.info?.("[ffai] compat-sync disabled by plugin config (compatSync=false)");
+    syncHasFired = true; // intentional config — no retry
     return;
   }
 
@@ -311,6 +315,7 @@ export async function runCompatSync(ctx: CompatSyncStartContext): Promise<void> 
     logger?.info?.(
       "[ffai] native discovery path is healthy this session (fresh heartbeat) — compat-sync skipping",
     );
+    syncHasFired = true; // native path works — no retry
     return;
   }
 
@@ -327,6 +332,7 @@ export async function runCompatSync(ctx: CompatSyncStartContext): Promise<void> 
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
     logger?.warn?.(`[ffai] compat-sync discovery threw: ${msg}`);
+    syncInFlight = false; // allow retry on next register()
     return;
   }
 
@@ -336,6 +342,7 @@ export async function runCompatSync(ctx: CompatSyncStartContext): Promise<void> 
     logger?.info?.(
       `[ffai] compat-sync skipping write (source=${fetched.source}, providers=${Object.keys(fetched.providers).length})`,
     );
+    syncInFlight = false; // transient failure — allow retry on next register()
     return;
   }
 
@@ -354,22 +361,26 @@ export async function runCompatSync(ctx: CompatSyncStartContext): Promise<void> 
   const onDisk = await readOpenclawConfig(configPath, logger);
   if (!onDisk) {
     logger?.warn?.(`[ffai] compat-sync: could not read ${configPath} — skipping write`);
+    syncInFlight = false; // allow retry
     return;
   }
 
   const { next, changed } = mergeFfaiProvidersIntoConfig(onDisk, fetched.providers);
   if (!changed) {
     logger?.info?.("[ffai] compat-sync: on-disk catalog already matches discovery — no write");
+    syncHasFired = true; // success — catalog is correct
     return;
   }
 
   try {
     await writeOpenclawConfigAtomic(configPath, next);
+    syncHasFired = true; // success — catalog written
     logger?.info?.(
       `[ffai] compat-sync: wrote ${Object.keys(fetched.providers).length} ffai-* providers to ${configPath}`,
     );
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
     logger?.error?.(`[ffai] compat-sync: failed to write ${configPath}: ${msg}`);
+    syncInFlight = false; // write failed — allow retry
   }
 }

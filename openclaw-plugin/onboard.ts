@@ -21,13 +21,13 @@ import {
   applyProviderConfigWithModelCatalog,
   type OpenClawConfig,
 } from "openclaw/plugin-sdk/provider-onboard";
-import { FFAI_DEFAULT_BASE_URL } from "./defaults.js";
+import { FFAI_DEFAULT_BASE_URL, normalizeFfaiBaseUrl } from "./defaults.js";
 
 export function applyFfaiConfig(
   cfg: OpenClawConfig,
   options: { preferredModelRef?: string; baseUrl?: string } = {},
 ): OpenClawConfig {
-  const root = (options.baseUrl ?? FFAI_DEFAULT_BASE_URL).replace(/\/+$/, "").replace(/\/v1$/i, "");
+  const root = normalizeFfaiBaseUrl(options.baseUrl ?? FFAI_DEFAULT_BASE_URL);
   const withProvider = applyProviderConfigWithModelCatalog(cfg, {
     agentModels: { ...cfg.agents?.defaults?.models },
     providerId: "ffai",

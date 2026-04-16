@@ -20,35 +20,17 @@ import {
   type OpenClawPluginApi,
   type PluginCommandContext,
 } from "openclaw/plugin-sdk/plugin-entry";
-import { FFAI_DEFAULT_BASE_URL } from "./defaults.js";
+import {
+  FFAI_DEFAULT_BASE_URL,
+  FFAI_PROVIDER_ID,
+  normalizeFfaiBaseUrl,
+  normalizePluginConfig,
+  type FfaiBasePluginConfig,
+} from "./defaults.js";
 import { handleFfaiStats, handleFfaiEncrypt, handleFfaiImportKeys } from "./ffai-commands.js";
 import { runCompatSync } from "./compat-sync.js";
 
-const PROVIDER_ID = "ffai";
-
-type FfaiPluginConfig = {
-  baseUrl?: string;
-  favorites: string[];
-};
-
-/**
- * Normalize & validate plugin config from the SDK. The host stores config as
- * untyped JSON, so we re-validate at the boundary rather than trusting `as`.
- */
-function normalizePluginConfig(raw: unknown): FfaiPluginConfig {
-  const src = (raw && typeof raw === "object" ? raw : {}) as Record<string, unknown>;
-  const baseUrl = typeof src.baseUrl === "string" ? src.baseUrl.trim() || undefined : undefined;
-  const favorites = Array.isArray(src.favorites)
-    ? src.favorites.filter((x): x is string => typeof x === "string" && x.trim().length > 0)
-    : [];
-  return { baseUrl, favorites };
-}
-
-function normalizeFfaiBaseUrl(raw: string): string {
-  return raw.trim().replace(/\/+$/, "").replace(/\/v1$/i, "");
-}
-
-function resolveFfaiBaseUrl(pluginConfig: FfaiPluginConfig): string {
+function resolveFfaiBaseUrl(pluginConfig: FfaiBasePluginConfig): string {
   // Priority: env var > plugin config > default. Provider-config lookup is
   // only relevant to the catalog hook (in provider-discovery.ts), not to
   // plugin commands — commands always talk to the configured FFAI server.
@@ -67,7 +49,7 @@ function resolveFfaiApiKey(): string | undefined {
 }
 
 export default definePluginEntry({
-  id: PROVIDER_ID,
+  id: FFAI_PROVIDER_ID,
   name: "FFAI Provider",
   description: "Free-tier AI key-pooling proxy with multi-provider model discovery",
   register(api: OpenClawPluginApi) {

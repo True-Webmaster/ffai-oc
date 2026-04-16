@@ -28,37 +28,30 @@ import type {
   ProviderAuthResult,
 } from "openclaw/plugin-sdk/provider-auth";
 import { buildProviderReplayFamilyHooks } from "openclaw/plugin-sdk/provider-model-shared";
-import { FFAI_DEFAULT_BASE_URL } from "./defaults.js";
+import {
+  FFAI_DEFAULT_BASE_URL,
+  FFAI_PROVIDER_ID,
+  normalizeFfaiBaseUrl,
+  normalizePluginConfig,
+  type FfaiBasePluginConfig,
+} from "./defaults.js";
 import { applyFfaiConfig } from "./onboard.js";
 import { buildFfaiProviders, buildFfaiStaticProvider } from "./provider-catalog.js";
 import { writeCatalogHeartbeat } from "./compat-sync.js";
 
-const PROVIDER_ID = "ffai";
+const PROVIDER_ID = FFAI_PROVIDER_ID;
 
 const OPENAI_COMPATIBLE_REPLAY_HOOKS = buildProviderReplayFamilyHooks({
   family: "openai-compatible",
 });
 
 // ── Plugin config shape & helpers ──────────────────────────────────────────
-//
-// This module intentionally duplicates the tiny config-normalization helpers
-// rather than importing them from `index.ts`. The discovery entry must stay
-// decoupled from the plugin runtime module — and the helpers are <30 lines,
-// so a copy is cheaper than a shared file that both sides pull in.
+// Shared helpers (normalizePluginConfig, normalizeFfaiBaseUrl) live in
+// defaults.ts so both the discovery entry and the plugin runtime share a
+// single copy. defaults.ts has no SDK imports, keeping it safe for either
+// load path.
 
-export type FfaiPluginConfig = {
-  baseUrl?: string;
-  favorites: string[];
-};
-
-function normalizePluginConfig(raw: unknown): FfaiPluginConfig {
-  const src = (raw && typeof raw === "object" ? raw : {}) as Record<string, unknown>;
-  const baseUrl = typeof src.baseUrl === "string" ? src.baseUrl.trim() || undefined : undefined;
-  const favorites = Array.isArray(src.favorites)
-    ? src.favorites.filter((x): x is string => typeof x === "string" && x.trim().length > 0)
-    : [];
-  return { baseUrl, favorites };
-}
+type FfaiPluginConfig = FfaiBasePluginConfig;
 
 /**
  * Read FFAI plugin config out of a loaded OpenClawConfig. Discovery and auth
@@ -68,10 +61,6 @@ function normalizePluginConfig(raw: unknown): FfaiPluginConfig {
 function readFfaiPluginConfig(config: { plugins?: { entries?: Record<string, { config?: unknown }> } }): FfaiPluginConfig {
   const raw = config.plugins?.entries?.[PROVIDER_ID]?.config;
   return normalizePluginConfig(raw);
-}
-
-function normalizeFfaiBaseUrl(raw: string): string {
-  return raw.trim().replace(/\/+$/, "").replace(/\/v1$/i, "");
 }
 
 function resolveFfaiBaseUrl(params: {
