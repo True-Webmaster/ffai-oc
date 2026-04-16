@@ -212,6 +212,12 @@ async function runFfaiCatalog(ctx: ProviderCatalogContext): Promise<ProviderCata
   }
 
   if (fetched) {
+    if (fetched.droppedProviders.length > 0) {
+      const logger = (ctx as { logger?: { warn?: (msg: string) => void } }).logger;
+      logger?.warn?.(
+        `[ffai] provider(s) dropped (name collides with reserved "favorites" key): ${fetched.droppedProviders.join(", ")}`,
+      );
+    }
     if (fetched.unresolvedFavorites.length > 0) {
       const logger = (ctx as { logger?: { warn?: (msg: string) => void } }).logger;
       logger?.warn?.(

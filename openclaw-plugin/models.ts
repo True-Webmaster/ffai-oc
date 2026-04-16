@@ -34,16 +34,20 @@ const FAVORITES_SENTINEL = "favorites";
 
 // ── SSRF policy ─────────────────────────────────────────────────────────────
 
-export function buildFfaiSsrfPolicy(baseUrl: string): SsrFPolicy | undefined {
+export function buildFfaiSsrfPolicy(baseUrl: string): SsrFPolicy {
+  let parsed: URL;
   try {
-    const parsed = new URL(baseUrl);
-    return {
-      allowedHostnames: [parsed.hostname],
-      hostnameAllowlist: [parsed.hostname],
-    };
+    parsed = new URL(baseUrl);
   } catch {
-    return undefined;
+    // Fail closed: a malformed baseUrl must never result in an undefined
+    // policy (which could be interpreted as "allow all" by the SDK).
+    // Use an impossible hostname so every request is blocked.
+    return { allowedHostnames: [], hostnameAllowlist: [] };
   }
+  return {
+    allowedHostnames: [parsed.hostname],
+    hostnameAllowlist: [parsed.hostname],
+  };
 }
 
 // ── Runtime validators ─────────────────────────────────────────────────────
@@ -63,7 +67,10 @@ function toFfaiModel(raw: unknown): FfaiModel | null {
 
   const numOrUndef = (v: unknown): number | undefined => {
     if (typeof v === "number" && Number.isFinite(v) && v >= 0) return v;
-    if (typeof v === "string" && /^\d+$/.test(v)) return Number(v);
+    if (typeof v === "string" && /^\d+$/.test(v)) {
+      const n = Number(v);
+      if (Number.isSafeInteger(n) && n >= 0) return n;
+    }
     return undefined;
   };
 
@@ -110,6 +117,10 @@ export async function fetchFfaiModels(
     const response = result.response;
 
     if (!response.ok) {
+      // Drain the body to release the connection back to the pool. An
+      // unconsumed body in Node (undici) keeps the socket tied to this
+      // response, leaking connections under sustained error conditions.
+      try { await response.text(); } catch { /* drain best-effort */ }
       return { status: "http_error", code: response.status };
     }
 
@@ -216,8 +227,12 @@ export function buildFavoritesGroup(
 ): FavoritesResolution {
   if (favorites.length === 0) return { models: [], missing: [] };
 
+  // Sort by provider name first so collisions (same model ID from multiple
+  // providers) resolve deterministically — alphabetical-first provider wins,
+  // matching the ordering in groupModelsByProvider.
+  const sorted = [...allModels].sort((a, b) => a.provider.localeCompare(b.provider));
   const modelIndex = new Map<string, FfaiModel>();
-  for (const m of allModels) {
+  for (const m of sorted) {
     if (!modelIndex.has(m.id)) modelIndex.set(m.id, m);
   }
 

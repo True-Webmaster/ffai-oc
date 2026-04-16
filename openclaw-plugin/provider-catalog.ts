@@ -21,6 +21,8 @@ export type FfaiCatalogResult = {
   providers: Record<string, ModelProviderConfig>;
   /** Favorite IDs that didn't resolve to any discovered model. */
   unresolvedFavorites: string[];
+  /** Provider names that were dropped because they collide with the reserved "favorites" key. */
+  droppedProviders: string[];
   /** Raw status from the fetch — lets the caller make wipe-protection choices. */
   source: "fetched" | "empty" | "http_error" | "unreachable";
 };
@@ -52,33 +54,46 @@ export async function buildFfaiProviders(params: {
 
   const fetchResult = await fetchFfaiModels(baseUrl, apiKey);
   if (fetchResult.status === "unreachable") {
-    return { providers: {}, unresolvedFavorites: [], source: "unreachable" };
+    return { providers: {}, unresolvedFavorites: [], droppedProviders: [], source: "unreachable" };
   }
   if (fetchResult.status === "http_error") {
-    return { providers: {}, unresolvedFavorites: [], source: "http_error" };
+    return { providers: {}, unresolvedFavorites: [], droppedProviders: [], source: "http_error" };
   }
 
   const { models } = fetchResult;
   if (models.length === 0) {
-    return { providers: {}, unresolvedFavorites: [], source: "empty" };
+    return { providers: {}, unresolvedFavorites: [], droppedProviders: [], source: "empty" };
   }
 
   const groups = groupModelsByProvider(models);
   const providers: Record<string, ModelProviderConfig> = {};
+  const droppedProviders: string[] = [];
 
   for (const group of groups) {
     if (group.models.length === 0) continue;
     const providerKey = `${PROVIDER_PREFIX}${sanitizeProviderKey(group.providerName)}`;
-    if (providerKey === FAVORITES_KEY) continue; // reserve for the virtual group
+    if (providerKey === FAVORITES_KEY) {
+      droppedProviders.push(group.providerName);
+      continue; // reserve for the virtual group
+    }
     // URL-encode the provider segment — FFAI allows arbitrary provider
     // names in its /models response and we must not blindly splice
     // unicode/spaces into a URL path.
-    providers[providerKey] = {
-      baseUrl: `${baseUrl}/${encodeURIComponent(group.providerName)}/v1`,
-      api: "openai-completions",
-      apiKey: resolvedKey,
-      models: group.models,
-    };
+    const existing = providers[providerKey];
+    if (existing) {
+      // Key collision — two FFAI providers sanitize to the same key
+      // (e.g. "Groq!" and "groq?"). Merge models into the first entry
+      // rather than silently dropping one provider's models.
+      const existingModels = Array.isArray(existing.models) ? existing.models : [];
+      existing.models = [...existingModels, ...group.models];
+    } else {
+      providers[providerKey] = {
+        baseUrl: `${baseUrl}/${encodeURIComponent(group.providerName)}/v1`,
+        api: "openai-completions",
+        apiKey: resolvedKey,
+        models: group.models,
+      };
+    }
   }
 
   // Build favorites virtual provider last so it can never be clobbered by a
@@ -97,7 +112,7 @@ export async function buildFfaiProviders(params: {
     }
   }
 
-  return { providers, unresolvedFavorites, source: "fetched" };
+  return { providers, unresolvedFavorites, droppedProviders, source: "fetched" };
 }
 
 /**

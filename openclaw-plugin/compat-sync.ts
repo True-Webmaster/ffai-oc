@@ -142,14 +142,27 @@ type OpenclawConfigLike = {
   };
 };
 
-export async function readOpenclawConfig(configPath: string): Promise<OpenclawConfigLike | undefined> {
+export async function readOpenclawConfig(
+  configPath: string,
+  logger?: CompatSyncLogger,
+): Promise<OpenclawConfigLike | undefined> {
+  let raw: string;
   try {
-    const raw = await fs.readFile(configPath, "utf8");
+    raw = await fs.readFile(configPath, "utf8");
+  } catch (err) {
+    // File missing or unreadable — expected on first run.
+    const code = (err as { code?: string })?.code;
+    if (code !== "ENOENT") {
+      logger?.warn?.(`[ffai] could not read ${configPath}: ${code ?? "unknown"}`);
+    }
+    return undefined;
+  }
+  try {
     const parsed: unknown = JSON.parse(raw);
     if (parsed && typeof parsed === "object") return parsed as OpenclawConfigLike;
+    logger?.warn?.(`[ffai] ${configPath} contains non-object JSON — treating as missing`);
   } catch {
-    // Missing or unreadable config — the shim can't safely proceed. The
-    // caller logs and bails.
+    logger?.warn?.(`[ffai] ${configPath} contains invalid JSON (corrupted?) — treating as missing`);
   }
   return undefined;
 }
@@ -271,13 +284,9 @@ export async function runCompatSync(ctx: CompatSyncStartContext): Promise<void> 
 
   // Resolve plugin config. Provider plugins get loaded through a deferred
   // path where api.pluginConfig may only contain schema defaults (not the
-  // full user config). Fall back to reading openclaw.json on disk as the
-  // authoritative source.
-  // Resolve plugin config. Provider plugins get loaded through a deferred
-  // path where api.pluginConfig may only contain schema defaults (not the
   // full user config). Read openclaw.json on disk as the authoritative source.
   const cfgPath = resolveOpenclawConfigPath(ctx.workspaceDir);
-  const cfgOnDisk = await readOpenclawConfig(cfgPath);
+  const cfgOnDisk = await readOpenclawConfig(cfgPath, logger);
   const diskPluginConfig = (cfgOnDisk as { plugins?: { entries?: Record<string, { config?: unknown }> } })
     ?.plugins?.entries?.[PROVIDER_ID]?.config;
   const raw = (diskPluginConfig && typeof diskPluginConfig === "object")
@@ -330,6 +339,11 @@ export async function runCompatSync(ctx: CompatSyncStartContext): Promise<void> 
     return;
   }
 
+  if (fetched.droppedProviders.length > 0) {
+    logger?.warn?.(
+      `[ffai] compat-sync: provider(s) dropped (name collides with reserved "favorites" key): ${fetched.droppedProviders.join(", ")}`,
+    );
+  }
   if (fetched.unresolvedFavorites.length > 0) {
     logger?.warn?.(
       `[ffai] compat-sync: favorites not found in discovered catalog: ${fetched.unresolvedFavorites.join(", ")}`,
@@ -337,7 +351,7 @@ export async function runCompatSync(ctx: CompatSyncStartContext): Promise<void> 
   }
 
   const configPath = resolveOpenclawConfigPath(ctx.workspaceDir);
-  const onDisk = await readOpenclawConfig(configPath);
+  const onDisk = await readOpenclawConfig(configPath, logger);
   if (!onDisk) {
     logger?.warn?.(`[ffai] compat-sync: could not read ${configPath} — skipping write`);
     return;

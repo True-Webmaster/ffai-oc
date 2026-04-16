@@ -44,7 +44,7 @@ export async function handleFfaiStats(params: {
       try {
         data = await response.json();
       } catch (err) {
-        return { text: `FFAI /savings returned invalid JSON: ${describe(err)}`, isError: true };
+        return { text: `FFAI /savings returned invalid JSON: ${redactSecrets(describe(err))}`, isError: true };
       }
       const savings = toSavingsResponse(data);
       if (!savings) {
@@ -82,7 +82,18 @@ export async function handleFfaiEncrypt(params: {
       try {
         html = await response.text();
       } catch (err) {
-        return { text: `FFAI /generate-import read failed: ${describe(err)}`, isError: true };
+        return { text: `FFAI /generate-import read failed: ${redactSecrets(describe(err))}`, isError: true };
+      }
+
+      // Sanity-check: the response must look like an HTML page from the FFAI
+      // encrypt endpoint. If the server is compromised or misconfigured and
+      // returns something unexpected, refuse to write it to disk — opening
+      // arbitrary content from file:// origin is a stored-XSS vector.
+      if (!html.includes("<!DOCTYPE html") && !html.includes("<html")) {
+        return { text: "FFAI /generate-import returned non-HTML content — refusing to write to disk.", isError: true };
+      }
+      if (!html.includes("FFAI-IMPORT") && !html.includes("ffai") && !html.includes("encrypt")) {
+        return { text: "FFAI /generate-import returned unexpected HTML — refusing to write to disk.", isError: true };
       }
 
       // Single atomic write to a plugin-owned path under the OS tmp dir
@@ -102,7 +113,7 @@ export async function handleFfaiEncrypt(params: {
         fs.writeFileSync(tmp, html, { encoding: "utf8", mode: 0o600 });
         fs.renameSync(tmp, outPath);
       } catch (err) {
-        return { text: `Failed to write ffai_encrypt.html: ${describe(err)}`, isError: true };
+        return { text: `Failed to write ffai_encrypt.html: ${redactSecrets(describe(err))}`, isError: true };
       }
 
       return {
@@ -150,12 +161,19 @@ export async function handleFfaiImportKeys(params: {
       audit: "ffai-provider.import",
     },
     async (response) => {
-      let data: { imported?: unknown; provider?: unknown; error?: unknown } = {};
+      let data: { imported?: unknown; provider?: unknown; error?: unknown };
       try {
         data = (await response.json()) as typeof data;
       } catch {
-        // Best-effort parse — FFAI /import returns JSON on success but we
-        // don't want a decoding quirk on the happy path to look like failure.
+        return {
+          text: "FFAI /import returned an invalid response body.",
+          isError: true,
+        };
+      }
+
+      if (data.error) {
+        const errMsg = redactSecrets(String(data.error)).slice(0, 300);
+        return { text: `FFAI /import error: ${errMsg}`, isError: true };
       }
 
       const imported = typeof data.imported === "number" ? data.imported : 0;
@@ -205,7 +223,7 @@ async function ffaiRequest(
 
     return await consume(response);
   } catch (err) {
-    return { text: `Failed to reach FFAI: ${describe(err)}`, isError: true };
+    return { text: `Failed to reach FFAI: ${redactSecrets(describe(err))}`, isError: true };
   } finally {
     if (release) {
       try { await release(); } catch { /* release failure is not actionable */ }
@@ -226,7 +244,9 @@ const SECRET_PATTERNS: RegExp[] = [
   /\b(?:gsk_[A-Za-z0-9_-]{10,})/g,
   /\b(?:csk-[A-Za-z0-9_-]{10,})/g,
   /\bAIza[0-9A-Za-z_-]{10,}/g,
+  /\bAKIA[0-9A-Z]{12,}/g,                   // AWS access key IDs
   /Bearer\s+[A-Za-z0-9._~+/=-]+/gi,
+  /\/\/[^@\s]+:[^@\s]+@/g,                   // URL-embedded user:pass@
 ];
 
 function redactSecrets(text: string): string {
