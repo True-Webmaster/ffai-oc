@@ -28,6 +28,14 @@
  * restart or 5xx should not erase provider state users are mid-conversation
  * on. This mirrors the wipe-protection policy in `provider-discovery.ts`.
  *
+ * ## Allowlist sync
+ *
+ * OpenClaw's `/models` command only shows models listed in
+ * `agents.defaults.models` when that map is non-empty. Compat-sync adds
+ * all discovered ffai model refs to the allowlist so newly added providers
+ * (e.g. sambanova) appear in `/models` automatically. It only ADDS entries
+ * — never removes — preserving manually curated entries.
+ *
  * ## Auth scope
  *
  * The shim is catalog-only. It does NOT write auth profiles. During the
@@ -149,6 +157,13 @@ type OpenclawConfigLike = {
   models?: {
     providers?: Record<string, ModelProviderConfig>;
   };
+  agents?: {
+    defaults?: {
+      models?: Record<string, unknown>;
+      [key: string]: unknown;
+    };
+    [key: string]: unknown;
+  };
 };
 
 export async function readOpenclawConfig(
@@ -222,6 +237,60 @@ export function mergeFfaiProvidersIntoConfig(
     },
   };
   return { next, changed: true };
+}
+
+// ── Allowlist sync ────────────────────────────────────────────────────────
+//
+// OpenClaw uses `agents.defaults.models` as an allowlist: if it's non-empty,
+// only listed model refs appear in `/models`. When compat-sync discovers new
+// ffai-* providers, their model refs must be added to the allowlist or they
+// remain invisible to users. We only ADD refs — never remove — so that
+// manually added entries or entries from other providers are preserved.
+
+export function syncFfaiAllowlist(
+  config: OpenclawConfigLike,
+  ffaiProviders: Record<string, ModelProviderConfig>,
+): { next: OpenclawConfigLike; added: number } {
+  const allowlist = config.agents?.defaults?.models;
+  // If there's no allowlist at all (empty or undefined), all catalog models
+  // are shown by default — no need to manage an allowlist.
+  if (!allowlist || Object.keys(allowlist).length === 0) {
+    return { next: config, added: 0 };
+  }
+
+  // Build the set of ffai model refs that should be in the allowlist.
+  let added = 0;
+  const nextAllowlist = { ...allowlist };
+  for (const [providerKey, providerCfg] of Object.entries(ffaiProviders)) {
+    if (!providerKey.startsWith(PROVIDER_PREFIX)) continue;
+    const models = providerCfg.models;
+    if (!Array.isArray(models)) continue;
+    for (const model of models) {
+      const id = typeof model === "object" && model && "id" in model
+        ? (model as { id: string }).id
+        : undefined;
+      if (!id) continue;
+      const ref = `${providerKey}/${id}`;
+      if (!(ref in nextAllowlist)) {
+        nextAllowlist[ref] = {};
+        added++;
+      }
+    }
+  }
+
+  if (added === 0) return { next: config, added: 0 };
+
+  const next: OpenclawConfigLike = {
+    ...config,
+    agents: {
+      ...(config.agents ?? {}),
+      defaults: {
+        ...(config.agents?.defaults ?? {}),
+        models: nextAllowlist,
+      },
+    },
+  };
+  return { next, added };
 }
 
 // ── Config normalization ──────────────────────────────────────────────────
@@ -365,18 +434,28 @@ export async function runCompatSync(ctx: CompatSyncStartContext): Promise<void> 
     return;
   }
 
-  const { next, changed } = mergeFfaiProvidersIntoConfig(onDisk, fetched.providers);
-  if (!changed) {
+  const { next: afterProviders, changed: providersChanged } = mergeFfaiProvidersIntoConfig(onDisk, fetched.providers);
+
+  // Sync the allowlist: add discovered ffai model refs so they appear in
+  // /models (the gateway only shows allowlisted models when the list is
+  // non-empty). Uses the post-merge config so newly added providers are
+  // included.
+  const { next: afterAllowlist, added: allowlistAdded } = syncFfaiAllowlist(afterProviders, fetched.providers);
+
+  if (!providersChanged && allowlistAdded === 0) {
     logger?.info?.("[ffai] compat-sync: on-disk catalog already matches discovery — no write");
     syncHasFired = true; // success — catalog is correct
     return;
   }
 
   try {
-    await writeOpenclawConfigAtomic(configPath, next);
+    await writeOpenclawConfigAtomic(configPath, afterAllowlist);
     syncHasFired = true; // success — catalog written
+    const parts: string[] = [];
+    if (providersChanged) parts.push(`${Object.keys(fetched.providers).length} ffai-* providers`);
+    if (allowlistAdded > 0) parts.push(`${allowlistAdded} model refs to allowlist`);
     logger?.info?.(
-      `[ffai] compat-sync: wrote ${Object.keys(fetched.providers).length} ffai-* providers to ${configPath}`,
+      `[ffai] compat-sync: wrote ${parts.join(" + ")} to ${configPath}`,
     );
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
