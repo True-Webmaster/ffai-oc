@@ -42,11 +42,11 @@ Provider-agnostic — works with any HTTP API: OpenAI, Gemini, Anthropic, Groq, 
 - **Async stats persistence** — non-blocking writes to disk with atomic rename
 
 ### OpenClaw Integration
-- **Automatic model discovery** — `sync-models.js` fetches models from KeyMux `/models` endpoint
-- **Native API spec fetching** — queries Gemini/Groq APIs directly for accurate context windows and max tokens
-- **Programmatic model filtering** — pattern-based rules (min context window, min output tokens, min params)
-- **Thought signature handling** — caches and injects Gemini 3 cryptographic signatures for tool calling
-- **Dual-config sync** — updates both `models.json` and `openclaw.json` atomically with wipe protection
+- **First-party OpenClaw plugin** — `openclaw-plugin/` registers FFAI as a
+  provider through OpenClaw's `providerDiscoveryEntry` API with dynamic
+  catalog discovery, favorites grouping, and three slash commands
+  (`/ffai_stats`, `/ffai_encrypt`, `/ffai_import_keys`). See the plugin's
+  own README for install and configuration.
 
 ## Quick Start
 
@@ -57,11 +57,11 @@ cp providers.json.example providers.json
 
 # 2. Create your environment
 cp .env.example .env
-chmod 600 .env  # Required — sync-all.sh enforces this
+chmod 600 .env  # Recommended — .env holds API keys
 # Edit .env — set your API keys and optional settings
 
 # 3. Run
-node server.js
+node serve.js
 ```
 
 ## Docker
@@ -175,7 +175,7 @@ Define one or more providers. Each provider has its own settings:
 
 ### Environment Variables (.env)
 
-Global settings. File **must** have mode `600` (enforced by `sync-all.sh`).
+Global settings. Because `.env` holds API keys, `chmod 600 .env` is strongly recommended.
 
 | Variable | Default | Description |
 |---|---|---|
@@ -334,47 +334,11 @@ Events: `all_keys_exhausted`, `circuit_open`
 
 ## OpenClaw Integration
 
-KeyMux includes two companion scripts for [OpenClaw](https://openclaw.ai) multi-agent platform integration:
-
-### sync-models.js
-
-Discovers models from KeyMux and updates OpenClaw agent configs:
-
-```bash
-# Sync a specific agent's models.json
-KEYMUX_URL=http://127.0.0.1:8002 \
-KEYMUX_PROXY_KEY=your-key \
-node sync-models.js /path/to/agent/models.json
-```
-
-**What it does:**
-1. Fetches model list from KeyMux `/models` and provider list from `/providers`
-2. Queries native APIs (Gemini, Groq) for accurate context windows and max tokens
-3. Applies programmatic filters: min 8K context, min 4K output tokens, min 4B parameters
-4. Deduplicates versioned models (e.g., `gemini-2.0-flash-001` when `gemini-2.0-flash` exists)
-5. Detects image-capable models via pattern matching
-6. Writes `models.json` and `openclaw.json` atomically (dual-write with wipe protection)
-7. Uses nullish coalescing (`??`) for spec resolution — `0` values from APIs are preserved correctly
-
-**Security:** Enforces HTTPS for non-loopback KEYMUX_URL.
-
-### sync-all.sh
-
-Orchestrates sync across all OpenClaw agents:
-
-```bash
-# Run manually or via systemd ExecStartPre
-bash sync-all.sh
-```
-
-**Features:**
-- Exclusive flock — prevents concurrent instances
-- Per-agent timeout (30s) with graceful fallback if `timeout` command unavailable
-- .env permissions enforcement (mode 600 required, hard gate)
-- Whitelisted env var sourcing (only specific keys exported)
-- Printf-based value parsing (no backslash mangling)
-- Empty PROXY_KEY warning
-- Per-agent log markers for attribution
+FFAI ships with a first-party OpenClaw plugin in `openclaw-plugin/`. Install
+it by copying or symlinking that directory into `~/.openclaw/extensions/ffai`
+and running `openclaw configure`. Full install instructions, config schema,
+and the `/ffai_stats`, `/ffai_encrypt`, `/ffai_import_keys` command reference
+live in [`openclaw-plugin/README.md`](openclaw-plugin/README.md).
 
 ## Streaming
 
@@ -413,10 +377,12 @@ Three-layer defense:
 ## File Structure
 
 ```
-keymux/
-  server.js             # Main proxy server (~1640 lines)
-  sync-models.js        # OpenClaw model discovery and sync
-  sync-all.sh           # Multi-agent sync orchestrator
+ffai/
+  serve.js              # Main proxy server
+  cli.js                # FFAI CLI
+  index.js              # Library entry
+  openclaw-plugin/      # First-party OpenClaw provider plugin
+  lib/                  # Core modules (pool, discovery, smush, auth, …)
   providers.json        # Provider configuration (not in git)
   .env                  # Environment variables (not in git, mode 600)
   .env.example          # Environment template

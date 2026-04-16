@@ -127,8 +127,10 @@ literal `FFAI-IMPORT:` prefix; bare base64 payloads are rejected.
 
 ## How it works
 
-1. On each OpenClaw catalog refresh, the plugin's `discovery.run()` hook
-   fires.
+1. On each OpenClaw catalog refresh, the plugin's `providerDiscoveryEntry`
+   catalog hook fires. (See [Compatibility sync](#compatibility-sync-temporary-workaround)
+   below for the one-shot shim that runs in parallel during the upstream
+   broken window.)
 2. It `GET`s `${baseUrl}/models` with `Bearer ${FFAI_KEY}`, through the
    SDK SSRF guard pinned to the configured hostname.
 3. The response is validated at the boundary (every field re-checked at
@@ -157,3 +159,55 @@ literal `FFAI-IMPORT:` prefix; bare base64 payloads are rejected.
 - **Stale model persists after removing it from FFAI.** OpenClaw reloads
   the catalog on its own cadence; `SIGHUP` or restart the OpenClaw
   gateway to force a refresh.
+
+## Compatibility sync (temporary workaround)
+
+Current OpenClaw hosts have a packaging issue that prevents
+`providerDiscoveryEntry` plugins — this one included — from being loaded
+at gateway start (see upstream tracking issue
+[`openclaw/openclaw#65715`](https://github.com/openclaw/openclaw/issues/65715)).
+Until the fix ships, the plugin includes a narrowly-scoped compatibility
+service that performs the same catalog sync the native discovery hook
+would have performed. It fires exactly **once** at gateway start — no
+polling loop — and produces the same `openclaw.json` state the native
+path would produce, so the two paths are idempotent when both are
+working.
+
+**Self-disabling.** The native discovery hook writes a heartbeat marker
+at `<workspaceDir>/.plugin-state/ffai-compat-sync/catalog-heartbeat.json`
+every time it runs. If the shim's `start()` hook sees a heartbeat that
+was written during the current gateway process (younger than process
+uptime), it concludes the native path is healthy and skips the sync.
+No user action is needed when upstream ships — the shim goes dormant on
+its own at the next gateway restart.
+
+**Manual override.** If you want to disable the shim explicitly (for
+example, you've verified your host has the upstream fix), set
+`compatSync: false` under the plugin config:
+
+```json
+{
+  "plugins": {
+    "entries": {
+      "ffai": {
+        "enabled": true,
+        "config": {
+          "compatSync": false
+        }
+      }
+    }
+  }
+}
+```
+
+**Wipe protection.** The shim only writes when FFAI returns a populated
+catalog. Empty, HTTP-error, and unreachable results never overwrite a
+live `openclaw.json` — same policy as the native discovery hook.
+
+**Auth during the workaround window.** The shim syncs the model catalog
+only; it does not write auth profiles. `openclaw configure` may fail to
+onboard FFAI until upstream ships. In the meantime, set `FFAI_KEY` in
+the environment before starting the gateway — the plugin's synthetic
+auth path uses it directly, and once the catalog sync runs you can use
+any `ffai-*` model. When upstream ships, `openclaw configure` starts
+working again with no migration needed.

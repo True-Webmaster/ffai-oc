@@ -4,6 +4,8 @@
   "description": "Free-tier AI key-pooling proxy with multi-provider model discovery",
   "version": "1.1.0",
   "entryPoint": "index.ts",
+  "providerDiscoveryEntry": "./provider-discovery.ts",
+  "providers": ["ffai"],
   "enabledByDefault": true,
   "envVars": [
     "FFAI_KEY",
@@ -24,6 +26,11 @@
           "type": "string"
         },
         "description": "Model IDs to include in the ffai-favorites provider group. The first entry is promoted to the default model during onboarding."
+      },
+      "compatSync": {
+        "type": "boolean",
+        "default": true,
+        "description": "Temporary workaround: run a one-shot catalog sync into openclaw.json at gateway start. Needed until upstream OpenClaw ships the fix for providerDiscoveryEntry plugins. Leave true unless you know your host already has the fix."
       }
     }
   },
@@ -35,6 +42,10 @@
     "favorites": {
       "label": "Favorite Models",
       "help": "List of model IDs to group under ffai-favorites for quick access in /models. Leave empty to see all discovered models ungrouped."
+    },
+    "compatSync": {
+      "label": "Compatibility Sync",
+      "help": "Workaround for upstream OpenClaw packaging bug. Leave enabled for now; disable once your openclaw host ships the fix for providerDiscoveryEntry plugins."
     }
   }
 }

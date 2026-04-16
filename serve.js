@@ -25,7 +25,6 @@ const DeprecationTracker = require("./lib/deprecation-tracker");
 const ModelDiscovery = require("./lib/model-discovery");
 const CapabilityStore = require("./lib/capabilities");
 const { validateConfig } = require("./lib/config-validator");
-const openclawSync = require("./lib/openclaw-sync");
 const { smush, resetSmush, getSmushStats } = require("./lib/smush");
 
 // ── Safe env parsing helper ─────────────────────────────────────────────────
@@ -66,12 +65,6 @@ const AUTH_FAIL_MAX = envInt("FFAI_AUTH_FAIL_MAX", 10);
 const AUTH_FAIL_WINDOW = envInt("FFAI_AUTH_FAIL_WINDOW", 60000);
 const AUTH_BLOCK_DURATION = envInt("FFAI_AUTH_BLOCK_DURATION", 300000);
 const VALIDATE_TIMEOUT = envInt("FFAI_VALIDATE_TIMEOUT", 10000);
-
-// ── OpenClaw sync settings ────────────────────────────────────────────────
-const OPENCLAW_SYNC = process.env.FFAI_OPENCLAW_SYNC === "true" || process.env.FFAI_OPENCLAW_SYNC === "1";
-const OPENCLAW_JSON = process.env.FFAI_OPENCLAW_JSON || path.join(process.env.HOME || require("os").homedir(), ".openclaw", "openclaw.json");
-const OPENCLAW_SYNC_AGENTS = process.env.FFAI_OPENCLAW_SYNC_AGENTS === "true" || process.env.FFAI_OPENCLAW_SYNC_AGENTS === "1";
-const OPENCLAW_AGENTS_DIR = process.env.FFAI_OPENCLAW_AGENTS_DIR || path.join(process.env.HOME || require("os").homedir(), ".openclaw", "agents");
 
 // ── SSE connection tracking for graceful shutdown ──────────────────────────
 const activeSSEConnections = new Set();
@@ -187,29 +180,6 @@ const discovery = new ModelDiscovery({
   specTimeout: DISCOVERY_SPEC_TIMEOUT,
 });
 pool.discovery = discovery;
-
-// ── OpenClaw auto-sync (after each discovery refresh) ─────────────────────
-if (OPENCLAW_SYNC) {
-  const ffaiUrl = `http://127.0.0.1:${PORT}`;
-  discovery.onRefresh((_modelIndex, cache) => {
-    try {
-      openclawSync.sync({
-        cache,
-        ffaiUrl,
-        openclawJson: OPENCLAW_JSON,
-        allAgents: OPENCLAW_SYNC_AGENTS,
-        agentsDir: OPENCLAW_AGENTS_DIR,
-        favorites: config.favorites,
-        logger: console,
-      });
-    } catch (err) {
-      console.warn(`[ffai] OpenClaw sync failed: ${err.message}`);
-    }
-  });
-  console.log(`[ffai] OpenClaw sync: enabled → ${OPENCLAW_JSON}`);
-} else {
-  console.log(`[ffai] OpenClaw sync: disabled (set FFAI_OPENCLAW_SYNC=true to enable)`);
-}
 
 // ── Auth ────────────────────────────────────────────────────────────────────
 const authGuard = new AuthGuard({

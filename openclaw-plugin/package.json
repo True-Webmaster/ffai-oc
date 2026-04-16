@@ -11,6 +11,8 @@
   },
   "files": [
     "index.ts",
+    "provider-discovery.ts",
+    "compat-sync.ts",
     "models.ts",
     "provider-catalog.ts",
     "onboard.ts",
@@ -23,7 +25,8 @@
   "openclaw": {
     "extensions": [
       "./index.ts"
-    ]
+    ],
+    "providerDiscoveryEntry": "./provider-discovery.ts"
   },
   "scripts": {
     "typecheck": "tsc --noEmit"

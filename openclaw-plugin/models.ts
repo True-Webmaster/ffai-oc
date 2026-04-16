@@ -163,10 +163,10 @@ export function buildFfaiModelDefinition(model: FfaiModel): ModelDefinitionConfi
     reasoning: isReasoningModelHeuristic(model.id),
     input: supportsImage ? ["text", "image"] : ["text"],
     cost: FFAI_COST,
-    // Use ?? not || so a legitimately-reported 0 would stay 0 (though FFAI
-    // doesn't emit 0 today, it's the safer default for numeric coercion).
-    contextWindow: model.context_window ?? FFAI_DEFAULT_CONTEXT_WINDOW,
-    maxTokens: model.max_output_tokens ?? FFAI_DEFAULT_MAX_TOKENS,
+    // Use || so that 0 falls through to the default — OpenClaw requires
+    // contextWindow > 0 and maxTokens > 0 in its config schema.
+    contextWindow: model.context_window || FFAI_DEFAULT_CONTEXT_WINDOW,
+    maxTokens: model.max_output_tokens || FFAI_DEFAULT_MAX_TOKENS,
   };
 }
 

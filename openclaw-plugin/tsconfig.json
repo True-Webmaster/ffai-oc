@@ -21,6 +21,8 @@
   },
   "include": [
     "index.ts",
+    "provider-discovery.ts",
+    "compat-sync.ts",
     "models.ts",
     "provider-catalog.ts",
     "onboard.ts",
