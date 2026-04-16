@@ -113,6 +113,12 @@ function resolveKeys(provConfig) {
 
 const config = loadConfig();
 
+// Holder for the v2 public-key import keypair. Populated below after config
+// validation. Declared here so the helper functions further down (which close
+// over it) are linked to the same binding — and so we can assign into it from
+// the initialization block without tripping the TDZ for the later definition.
+let _importKeypair = null;
+
 // ── Config validation ─────────────────────────────────────────────────────────
 {
   const { errors, warnings } = validateConfig(config);
@@ -123,6 +129,12 @@ const config = loadConfig();
     process.exit(1);
   }
 }
+
+// Initialize the public-key import keypair (v2). Generated on first boot
+// and persisted into config.json; regenerated transparently if storage
+// becomes corrupted. Must run AFTER config validation but BEFORE the HTTP
+// server starts handling /pubkey or /generate-import.
+_importKeypair = loadOrCreateImportKeypair(config);
 
 // Build provider configs with upstream URLs for proxying
 const providerConfigs = {};
@@ -244,9 +256,84 @@ function auditLog(entry) {
   try { fs.appendFileSync(AUDIT_LOG_FILE, line, { mode: 0o600 }); } catch {}
 }
 
-// ── Token expiry constants (fix #2, #14) ────────────────────────────────────
+// ── Import session constants ───────────────────────────────────────────────
+// TTL is the *only* time-based gate for v2 (public-key) imports: an HTML page
+// older than this is refused. v1 (shared-secret) tokens still use this same
+// TTL for backwards compat during the transition window.
 const IMPORT_TOKEN_TTL_MS = 24 * 60 * 60 * 1000; // 24 hours
-const IMPORT_TOKEN_MAX = 20; // max active tokens
+const IMPORT_NONCE_TTL_MS = 24 * 60 * 60 * 1000; // 24h nonce memory for replay protection
+const IMPORT_NONCE_MAX = 500; // ceiling on retained nonces (LRU-evicted)
+
+// ── Public-key import keypair (v2) ──────────────────────────────────────────
+// Persistent ECDH P-256 keypair stored in config.json under "import_keypair".
+// The *public* half is baked into generated HTML pages; the *private* half
+// never leaves the FFAI host. This replaces the v1 shared-secret model where
+// the decryption token traveled alongside the ciphertext.
+//
+// Why P-256 over X25519: universal browser Web Crypto support (X25519 only
+// landed in Safari 17+ and is still spotty on mobile). Security is equivalent
+// for this use case — both give ~128-bit work factor.
+//
+// Declaration is hoisted manually to the top of the module via the earlier
+// `let _importKeypair` binding so the keypair can be initialised immediately
+// after config load (line ~127). The function below is a declaration, which
+// is hoisted automatically.
+function loadOrCreateImportKeypair(cfg) {
+  const existing = cfg.import_keypair;
+  if (existing && typeof existing === "object" && existing.privateJwk && existing.publicRawB64) {
+    try {
+      const privateKeyObj = crypto.createPrivateKey({ key: existing.privateJwk, format: "jwk" });
+      return {
+        publicJwk: existing.publicJwk,
+        publicRawB64: existing.publicRawB64,
+        privateKeyObj,
+      };
+    } catch (err) {
+      console.warn(`[ffai] import_keypair load failed (${err.message}); regenerating`);
+    }
+  }
+
+  // Generate a fresh keypair. SPKI DER for P-256 uncompressed pubkey is 91
+  // bytes; the final 65 bytes are the raw `04 || X || Y` form the browser's
+  // importKey('raw', …) expects. JWK form is stored for portability.
+  const { publicKey, privateKey } = crypto.generateKeyPairSync("ec", { namedCurve: "P-256" });
+  const publicJwk = publicKey.export({ format: "jwk" });
+  const privateJwk = privateKey.export({ format: "jwk" });
+  const spkiDer = publicKey.export({ type: "spki", format: "der" });
+  const publicRawB64 = Buffer.from(spkiDer.slice(spkiDer.length - 65)).toString("base64");
+
+  cfg.import_keypair = { publicJwk, privateJwk, publicRawB64, created: new Date().toISOString() };
+  try {
+    writeConfigAtomic(cfg);
+  } catch (err) {
+    console.error(`[ffai] Failed to persist import_keypair: ${err.message}`);
+    // Still usable in-memory for this process lifetime.
+  }
+  console.log("[ffai] Generated new import_keypair (P-256)");
+  return { publicJwk, publicRawB64, privateKeyObj: privateKey };
+}
+
+// Replay protection: remember nonces from accepted v2 imports so an attacker
+// who captures a blob cannot re-submit the same decrypted payload. Map of
+// nonce → expiresAt (ms since epoch). LRU-evict oldest when size exceeds max.
+const _importNonces = new Map();
+
+function rememberImportNonce(nonce) {
+  if (typeof nonce !== "string" || nonce.length < 16) return false;
+  if (_importNonces.has(nonce)) return false; // replay
+  // Evict expired
+  const now = Date.now();
+  for (const [n, exp] of _importNonces) {
+    if (exp < now) _importNonces.delete(n);
+  }
+  // Hard cap (LRU by insertion order — Map iterates in insertion order)
+  while (_importNonces.size >= IMPORT_NONCE_MAX) {
+    const oldest = _importNonces.keys().next().value;
+    _importNonces.delete(oldest);
+  }
+  _importNonces.set(nonce, now + IMPORT_NONCE_TTL_MS);
+  return true;
+}
 
 // ── Provider key fingerprints ──────────────────────────────────────────────
 // Used by /import to reject mislabeled keys before they land in a pool where
@@ -884,8 +971,15 @@ async function handleProxy(req, res, provName, apiPath, reqId) {
 // The HTML page encrypts keys client-side with AES-256-GCM (PBKDF2-derived key from token).
 // The /import endpoint decrypts, validates, and writes keys into provider config.
 
-function generateImportHtml(token) {
-  // Token is baked into the HTML — user never sees or types it
+function generateImportHtml(pubRawB64, createdAtMs) {
+  // The server's ECDH P-256 public key is baked in. It contains NO decryption
+  // secret — an attacker who captures this HTML plus the encrypted blob still
+  // cannot recover the keys, because decryption requires the server's private
+  // key (which never leaves this host).
+  //
+  // `createdAtMs` is the ms-since-epoch when the page was issued; the page
+  // shows a live countdown and refuses to encrypt past expiry to match the
+  // server's TTL gate.
   return `<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -923,11 +1017,13 @@ function generateImportHtml(token) {
 </head>
 <body>
 <h1>FFAI — Import Keys</h1>
-<p class="subtitle">Encrypt API keys locally in your browser. Nothing leaves this page unencrypted.</p>
+<p class="subtitle">Encrypt API keys locally in your browser using public-key crypto.</p>
 <div class="info">
-  &#x1f512; This page works offline. Keys are encrypted with AES-256-GCM before leaving your browser.
-  The encrypted blob can be safely pasted into chat or sent to your FFAI server.
-  <br><br>&#x26a0;&#xfe0f; <strong>Delete this file after use.</strong> It contains a one-time encryption token.
+  &#x1f512; Keys are encrypted to the FFAI server's public key (ECDH P-256 + AES-256-GCM).
+  Only the FFAI server holds the private half — an attacker who captures both this
+  page AND the encrypted blob still cannot decrypt the keys.
+  <br><br>&#x23f3; Page expires in <span id="countdown" style="color:#58a6ff;font-weight:600;">—</span>.
+  After expiry the blob will be rejected by the server.
 </div>
 
 <div class="row">
@@ -964,7 +1060,11 @@ function generateImportHtml(token) {
 </div>
 
 <script>
-const TOKEN = ${JSON.stringify(token)};
+// Server's ECDH P-256 public key, uncompressed SEC1 form (65 bytes: 0x04 || X || Y)
+// baked in at page generation. Contains no secret material.
+const SERVER_PUB_B64 = ${JSON.stringify(pubRawB64)};
+const ISSUED_AT = ${createdAtMs};
+const TTL_MS = ${IMPORT_TOKEN_TTL_MS};
 
 // Key-format patterns — kept in sync with KEY_PATTERNS on the server side.
 // Order matters: more-specific prefixes (gsk_, csk-, AIza) are checked before
@@ -991,16 +1091,56 @@ function arrToBase64(buf) {
   return btoa(binary);
 }
 
-async function deriveKey(token, salt) {
-  const enc = new TextEncoder();
-  const keyMaterial = await crypto.subtle.importKey("raw", enc.encode(token), "PBKDF2", false, ["deriveKey"]);
-  return crypto.subtle.deriveKey(
-    { name: "PBKDF2", salt, iterations: 600000, hash: "SHA-256" },
-    keyMaterial,
+function base64ToBytes(b64) {
+  const bin = atob(b64);
+  const out = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i);
+  return out;
+}
+
+function msRemaining() { return (ISSUED_AT + TTL_MS) - Date.now(); }
+
+function fmtDuration(ms) {
+  if (ms <= 0) return "expired";
+  const s = Math.floor(ms / 1000);
+  const h = Math.floor(s / 3600);
+  const m = Math.floor((s % 3600) / 60);
+  const sec = s % 60;
+  if (h > 0) return h + "h " + m + "m";
+  return m + ":" + String(sec).padStart(2, "0");
+}
+
+// Derive a symmetric AES-256-GCM key by ECDH with the server's public key,
+// piped through HKDF-SHA256. Returns { aesKey, ephPubRaw } — the caller must
+// send ephPubRaw alongside the ciphertext so the server can redo the ECDH.
+async function deriveSharedAesKey() {
+  const eph = await crypto.subtle.generateKey(
+    { name: "ECDH", namedCurve: "P-256" },
+    true,
+    ["deriveBits"]
+  );
+  const serverPub = await crypto.subtle.importKey(
+    "raw",
+    base64ToBytes(SERVER_PUB_B64),
+    { name: "ECDH", namedCurve: "P-256" },
+    false,
+    []
+  );
+  const sharedBits = await crypto.subtle.deriveBits(
+    { name: "ECDH", public: serverPub },
+    eph.privateKey,
+    256
+  );
+  const ikm = await crypto.subtle.importKey("raw", sharedBits, "HKDF", false, ["deriveKey"]);
+  const aesKey = await crypto.subtle.deriveKey(
+    { name: "HKDF", hash: "SHA-256", salt: new Uint8Array(0), info: new TextEncoder().encode("ffai-import-v2") },
+    ikm,
     { name: "AES-GCM", length: 256 },
     false,
     ["encrypt"]
   );
+  const ephPubRaw = new Uint8Array(await crypto.subtle.exportKey("raw", eph.publicKey));
+  return { aesKey, ephPubRaw };
 }
 
 async function doEncrypt() {
@@ -1054,22 +1194,31 @@ async function doEncrypt() {
     }
   }
 
+  if (msRemaining() <= 0) {
+    status.textContent = "This page has expired. Generate a new one via /ffai_encrypt.";
+    status.className = "status err";
+    return;
+  }
+
   btn.disabled = true;
   btn.textContent = "Encrypting...";
 
   try {
-    const salt = crypto.getRandomValues(new Uint8Array(16));
+    const { aesKey, ephPubRaw } = await deriveSharedAesKey();
     const iv = crypto.getRandomValues(new Uint8Array(12));
-    const key = await deriveKey(TOKEN, salt);
 
-    const plaintext = JSON.stringify({ provider, keys, ts: Date.now() });
+    // Nonce inside the plaintext gives the server a stable anti-replay token —
+    // even though the ciphertext already contains a unique ephemeral pubkey,
+    // the nonce is what gets remembered on the server for the TTL window.
+    const nonce = arrToBase64(crypto.getRandomValues(new Uint8Array(18)));
+    const plaintext = JSON.stringify({ provider, keys, ts: Date.now(), nonce });
+
     const enc = new TextEncoder();
-    const ciphertext = await crypto.subtle.encrypt({ name: "AES-GCM", iv }, key, enc.encode(plaintext));
+    const ciphertext = await crypto.subtle.encrypt({ name: "AES-GCM", iv }, aesKey, enc.encode(plaintext));
 
     const payload = {
-      v: 1,
-      id: TOKEN.substring(0, 8),
-      salt: arrToBase64(salt),
+      v: 2,
+      ephPub: arrToBase64(ephPubRaw),
       iv: arrToBase64(iv),
       ct: arrToBase64(new Uint8Array(ciphertext))
     };
@@ -1159,6 +1308,27 @@ function updateDetectHint() {
   }
 }
 document.getElementById("keys").addEventListener("input", updateDetectHint);
+
+// Live TTL countdown — refreshes once per second. When the window closes we
+// disable the encrypt button and surface a hard error, so the user is never
+// tricked into producing a blob the server will reject.
+function refreshCountdown() {
+  const el = document.getElementById("countdown");
+  const btn = document.getElementById("encrypt-btn");
+  const remaining = msRemaining();
+  if (remaining <= 0) {
+    el.textContent = "EXPIRED";
+    el.style.color = "#f85149";
+    btn.disabled = true;
+    btn.textContent = "Page expired";
+  } else {
+    el.textContent = fmtDuration(remaining);
+    // Colour shift in the last 60 seconds to cue urgency
+    el.style.color = remaining < 60000 ? "#f85149" : "#58a6ff";
+  }
+}
+refreshCountdown();
+setInterval(refreshCountdown, 1000);
 </script>
 </body>
 </html>`;
@@ -1166,66 +1336,23 @@ document.getElementById("keys").addEventListener("input", updateDetectHint);
 
 // ── Route: /generate-import ──────────────────────────────────────────────────
 function handleGenerateImport(req, res) {
-  // Generate a cryptographically random import token
-  const token = crypto.randomBytes(32).toString("hex");
-  const tokenId = token.substring(0, 8);
-
-  // Read current config, add token, write back
-  const currentConfig = tryLoadConfig();
-  if (!currentConfig) return sendJson(res, 500, { error: "failed to read config" });
-
-  if (!Array.isArray(currentConfig.import_tokens)) currentConfig.import_tokens = [];
-
-  // Fix #2/#14: Expire old tokens and enforce max count
-  const now = Date.now();
-  currentConfig.import_tokens = currentConfig.import_tokens.filter(t => {
-    const age = now - new Date(t.created).getTime();
-    return age < IMPORT_TOKEN_TTL_MS;
-  });
-
-  if (currentConfig.import_tokens.length >= IMPORT_TOKEN_MAX) {
-    return sendJson(res, 429, { error: "too many active import tokens — wait for old ones to expire" });
+  // v2 flow: no per-request token to persist. Every page embeds the same
+  // long-lived server public key plus the current timestamp. Replay protection
+  // lives server-side in the _importNonces map, and temporal scoping is the
+  // TTL check below in handleImport.
+  if (!_importKeypair || !_importKeypair.publicRawB64) {
+    return sendJson(res, 503, { error: "import keypair not initialised" });
   }
 
-  // Fix #13: Prevent token ID collisions with bounded retry (not recursion)
-  let finalToken = token;
-  let finalTokenId = tokenId;
-  let collisionResolved = !currentConfig.import_tokens.some(t => t.id === finalTokenId);
-  for (let attempt = 0; attempt < 5 && !collisionResolved; attempt++) {
-    finalToken = crypto.randomBytes(32).toString("hex");
-    finalTokenId = finalToken.substring(0, 8);
-    collisionResolved = !currentConfig.import_tokens.some(t => t.id === finalTokenId);
-  }
-  if (!collisionResolved) {
-    return sendJson(res, 500, { error: "token generation failed — try again" });
-  }
-
-  currentConfig.import_tokens.push({
-    id: finalTokenId,
-    token: finalToken,
-    created: new Date().toISOString(),
-  });
-
-  // Fix #6: Atomic config write
-  try {
-    writeConfigAtomic(currentConfig);
-  } catch (err) {
-    console.error(`[ffai] Failed to save import token: ${err.message}`);
-    return sendJson(res, 500, { error: "failed to save token" });
-  }
-
-  // Update in-memory config
-  config.import_tokens = currentConfig.import_tokens;
-
-  // Generate and return the HTML file
-  const html = generateImportHtml(finalToken);
+  const createdAtMs = Date.now();
+  const html = generateImportHtml(_importKeypair.publicRawB64, createdAtMs);
   res.writeHead(200, {
     "content-type": "text/html; charset=utf-8",
     "content-disposition": "attachment; filename=\"ffai_encrypt.html\"",
     "content-length": String(Buffer.byteLength(html, "utf8")),
   });
   res.end(html);
-  console.log(`[ffai] Generated import page (token ${finalTokenId}...)`);
+  console.log(`[ffai] Generated v2 import page (issued at ${new Date(createdAtMs).toISOString()})`);
 }
 
 // ── Route: /import ──────────────────────────────────────────────────────────
@@ -1258,52 +1385,53 @@ async function handleImport(req, res) {
     return sendJson(res, 400, { error: "invalid payload encoding" });
   }
 
-  if (envelope.v !== 1) return sendJson(res, 400, { error: "unsupported payload version" });
-
-  // Find matching token by ID prefix
-  const tokens = config.import_tokens || [];
-  const match = tokens.find(t => t.id === envelope.id);
-
-  // Fix #2: Check token TTL (don't reveal whether token existed — fall through to generic error)
-  const matchAge = match ? Date.now() - new Date(match.created).getTime() : null;
-  const validMatch = match && matchAge <= IMPORT_TOKEN_TTL_MS;
-
-  // Fix #10: Same error message for unknown token and failed decryption
-  if (!validMatch) {
-    // Distinguish expired vs unknown in the audit log (response body stays identical)
-    const reason = match ? "expired_token" : "unknown_token";
-    auditLog({ event: "import_failed", reason, tokenId: envelope.id, ip });
-    // Fix #12: Record auth failure for IP blocking
-    authGuard.recordFailure(ip);
-    return sendJson(res, 403, { error: "import failed — token invalid, expired, or already used" });
-  }
-
-  // Decrypt
+  // Dispatch on envelope version. v2 is the public-key ECDH flow; v1 is the
+  // legacy shared-secret flow, retained so blobs encrypted against an HTML
+  // page issued before the upgrade can still be imported within their 24h
+  // window. Both paths produce the same `plaintext` / `auditContext` shape
+  // so the downstream write logic is shared.
   let plaintext;
-  try {
-    const salt = Buffer.from(envelope.salt, "base64");
-    const iv = Buffer.from(envelope.iv, "base64");
-    const ct = Buffer.from(envelope.ct, "base64");
-
-    const keyMaterial = crypto.pbkdf2Sync(match.token, salt, 600000, 32, "sha256");
-    const decipher = crypto.createDecipheriv("aes-256-gcm", keyMaterial, iv);
-
-    const authTag = ct.slice(ct.length - 16);
-    const encrypted = ct.slice(0, ct.length - 16);
-    decipher.setAuthTag(authTag);
-
-    plaintext = Buffer.concat([decipher.update(encrypted), decipher.final()]).toString("utf8");
-  } catch (err) {
-    console.warn(`[ffai] Import decrypt failed (token ${envelope.id}): ${err.message}`);
-    auditLog({ event: "import_failed", reason: "decrypt_failed", tokenId: envelope.id, ip });
-    authGuard.recordFailure(ip);
-    // Fix #10: Same error message
-    return sendJson(res, 403, { error: "import failed — token invalid, expired, or already used" });
+  let auditContext;
+  if (envelope.v === 2) {
+    const result = await v2Decrypt(envelope, ip);
+    if (result.error) return sendJson(res, result.status || 403, { error: result.error });
+    plaintext = result.plaintext;
+    auditContext = { version: 2, tokenId: null };
+  } else if (envelope.v === 1) {
+    const result = v1Decrypt(envelope, ip);
+    if (result.error) return sendJson(res, result.status || 403, { error: result.error });
+    plaintext = result.plaintext;
+    auditContext = { version: 1, tokenId: result.tokenId, matchId: result.matchId };
+  } else {
+    return sendJson(res, 400, { error: "unsupported payload version" });
   }
 
   let data;
   try { data = JSON.parse(plaintext); } catch {
     return sendJson(res, 400, { error: "decrypted payload is not valid JSON" });
+  }
+
+  // v2 replay protection: the decrypted plaintext carries a random nonce; the
+  // server remembers it for IMPORT_NONCE_TTL_MS and rejects re-uses. For v1
+  // the single-use token already prevents replay, so skip.
+  if (auditContext.version === 2) {
+    if (typeof data.nonce !== "string" || data.nonce.length < 16) {
+      auditLog({ event: "import_failed", reason: "missing_nonce", ip });
+      authGuard.recordFailure(ip);
+      return sendJson(res, 400, { error: "payload missing nonce" });
+    }
+    if (!rememberImportNonce(data.nonce)) {
+      auditLog({ event: "import_failed", reason: "replay", ip });
+      authGuard.recordFailure(ip);
+      return sendJson(res, 403, { error: "import failed — this blob was already used" });
+    }
+    // Temporal window: reject blobs encrypted too far in the past.
+    const ageMs = typeof data.ts === "number" ? Date.now() - data.ts : Infinity;
+    if (!Number.isFinite(ageMs) || ageMs > IMPORT_TOKEN_TTL_MS || ageMs < -60_000) {
+      auditLog({ event: "import_failed", reason: "stale_blob", ageMs, ip });
+      authGuard.recordFailure(ip);
+      return sendJson(res, 403, { error: "import failed — blob has expired" });
+    }
   }
 
   const { provider, keys } = data;
@@ -1352,10 +1480,22 @@ async function handleImport(req, res) {
     imported++;
   }
 
+  // Token consumption is a v1-only concern — v2 uses the nonce map instead
+  // of per-token state in config.json.
+  const consumeV1Token = () => {
+    if (auditContext.version === 1 && auditContext.matchId) {
+      _consumeImportToken(currentConfig, auditContext.matchId);
+    }
+  };
+
   if (imported === 0) {
-    // Fix #1: Still consume token even if no new keys (prevent replay probing)
-    _consumeImportToken(currentConfig, match.id);
-    auditLog({ event: "import_empty", tokenId: match.id, provider, duplicates, invalid, mismatched, ip });
+    consumeV1Token();
+    auditLog({
+      event: "import_empty",
+      v: auditContext.version,
+      tokenId: auditContext.matchId ?? null,
+      provider, duplicates, invalid, mismatched, ip,
+    });
     const msg = mismatched > 0
       ? `no keys imported — ${mismatched} key(s) did not match the ${provider} format`
       : "no new keys to import";
@@ -1366,8 +1506,7 @@ async function handleImport(req, res) {
   if (!Array.isArray(provConf.keys)) provConf.keys = [...existingKeys];
   provConf.keys.push(...newKeys);
 
-  // Fix #1: Consume the token (single-use)
-  _consumeImportToken(currentConfig, match.id);
+  consumeV1Token();
 
   // Fix #6: Atomic config write
   try {
@@ -1380,7 +1519,8 @@ async function handleImport(req, res) {
   // Fix #16: Audit log
   auditLog({
     event: "import_success",
-    tokenId: match.id,
+    v: auditContext.version,
+    tokenId: auditContext.matchId ?? null,
     provider,
     imported,
     duplicates,
@@ -1390,7 +1530,7 @@ async function handleImport(req, res) {
   });
 
   // Trigger hot-reload so the pool picks up the new keys
-  console.log(`[ffai] Import: ${imported} key(s) added to "${provider}" (${duplicates} dupes, ${invalid} invalid, ${mismatched} mismatched)`);
+  console.log(`[ffai] Import v${auditContext.version}: ${imported} key(s) added to "${provider}" (${duplicates} dupes, ${invalid} invalid, ${mismatched} mismatched)`);
   process.kill(process.pid, "SIGHUP");
 
   sendJson(res, 200, { imported, duplicates, invalid, mismatched, provider });
@@ -1401,6 +1541,121 @@ function _consumeImportToken(currentConfig, tokenId) {
   if (!Array.isArray(currentConfig.import_tokens)) return;
   currentConfig.import_tokens = currentConfig.import_tokens.filter(t => t.id !== tokenId);
   config.import_tokens = currentConfig.import_tokens;
+}
+
+// ── v1 (legacy shared-secret) decrypt ───────────────────────────────────────
+// Retained only so HTML pages generated before the v2 upgrade can still be
+// used within their 24h TTL. New pages always emit v2 blobs.
+function v1Decrypt(envelope, ip) {
+  const tokens = config.import_tokens || [];
+  const match = tokens.find(t => t.id === envelope.id);
+  const matchAge = match ? Date.now() - new Date(match.created).getTime() : null;
+  const validMatch = match && matchAge <= IMPORT_TOKEN_TTL_MS;
+
+  if (!validMatch) {
+    const reason = match ? "expired_token" : "unknown_token";
+    auditLog({ event: "import_failed", v: 1, reason, tokenId: envelope.id, ip });
+    authGuard.recordFailure(ip);
+    return { error: "import failed — token invalid, expired, or already used", status: 403 };
+  }
+
+  try {
+    const salt = Buffer.from(envelope.salt, "base64");
+    const iv = Buffer.from(envelope.iv, "base64");
+    const ct = Buffer.from(envelope.ct, "base64");
+
+    const keyMaterial = crypto.pbkdf2Sync(match.token, salt, 600000, 32, "sha256");
+    const decipher = crypto.createDecipheriv("aes-256-gcm", keyMaterial, iv);
+
+    const authTag = ct.slice(ct.length - 16);
+    const encrypted = ct.slice(0, ct.length - 16);
+    decipher.setAuthTag(authTag);
+
+    const plaintext = Buffer.concat([decipher.update(encrypted), decipher.final()]).toString("utf8");
+    return { plaintext, tokenId: envelope.id, matchId: match.id };
+  } catch (err) {
+    console.warn(`[ffai] v1 decrypt failed (token ${envelope.id}): ${err.message}`);
+    auditLog({ event: "import_failed", v: 1, reason: "decrypt_failed", tokenId: envelope.id, ip });
+    authGuard.recordFailure(ip);
+    return { error: "import failed — token invalid, expired, or already used", status: 403 };
+  }
+}
+
+// ── v2 (public-key ECDH) decrypt ────────────────────────────────────────────
+// The envelope carries the browser's ephemeral P-256 public key (`ephPub`).
+// We perform ECDH with our persistent private key, pipe the shared bits
+// through HKDF-SHA256 with the same "ffai-import-v2" info string the browser
+// used, and AES-GCM decrypt. Any mismatch (tampered ct, wrong pubkey, replay
+// of a random blob) surfaces as "decrypt_failed" — the generic error message
+// we return externally avoids leaking which specific validation tripped.
+async function v2Decrypt(envelope, ip) {
+  if (!_importKeypair || !_importKeypair.privateKeyObj) {
+    auditLog({ event: "import_failed", v: 2, reason: "no_keypair", ip });
+    return { error: "server misconfigured: no import keypair", status: 503 };
+  }
+
+  let ephPubRaw, iv, ct;
+  try {
+    ephPubRaw = Buffer.from(envelope.ephPub, "base64");
+    iv = Buffer.from(envelope.iv, "base64");
+    ct = Buffer.from(envelope.ct, "base64");
+  } catch {
+    return { error: "invalid payload fields", status: 400 };
+  }
+
+  // P-256 uncompressed raw pubkey is always 65 bytes (0x04 || X(32) || Y(32)).
+  // Reject anything else early instead of letting createPublicKey surface a
+  // cryptic error to the client.
+  if (ephPubRaw.length !== 65 || ephPubRaw[0] !== 0x04) {
+    auditLog({ event: "import_failed", v: 2, reason: "bad_ephpub", ip });
+    authGuard.recordFailure(ip);
+    return { error: "import failed — malformed payload", status: 400 };
+  }
+  if (iv.length !== 12) {
+    auditLog({ event: "import_failed", v: 2, reason: "bad_iv", ip });
+    authGuard.recordFailure(ip);
+    return { error: "import failed — malformed payload", status: 400 };
+  }
+  if (ct.length < 17) { // at least 16-byte auth tag + 1 byte ciphertext
+    auditLog({ event: "import_failed", v: 2, reason: "short_ct", ip });
+    authGuard.recordFailure(ip);
+    return { error: "import failed — malformed payload", status: 400 };
+  }
+
+  try {
+    // Reconstruct SPKI DER prefix for P-256 so createPublicKey can parse it.
+    // Prefix is the fixed 26-byte AlgorithmIdentifier for id-ecPublicKey + P-256;
+    // we extracted the matching 65-byte raw form at keypair generation, so the
+    // inverse is just prefix || raw.
+    const SPKI_P256_PREFIX = Buffer.from(
+      "3059301306072a8648ce3d020106082a8648ce3d030107034200",
+      "hex",
+    );
+    const spki = Buffer.concat([SPKI_P256_PREFIX, ephPubRaw]);
+    const ephPubKey = crypto.createPublicKey({ key: spki, format: "der", type: "spki" });
+
+    const sharedSecret = crypto.diffieHellman({
+      privateKey: _importKeypair.privateKeyObj,
+      publicKey: ephPubKey,
+    });
+
+    // HKDF-SHA256 — matches the browser's parameters exactly (empty salt,
+    // "ffai-import-v2" info, 32-byte output). Any deviation on either side
+    // makes decryption fail with AES-GCM auth tag mismatch.
+    const aesKey = crypto.hkdfSync("sha256", sharedSecret, Buffer.alloc(0), Buffer.from("ffai-import-v2"), 32);
+
+    const decipher = crypto.createDecipheriv("aes-256-gcm", Buffer.from(aesKey), iv);
+    const authTag = ct.slice(ct.length - 16);
+    const encrypted = ct.slice(0, ct.length - 16);
+    decipher.setAuthTag(authTag);
+    const plaintext = Buffer.concat([decipher.update(encrypted), decipher.final()]).toString("utf8");
+    return { plaintext };
+  } catch (err) {
+    console.warn(`[ffai] v2 decrypt failed: ${err.message}`);
+    auditLog({ event: "import_failed", v: 2, reason: "decrypt_failed", ip });
+    authGuard.recordFailure(ip);
+    return { error: "import failed — blob could not be decrypted", status: 403 };
+  }
 }
 
 // ── Route: /health ──────────────────────────────────────────────────────────

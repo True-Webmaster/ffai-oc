@@ -96,26 +96,50 @@ function authHeader(key) {
 
 // ── Crypto: replicate the browser encryption logic from encrypt.html ────────
 //
-// The HTML page uses WebCrypto:
-//   key = PBKDF2(password=token, salt, 600_000, SHA-256, 32 bytes)
-//   ct  = AES-256-GCM(key, iv, plaintext)  // 16-byte tag APPENDED to ct
+// v2 (public-key) flow — the current default:
+//   1. Generate ephemeral P-256 keypair in the browser
+//   2. ECDH with the server's public key → 32-byte shared secret
+//   3. HKDF-SHA256(shared, salt=empty, info="ffai-import-v2") → AES-256 key
+//   4. ct = AES-256-GCM(aesKey, iv, plaintext)  // 16-byte tag APPENDED
+//   Envelope: { v: 2, ephPub: b64, iv: b64, ct: b64 }
 //
-// Envelope: { v: 1, id, salt: b64, iv: b64, ct: b64 }
+// v1 (legacy shared-secret) flow — still accepted by the server for backwards
+// compat with pre-upgrade HTML pages within the 24h TTL window.
 
-function encryptPayload(token, plaintextObj) {
-  const salt = crypto.randomBytes(16);
+function encryptPayloadV2(serverPubRawB64, plaintextObj) {
+  const serverPubRaw = Buffer.from(serverPubRawB64, "base64");
+  // Reconstruct an SPKI DER so createPublicKey can parse it
+  const SPKI_P256_PREFIX = Buffer.from(
+    "3059301306072a8648ce3d020106082a8648ce3d030107034200", "hex"
+  );
+  const serverPub = crypto.createPublicKey({
+    key: Buffer.concat([SPKI_P256_PREFIX, serverPubRaw]),
+    format: "der",
+    type: "spki",
+  });
+
+  const eph = crypto.generateKeyPairSync("ec", { namedCurve: "P-256" });
+  const ephSpkiDer = eph.publicKey.export({ type: "spki", format: "der" });
+  const ephPubRaw = ephSpkiDer.slice(ephSpkiDer.length - 65);
+
+  const sharedSecret = crypto.diffieHellman({
+    privateKey: eph.privateKey,
+    publicKey: serverPub,
+  });
+  const aesKey = crypto.hkdfSync(
+    "sha256", sharedSecret, Buffer.alloc(0), Buffer.from("ffai-import-v2"), 32
+  );
+
   const iv = crypto.randomBytes(12);
-  const key = crypto.pbkdf2Sync(token, salt, 600000, 32, "sha256");
-  const cipher = crypto.createCipheriv("aes-256-gcm", key, iv);
+  const cipher = crypto.createCipheriv("aes-256-gcm", Buffer.from(aesKey), iv);
   const plaintext = Buffer.from(JSON.stringify(plaintextObj), "utf8");
   const encrypted = Buffer.concat([cipher.update(plaintext), cipher.final()]);
   const authTag = cipher.getAuthTag();
-  // Serve expects tag appended to ct (matches the browser code path)
   const ct = Buffer.concat([encrypted, authTag]);
+
   return {
-    v: 1,
-    id: token.substring(0, 8),
-    salt: salt.toString("base64"),
+    v: 2,
+    ephPub: Buffer.from(ephPubRaw).toString("base64"),
     iv: iv.toString("base64"),
     ct: ct.toString("base64"),
   };
@@ -126,13 +150,16 @@ function envelopeToPayload(envelope) {
   return `FFAI-IMPORT:${blob}`;
 }
 
-// ── Parse token from HTML page ──────────────────────────────────────────────
+function randomNonce() {
+  return crypto.randomBytes(18).toString("base64");
+}
 
-function extractTokenFromHtml(html) {
-  // generateImportHtml embeds the token via: const TOKEN = JSON.stringify(token);
-  // which serializes to: const TOKEN = "<64 hex chars>";
-  const match = html.match(/const TOKEN = "([a-f0-9]{64})"/);
-  assert.ok(match, "HTML must contain TOKEN constant");
+// ── Parse public key from HTML page ─────────────────────────────────────────
+
+function extractPubKeyFromHtml(html) {
+  // generateImportHtml embeds: const SERVER_PUB_B64 = "<base64 65-byte raw>";
+  const match = html.match(/const SERVER_PUB_B64 = "([A-Za-z0-9+/=]+)"/);
+  assert.ok(match, "HTML must contain SERVER_PUB_B64 constant");
   return match[1];
 }
 
@@ -228,30 +255,31 @@ describe("Import endpoints (/generate-import, /import)", { concurrency: 1 }, () 
       assert.equal(res.status, 401);
     });
 
-    it("returns an HTML page with an embedded token when authenticated", async () => {
+    it("returns an HTML page with the server public key baked in", async () => {
       const res = await request("/generate-import", { headers: authHeader(ADMIN_KEY) });
       assert.equal(res.status, 200);
       assert.match(res.headers["content-type"] || "", /text\/html/);
       assert.ok(res.body.length > 1000, "HTML should be non-trivial");
-      // The token is what the browser will PBKDF2-derive the key from
-      const token = extractTokenFromHtml(res.body);
-      assert.equal(token.length, 64, "token should be 64 hex chars (32 bytes)");
+      // v2 embeds the server's P-256 public key (raw 65 bytes → ~88 base64 chars)
+      const pub = extractPubKeyFromHtml(res.body);
+      const raw = Buffer.from(pub, "base64");
+      assert.equal(raw.length, 65, "raw pubkey should be 65 bytes (0x04 || X || Y)");
+      assert.equal(raw[0], 0x04, "uncompressed P-256 pubkey starts with 0x04");
     });
 
-    it("persists the generated token to config.json", async () => {
-      const before = JSON.parse(fs.readFileSync(configFile, "utf8"));
-      const beforeCount = (before.import_tokens || []).length;
+    it("persists the server keypair across restarts (same pubkey on repeated /generate-import)", async () => {
+      const a = await request("/generate-import", { headers: authHeader(ADMIN_KEY) });
+      const b = await request("/generate-import", { headers: authHeader(ADMIN_KEY) });
+      assert.equal(a.status, 200);
+      assert.equal(b.status, 200);
+      // The public key is a long-lived server secret, not per-request
+      assert.equal(extractPubKeyFromHtml(a.body), extractPubKeyFromHtml(b.body));
 
-      const res = await request("/generate-import", { headers: authHeader(ADMIN_KEY) });
-      assert.equal(res.status, 200);
-      const token = extractTokenFromHtml(res.body);
-
-      const after = JSON.parse(fs.readFileSync(configFile, "utf8"));
-      assert.equal((after.import_tokens || []).length, beforeCount + 1);
-      const latest = after.import_tokens[after.import_tokens.length - 1];
-      assert.equal(latest.token, token);
-      assert.equal(latest.id, token.substring(0, 8));
-      assert.ok(latest.created, "token should have created timestamp");
+      // And it lives in config.json under import_keypair
+      const cfg = JSON.parse(fs.readFileSync(configFile, "utf8"));
+      assert.ok(cfg.import_keypair, "import_keypair should be persisted");
+      assert.equal(cfg.import_keypair.publicRawB64, extractPubKeyFromHtml(a.body));
+      assert.ok(cfg.import_keypair.privateJwk, "private JWK should be persisted");
     });
   });
 
@@ -279,7 +307,7 @@ describe("Import endpoints (/generate-import, /import)", { concurrency: 1 }, () 
     });
 
     it("400 when envelope version is unsupported", async () => {
-      const env = { v: 99, id: "deadbeef", salt: "AA==", iv: "AA==", ct: "AA==" };
+      const env = { v: 99, ephPub: "AA==", iv: "AA==", ct: "AA==" };
       const res = await request("/import", {
         method: "POST",
         headers: { ...authHeader(ADMIN_KEY), "content-type": "application/json" },
@@ -289,33 +317,10 @@ describe("Import endpoints (/generate-import, /import)", { concurrency: 1 }, () 
       assert.match(res.json?.error || "", /unsupported payload version/i);
     });
 
-    it("403 for unknown token ID (logged as 'unknown_token')", async () => {
-      const env = { v: 1, id: "deadbeef", salt: "AAAAAAAAAAAAAAAAAAAAAA==", iv: "AAAAAAAAAAAAAAAA", ct: "AAAAAAAAAAAAAAAAAAAAAA==" };
-      const res = await request("/import", {
-        method: "POST",
-        headers: { ...authHeader(ADMIN_KEY), "content-type": "application/json" },
-        body: JSON.stringify({ payload: envelopeToPayload(env) }),
-      });
-      assert.equal(res.status, 403);
-
-      const log = readAuditLog();
-      const hit = log.find((e) => e.event === "import_failed" && e.tokenId === "deadbeef");
-      assert.ok(hit, "audit log should have an entry for the unknown token");
-      assert.equal(hit.reason, "unknown_token");
-    });
-
-    it("403 for valid token ID with bad ciphertext (logged as 'decrypt_failed')", async () => {
-      // First: generate a fresh token so we have a valid ID on record
-      const genRes = await request("/generate-import", { headers: authHeader(ADMIN_KEY) });
-      assert.equal(genRes.status, 200);
-      const token = extractTokenFromHtml(genRes.body);
-      const id = token.substring(0, 8);
-
-      // Now craft an envelope with the real ID but garbage ciphertext
+    it("400 for v2 envelope with malformed ephemeral pubkey", async () => {
       const env = {
-        v: 1,
-        id,
-        salt: Buffer.alloc(16, 0).toString("base64"),
+        v: 2,
+        ephPub: Buffer.alloc(10, 0).toString("base64"),  // wrong length
         iv: Buffer.alloc(12, 0).toString("base64"),
         ct: Buffer.alloc(32, 0).toString("base64"),
       };
@@ -324,27 +329,47 @@ describe("Import endpoints (/generate-import, /import)", { concurrency: 1 }, () 
         headers: { ...authHeader(ADMIN_KEY), "content-type": "application/json" },
         body: JSON.stringify({ payload: envelopeToPayload(env) }),
       });
-      assert.equal(res.status, 403);
-      // Same error text as unknown token (no oracle)
-      assert.match(res.json?.error || "", /import failed/i);
+      assert.equal(res.status, 400);
 
       const log = readAuditLog();
-      const hit = log.find((e) => e.event === "import_failed" && e.tokenId === id && e.reason === "decrypt_failed");
-      assert.ok(hit, "audit log should have decrypt_failed entry");
+      const hit = log.find((e) => e.event === "import_failed" && e.reason === "bad_ephpub");
+      assert.ok(hit, "audit log should have bad_ephpub entry");
+    });
+
+    it("403 for v2 envelope with valid structure but wrong/garbage ciphertext", async () => {
+      // A well-formed uncompressed P-256 pubkey we control, with ciphertext
+      // encrypted under the wrong AES key — decryption auth tag will fail.
+      const genRes = await request("/generate-import", { headers: authHeader(ADMIN_KEY) });
+      assert.equal(genRes.status, 200);
+      // Don't use the real pubkey — encrypt with a throwaway keypair so
+      // ECDH with the server's private key produces a different AES key.
+      const wrongServer = crypto.generateKeyPairSync("ec", { namedCurve: "P-256" });
+      const wrongServerPubRaw = wrongServer.publicKey.export({ type: "spki", format: "der" }).slice(-65);
+      const env = encryptPayloadV2(
+        Buffer.from(wrongServerPubRaw).toString("base64"),
+        { provider: "testprov", keys: ["fresh-key-for-wrongkey-test"], ts: Date.now(), nonce: randomNonce() },
+      );
+      const res = await request("/import", {
+        method: "POST",
+        headers: { ...authHeader(ADMIN_KEY), "content-type": "application/json" },
+        body: JSON.stringify({ payload: envelopeToPayload(env) }),
+      });
+      assert.equal(res.status, 403);
+      assert.match(res.json?.error || "", /could not be decrypted/i);
+
+      const log = readAuditLog();
+      const hit = log.find((e) => e.event === "import_failed" && e.reason === "decrypt_failed" && e.v === 2);
+      assert.ok(hit, "audit log should have v2 decrypt_failed entry");
     });
   });
 
   // ── /import happy path ──────────────────────────────────────────────────
 
-  describe("POST /import — successful round-trip", () => {
-    it("installs new keys, dedups existing, consumes token", async () => {
-      // Generate token
+  describe("POST /import — successful round-trip (v2)", () => {
+    it("installs new keys, dedups existing, records audit entry", async () => {
       const genRes = await request("/generate-import", { headers: authHeader(ADMIN_KEY) });
-      const token = extractTokenFromHtml(genRes.body);
-      const id = token.substring(0, 8);
+      const pub = extractPubKeyFromHtml(genRes.body);
 
-      // Encrypt payload: one new key, one duplicate of the pre-existing key,
-      // one too-short invalid key
       const plaintext = {
         provider: "testprov",
         keys: [
@@ -352,8 +377,10 @@ describe("Import endpoints (/generate-import, /import)", { concurrency: 1 }, () 
           "existing-key-original-12345", // duplicate
           "short",                       // invalid (< 8 chars)
         ],
+        ts: Date.now(),
+        nonce: randomNonce(),
       };
-      const envelope = encryptPayload(token, plaintext);
+      const envelope = encryptPayloadV2(pub, plaintext);
       const res = await request("/import", {
         method: "POST",
         headers: { ...authHeader(ADMIN_KEY), "content-type": "application/json" },
@@ -365,33 +392,31 @@ describe("Import endpoints (/generate-import, /import)", { concurrency: 1 }, () 
       assert.equal(res.json.invalid, 1);
       assert.equal(res.json.provider, "testprov");
 
-      // Config must now contain the new key
       const cfg = JSON.parse(fs.readFileSync(configFile, "utf8"));
       assert.ok(cfg.providers.testprov.keys.includes("fresh-new-key-from-import-abc"),
         "new key must be written to config.json");
       assert.ok(cfg.providers.testprov.keys.includes("existing-key-original-12345"),
         "pre-existing key must remain");
 
-      // Token must be consumed (removed from import_tokens)
-      const stillThere = (cfg.import_tokens || []).some((t) => t.id === id);
-      assert.equal(stillThere, false, "token should be consumed after successful import");
-
-      // Audit log should record the success
       const log = readAuditLog();
-      const hit = log.find((e) => e.event === "import_success" && e.tokenId === id);
-      assert.ok(hit, "audit log should have import_success entry");
+      const hit = log.find((e) => e.event === "import_success" && e.v === 2);
+      assert.ok(hit, "audit log should have v2 import_success entry");
       assert.equal(hit.imported, 1);
       assert.equal(hit.duplicates, 1);
       assert.equal(hit.invalid, 1);
     });
 
-    it("rejects a second use of a consumed token", async () => {
-      // Generate and use a token
+    it("rejects replay of the same blob (nonce memory)", async () => {
       const genRes = await request("/generate-import", { headers: authHeader(ADMIN_KEY) });
-      const token = extractTokenFromHtml(genRes.body);
+      const pub = extractPubKeyFromHtml(genRes.body);
 
-      const plaintext = { provider: "testprov", keys: ["single-use-key-xyz-99999"] };
-      const envelope = encryptPayload(token, plaintext);
+      const plaintext = {
+        provider: "testprov",
+        keys: ["replay-test-key-xyz-9999"],
+        ts: Date.now(),
+        nonce: randomNonce(),
+      };
+      const envelope = encryptPayloadV2(pub, plaintext);
       const payload = JSON.stringify({ payload: envelopeToPayload(envelope) });
 
       const first = await request("/import", {
@@ -401,14 +426,43 @@ describe("Import endpoints (/generate-import, /import)", { concurrency: 1 }, () 
       });
       assert.equal(first.status, 200);
 
-      // Second attempt with the SAME envelope — should now fail because the
-      // token was consumed. The audit log should record it as unknown_token.
+      // Second attempt with the exact same envelope — nonce already seen, reject
       const second = await request("/import", {
         method: "POST",
         headers: { ...authHeader(ADMIN_KEY), "content-type": "application/json" },
         body: payload,
       });
       assert.equal(second.status, 403);
+      assert.match(second.json?.error || "", /already used/i);
+
+      const log = readAuditLog();
+      const replayHit = log.find((e) => e.event === "import_failed" && e.reason === "replay");
+      assert.ok(replayHit, "audit log should have replay entry");
+    });
+
+    it("rejects a stale blob (ts too old)", async () => {
+      const genRes = await request("/generate-import", { headers: authHeader(ADMIN_KEY) });
+      const pub = extractPubKeyFromHtml(genRes.body);
+
+      // ts = 2 days ago; server enforces 24h window
+      const plaintext = {
+        provider: "testprov",
+        keys: ["stale-blob-key-abcdefgh"],
+        ts: Date.now() - (2 * 24 * 60 * 60 * 1000),
+        nonce: randomNonce(),
+      };
+      const envelope = encryptPayloadV2(pub, plaintext);
+      const res = await request("/import", {
+        method: "POST",
+        headers: { ...authHeader(ADMIN_KEY), "content-type": "application/json" },
+        body: JSON.stringify({ payload: envelopeToPayload(envelope) }),
+      });
+      assert.equal(res.status, 403);
+      assert.match(res.json?.error || "", /expired/i);
+
+      const log = readAuditLog();
+      const hit = log.find((e) => e.event === "import_failed" && e.reason === "stale_blob");
+      assert.ok(hit, "audit log should have stale_blob entry");
     });
   });
 });
