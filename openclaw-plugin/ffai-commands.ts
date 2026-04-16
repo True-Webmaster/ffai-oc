@@ -161,7 +161,15 @@ export async function handleFfaiImportKeys(params: {
       audit: "ffai-provider.import",
     },
     async (response) => {
-      let data: { imported?: unknown; provider?: unknown; error?: unknown };
+      let data: {
+        imported?: unknown;
+        provider?: unknown;
+        duplicates?: unknown;
+        invalid?: unknown;
+        mismatched?: unknown;
+        message?: unknown;
+        error?: unknown;
+      };
       try {
         data = (await response.json()) as typeof data;
       } catch {
@@ -177,11 +185,25 @@ export async function handleFfaiImportKeys(params: {
       }
 
       const imported = typeof data.imported === "number" ? data.imported : 0;
+      const duplicates = typeof data.duplicates === "number" ? data.duplicates : 0;
+      const invalid = typeof data.invalid === "number" ? data.invalid : 0;
+      const mismatched = typeof data.mismatched === "number" ? data.mismatched : 0;
       const provider = typeof data.provider === "string" && data.provider.trim()
         ? data.provider.trim()
         : "unknown";
+
+      if (imported === 0) {
+        const msg = typeof data.message === "string" ? data.message : "no keys imported";
+        return { text: `FFAI /import: ${msg} (provider "${provider}")`, isError: mismatched > 0 };
+      }
+
+      const extras: string[] = [];
+      if (duplicates > 0) extras.push(`${duplicates} duplicate(s) skipped`);
+      if (invalid > 0) extras.push(`${invalid} invalid`);
+      if (mismatched > 0) extras.push(`${mismatched} did not match "${provider}" format`);
+      const suffix = extras.length > 0 ? ` (${extras.join(", ")})` : "";
       return {
-        text: `Keys imported successfully! ${imported} key(s) added for provider "${provider}".`,
+        text: `Keys imported successfully! ${imported} key(s) added for provider "${provider}"${suffix}.`,
       };
     },
   );

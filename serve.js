@@ -247,6 +247,19 @@ function auditLog(entry) {
 // ── Token expiry constants (fix #2, #14) ────────────────────────────────────
 const IMPORT_TOKEN_TTL_MS = 24 * 60 * 60 * 1000; // 24 hours
 const IMPORT_TOKEN_MAX = 20; // max active tokens
+
+// ── Provider key fingerprints ──────────────────────────────────────────────
+// Used by /import to reject mislabeled keys before they land in a pool where
+// every rotation would 401 and silently trip circuit breakers. Kept in sync
+// with the KEY_PATTERNS constant embedded in generateImportHtml — any change
+// here must be mirrored there (and vice-versa).
+const PROVIDER_KEY_PATTERNS = {
+  gemini:    /^AIza[A-Za-z0-9_-]{35}$/,
+  groq:      /^gsk_[A-Za-z0-9]{52}$/,
+  cerebras:  /^csk-[a-z0-9]{40,}$/,
+  ollama:    /^[0-9a-f]{32}\.[A-Za-z0-9]{20,}$/,
+  sambanova: /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/,
+};
 /** Redact potential API key patterns in upstream error bodies before forwarding to client. */
 const _KEY_PATTERNS = /\b(sk-[a-zA-Z0-9_-]{10,}|gsk_[a-zA-Z0-9]{20,}|AIzaSy[a-zA-Z0-9_-]{30,}|csk-[a-zA-Z0-9]{20,}|Bearer\s+[a-zA-Z0-9_-]{20,})\b/g;
 function _redactKeys(body) {
@@ -920,16 +933,19 @@ function generateImportHtml(token) {
 <div class="row">
   <label for="provider">Provider</label>
   <select id="provider">
+    <option value="auto">Auto-detect (recommended)</option>
     <option value="gemini">Gemini</option>
     <option value="groq">Groq</option>
     <option value="cerebras">Cerebras</option>
     <option value="ollama">Ollama</option>
+    <option value="sambanova">SambaNova</option>
   </select>
 </div>
 
 <div class="row">
   <label for="keys">API Keys (one per line)</label>
   <textarea id="keys" autocomplete="off" placeholder="AIzaSy...&#10;AIzaSy...&#10;AIzaSy..."></textarea>
+  <div class="status" id="detect-status" style="margin-top:0.4rem;"></div>
 </div>
 
 <div class="row">
@@ -949,6 +965,24 @@ function generateImportHtml(token) {
 
 <script>
 const TOKEN = ${JSON.stringify(token)};
+
+// Key-format patterns — kept in sync with KEY_PATTERNS on the server side.
+// Order matters: more-specific prefixes (gsk_, csk-, AIza) are checked before
+// the bare-UUID / hex-dot patterns that would otherwise over-match.
+const KEY_PATTERNS = [
+  { provider: "gemini",    regex: /^AIza[A-Za-z0-9_-]{35}$/ },
+  { provider: "groq",      regex: /^gsk_[A-Za-z0-9]{52}$/ },
+  { provider: "cerebras",  regex: /^csk-[a-z0-9]{40,}$/ },
+  { provider: "ollama",    regex: /^[0-9a-f]{32}\\.[A-Za-z0-9]{20,}$/ },
+  { provider: "sambanova", regex: /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/ },
+];
+
+function detectProvider(key) {
+  for (const { provider, regex } of KEY_PATTERNS) {
+    if (regex.test(key)) return provider;
+  }
+  return null;
+}
 
 function arrToBase64(buf) {
   const bytes = buf instanceof Uint8Array ? buf : new Uint8Array(buf);
@@ -973,7 +1007,7 @@ async function doEncrypt() {
   const btn = document.getElementById("encrypt-btn");
   const status = document.getElementById("status");
   const keysRaw = document.getElementById("keys").value.trim();
-  const provider = document.getElementById("provider").value;
+  const providerSelection = document.getElementById("provider").value;
 
   if (!keysRaw) { status.textContent = "No keys entered."; status.className = "status err"; return; }
 
@@ -981,6 +1015,44 @@ async function doEncrypt() {
   if (keys.length === 0) { status.textContent = "No valid keys found."; status.className = "status err"; return; }
 
   const dupes = keysRaw.split("\\n").map(k => k.trim()).filter(Boolean).length - keys.length;
+
+  // Resolve provider: auto-detect, or validate that user's explicit pick
+  // matches every key. Mixed batches are rejected — a single payload carries
+  // one provider label; mislabeled keys would land in the wrong pool.
+  const detected = keys.map(detectProvider);
+  const uniqueDetected = [...new Set(detected.filter(Boolean))];
+  let provider;
+  if (providerSelection === "auto") {
+    if (uniqueDetected.length === 0) {
+      status.textContent = "Could not auto-detect provider for any key. Pick a provider manually.";
+      status.className = "status err";
+      return;
+    }
+    if (uniqueDetected.length > 1) {
+      status.textContent = "Keys appear to belong to different providers (" + uniqueDetected.join(", ") + "). Encrypt them in separate batches.";
+      status.className = "status err";
+      return;
+    }
+    const unrecognized = detected.filter(d => !d).length;
+    if (unrecognized > 0) {
+      status.textContent = unrecognized + " key(s) did not match any known provider format.";
+      status.className = "status err";
+      return;
+    }
+    provider = uniqueDetected[0];
+  } else {
+    provider = providerSelection;
+    const wrong = [];
+    for (let i = 0; i < keys.length; i++) {
+      if (detected[i] && detected[i] !== provider) wrong.push(i + 1);
+      else if (!detected[i]) wrong.push(i + 1);
+    }
+    if (wrong.length > 0) {
+      status.textContent = "Key(s) on line " + wrong.join(", ") + " do not match the " + provider + " format. Use Auto-detect or fix the keys.";
+      status.className = "status err";
+      return;
+    }
+  }
 
   btn.disabled = true;
   btn.textContent = "Encrypting...";
@@ -1064,6 +1136,29 @@ document.getElementById("ffai-url").addEventListener("input", () => {
   const hasPayload = document.getElementById("payload") && document.getElementById("payload").value;
   document.getElementById("send-btn").style.display = (hasUrl && hasPayload) ? "inline-block" : "none";
 });
+
+// Live detection hint as user types — helps catch mislabeled pastes before encrypt.
+function updateDetectHint() {
+  const el = document.getElementById("detect-status");
+  const raw = document.getElementById("keys").value.trim();
+  if (!raw) { el.textContent = ""; el.className = "status"; return; }
+  const keys = raw.split("\\n").map(k => k.trim()).filter(Boolean);
+  if (keys.length === 0) { el.textContent = ""; el.className = "status"; return; }
+  const detected = keys.map(detectProvider);
+  const unique = [...new Set(detected.filter(Boolean))];
+  const unknown = detected.filter(d => !d).length;
+  if (unique.length === 1 && unknown === 0) {
+    el.textContent = "Detected: " + unique[0] + " (" + keys.length + " key" + (keys.length === 1 ? "" : "s") + ")";
+    el.className = "status ok";
+  } else if (unique.length > 1) {
+    el.textContent = "Mixed providers detected: " + unique.join(", ") + ". Split into separate batches.";
+    el.className = "status err";
+  } else if (unknown > 0) {
+    el.textContent = unknown + " key(s) did not match any known format.";
+    el.className = "status err";
+  }
+}
+document.getElementById("keys").addEventListener("input", updateDetectHint);
 </script>
 </body>
 </html>`;
@@ -1236,14 +1331,21 @@ async function handleImport(req, res) {
 
   // Deduplicate and validate
   const existingSet = new Set(existingKeys);
+  const providerPattern = PROVIDER_KEY_PATTERNS[provider];
   let imported = 0;
   let duplicates = 0;
   let invalid = 0;
+  let mismatched = 0;
   const newKeys = [];
 
   for (const key of keys) {
     if (typeof key !== "string" || key.trim().length < 8) { invalid++; continue; }
     const trimmed = key.trim();
+    // Format check: if we know the provider's fingerprint, reject keys that
+    // don't match. A Groq key in the Gemini pool would 401 on every rotation
+    // until the circuit breaker trips. Unknown providers (no pattern
+    // registered) fall through to the old length-only check above.
+    if (providerPattern && !providerPattern.test(trimmed)) { mismatched++; continue; }
     if (existingSet.has(trimmed)) { duplicates++; continue; }
     existingSet.add(trimmed);
     newKeys.push(trimmed);
@@ -1253,8 +1355,11 @@ async function handleImport(req, res) {
   if (imported === 0) {
     // Fix #1: Still consume token even if no new keys (prevent replay probing)
     _consumeImportToken(currentConfig, match.id);
-    auditLog({ event: "import_empty", tokenId: match.id, provider, duplicates, invalid, ip });
-    return sendJson(res, 200, { imported: 0, duplicates, invalid, message: "no new keys to import" });
+    auditLog({ event: "import_empty", tokenId: match.id, provider, duplicates, invalid, mismatched, ip });
+    const msg = mismatched > 0
+      ? `no keys imported — ${mismatched} key(s) did not match the ${provider} format`
+      : "no new keys to import";
+    return sendJson(res, 200, { imported: 0, duplicates, invalid, mismatched, provider, message: msg });
   }
 
   // Write keys into config
@@ -1280,14 +1385,15 @@ async function handleImport(req, res) {
     imported,
     duplicates,
     invalid,
+    mismatched,
     ip,
   });
 
   // Trigger hot-reload so the pool picks up the new keys
-  console.log(`[ffai] Import: ${imported} key(s) added to "${provider}" (${duplicates} dupes, ${invalid} invalid)`);
+  console.log(`[ffai] Import: ${imported} key(s) added to "${provider}" (${duplicates} dupes, ${invalid} invalid, ${mismatched} mismatched)`);
   process.kill(process.pid, "SIGHUP");
 
-  sendJson(res, 200, { imported, duplicates, invalid, provider });
+  sendJson(res, 200, { imported, duplicates, invalid, mismatched, provider });
 }
 
 // Fix #1: Helper to remove a used token from config
