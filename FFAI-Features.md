@@ -189,23 +189,27 @@ Full Server-Sent Events support with:
 
 ### Encrypted Key Import
 
-Adding API keys to a server is usually awkward — you either SSH in and edit config files, or you paste secrets into a chat where they can be logged. FFAI solves this with an end-to-end encrypted import flow:
+Adding API keys to a server is usually awkward — you either SSH in and edit config files, or you paste secrets into a chat where they can be logged. FFAI's import flow is built so that **neither the chat transport nor the HTML file can leak the keys**, even if both are captured.
 
-1. **Run `/ffai_encrypt` in OpenClaw** — FFAI generates a self-contained HTML page and sends it to you in Telegram (or saves it locally). The page includes a unique one-time token.
-2. **Open the HTML page in any browser** — no network needed. Paste your API keys, pick a password, and click Encrypt. The keys are encrypted locally using AES-256-GCM with PBKDF2 key derivation (600,000 iterations).
-3. **Copy the `FFAI-IMPORT:` blob** — this is the encrypted payload. It's useless without the password.
-4. **Paste it in OpenClaw chat** — the agent automatically detects the blob and sends it to FFAI.
-5. **FFAI decrypts, adds the keys, and hot-reloads** — no restart needed. New keys are live immediately.
+1. **Run `/ffai_encrypt` in OpenClaw** — FFAI generates a self-contained HTML page and sends it to you (via Telegram file attachment or a local path). The page has FFAI's ECDH P-256 **public key** baked in. No decryption secret lives in the HTML.
+2. **Open the HTML page in any browser** — no network needed. The page auto-detects the provider from the key format (or you pick manually), then performs ECDH with the baked-in server pubkey, derives an AES-256 key via HKDF-SHA256, and encrypts the keys with AES-256-GCM.
+3. **Copy the `FFAI-IMPORT:` blob** — this is the encrypted payload. It can only be decrypted by whoever holds the matching private key, i.e. the FFAI server.
+4. **Paste it in OpenClaw chat with `/ffai_import_keys`** — the plugin forwards the blob verbatim to FFAI.
+5. **FFAI decrypts, validates each key against the provider's format, and hot-reloads** — no restart needed. Mismatches are rejected before touching the pool.
 
 The keys never exist in plaintext anywhere except inside your browser tab and inside FFAI's memory. They never touch a log file, a chat history, or a disk (before encryption).
 
-**About the "import token":** when FFAI generates the HTML page, it embeds a random 64-character ID in it. Think of this as a one-time coupon code, **not** an encryption key. It just tells FFAI "this specific page is authorized to send me one import." Your actual secret is the password you type into the page — FFAI never sees it.
+**Why the HTML is safe to leak:** the HTML contains only a public key. Decryption requires the private half, which lives in FFAI's `config.json` (mode `0600`) and never leaves the host. An attacker with the HTML *and* the encrypted blob cannot recover the keys — they'd need to compromise the FFAI host itself, at which point the plaintext provider keys in `config.json` are already exposed anyway.
 
 **Security guarantees:**
-- **One-use coupon** — each HTML page works exactly once. After a successful import, the coupon is destroyed server-side. If you need to import more keys, generate a new page.
-- **24-hour expiry** — if you generate an HTML page and don't use it, FFAI stops accepting that page after 24 hours. Your encrypted blob is still cryptographically secure forever — the expiry just prevents stale pages from lingering as attack surface.
-- **Rate limited** — 10 attempts per minute per IP. If someone steals a page and tries to brute-force your password, they get blocked fast.
-- **Audit trail** — every import attempt (success, failure, rate-limit) is logged to `import-audit.log` with timestamp, IP, and token ID
+- **Public-key crypto** — ECDH P-256 + HKDF-SHA256 + AES-256-GCM. Web Crypto primitives, widely-reviewed, universally supported.
+- **Replay-proof** — every decrypted blob carries a random 18-byte nonce; the server remembers used nonces for 24h and rejects re-submissions.
+- **Freshness gate** — blobs older than 24h are rejected by timestamp.
+- **Rate limited** — 10 attempts per minute per IP. Repeated failures feed the global auth brute-force guard (10 failures → 5 min IP block).
+- **Format validation** — each key must match the declared provider's fingerprint (Gemini `AIza…`, Groq `gsk_…`, Cerebras `csk-…`, Ollama `{hex}.{alnum}`, SambaNova UUID). Mislabeled keys never enter the pool.
+- **Audit trail** — every import attempt (success, empty, replay, stale, decrypt-failed, rate-limited) is logged to `${configDir}/import-audit.log` as JSONL with timestamp, IP, provider, and reason.
+
+**What this does NOT protect against:** an active adversary watching your chat session in real time can see the plaintext keys in the HTML page's textarea during the ~500ms between "user pastes" and "browser encrypts". That's a fundamental limit of running the crypto in a browser you don't fully control; no redesign fixes it short of using a separate trusted device. The v2 design is specifically hardened for the "leaked transcript, hours or days later" threat — which was the common case.
 
 ---
 
@@ -252,7 +256,7 @@ FFAI includes a full TypeScript plugin for [OpenClaw](https://openclaw.com), reg
 - **Favorites** — curate a `ffai-favorites` group for quick access
 - **`/ffai_stats`** — check savings directly from chat
 - **`/ffai_encrypt`** — generate import page from chat, receive as Telegram file
-- **Auto-import** — paste an `FFAI-IMPORT:` blob in chat and the agent imports it automatically
+- **`/ffai_import_keys`** — import an encrypted blob (user-initiated only; no auto-import hook, so pasted blobs from untrusted sources can never trigger a silent import)
 
 ---
 
@@ -322,11 +326,11 @@ That's it. Your app thinks it's talking to OpenAI. FFAI handles everything else.
 | Dependencies | **0** |
 | Lines of code | **~8,000** |
 | Proxy overhead | **< 5ms** median |
-| Configured providers | **4** (extensible to any OpenAI-compat) |
+| Configured providers | **5** (Gemini, Groq, Cerebras, Ollama, SambaNova — extensible to any OpenAI-compat) |
 | Auth schemes | **4** (bearer, header, query, none) |
 | Scoring factors | **7** per key selection |
 | Circuit breaker levels | **2** (per-key + per-provider) |
-| PBKDF2 iterations | **600,000** |
+| Import crypto | **ECDH P-256 + HKDF-SHA256 + AES-256-GCM** (v2, public-key) |
 | Security findings fixed | **18/18** |
 | Max tracked models | **2,000** (LRU) |
 | Max tracked IPs | **100,000** (stale-first eviction) |
