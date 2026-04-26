@@ -261,12 +261,153 @@ export function normalizeCatalogSyncConfig(raw: unknown): CatalogSyncPluginConfi
 export function resolveCatalogSyncBaseUrl(params: {
   pluginConfig: CatalogSyncPluginConfig;
   env: NodeJS.ProcessEnv;
-}): string {
+}): { baseUrl: string; explicitlySet: boolean } {
+  // We track `explicitlySet` to gate the auto-flip below. The rule is
+  // narrower than "operator wrote a value somewhere" — `openclaw configure`
+  // writes `baseUrl: "http://127.0.0.1:8010"` into pluginConfig during
+  // onboarding, which would falsely flag "explicit" if we just looked for
+  // any non-empty value. Operators who want the default with auto-flip
+  // would have to manually delete the field, which is a footgun.
+  //
+  // So: only treat the URL as explicit when EITHER:
+  //   - it came from FFAI_URL env (env vars are always operator intent), or
+  //   - it's a non-loopback address (no benefit to auto-flipping a
+  //     non-loopback URL — auto-flip exists specifically to escape
+  //     loopback for Discord visibility)
+  // Otherwise it's effectively the default and auto-flip can apply.
   const envUrl = params.env.FFAI_URL?.trim();
-  if (envUrl) return normalizeFfaiBaseUrl(envUrl);
+  if (envUrl) return { baseUrl: normalizeFfaiBaseUrl(envUrl), explicitlySet: true };
+
   const pluginUrl = params.pluginConfig.baseUrl?.trim();
-  if (pluginUrl) return normalizeFfaiBaseUrl(pluginUrl);
-  return FFAI_DEFAULT_BASE_URL;
+  if (pluginUrl) {
+    const normalized = normalizeFfaiBaseUrl(pluginUrl);
+    let host: string | null = null;
+    try { host = new URL(normalized).hostname; } catch { /* malformed — fall through */ }
+    const isLoopbackPluginUrl = host !== null && isLoopbackHost(host);
+    return { baseUrl: normalized, explicitlySet: !isLoopbackPluginUrl };
+  }
+
+  return { baseUrl: FFAI_DEFAULT_BASE_URL, explicitlySet: false };
+}
+
+// ── Tailscale auto-detect ─────────────────────────────────────────────────
+//
+// OpenClaw's Discord channel plugin hides providers whose baseUrl looks
+// like loopback (see openclaw/openclaw#35516). When the operator hasn't
+// explicitly set FFAI_URL and FFAI is reachable on a Tailscale interface,
+// we publish the Tailscale URL instead of 127.0.0.1 so Discord stops
+// hiding the catalog.
+//
+// Safety: we ONLY flip when the Tailscale URL is verified reachable. If
+// FFAI is bound to loopback only (FFAI_BIND=127.0.0.1 default), the probe
+// fails and we keep using loopback — auto-flip would otherwise break every
+// completion request.
+
+const TAILSCALE_CGNAT_RE = /^100\.(?:6[4-9]|[7-9][0-9]|1[01][0-9]|12[0-7])\./;
+
+export function findTailscaleIp(): string | undefined {
+  let interfaces: ReturnType<typeof os.networkInterfaces>;
+  try {
+    interfaces = os.networkInterfaces();
+  } catch {
+    return undefined;
+  }
+  for (const name of Object.keys(interfaces)) {
+    const addrs = interfaces[name];
+    if (!addrs) continue;
+    for (const addr of addrs) {
+      if (addr.internal) continue;
+      if (addr.family !== "IPv4") continue;
+      if (TAILSCALE_CGNAT_RE.test(addr.address)) return addr.address;
+    }
+  }
+  return undefined;
+}
+
+export function isLoopbackHost(host: string): boolean {
+  const h = host.toLowerCase();
+  if (h === "localhost" || h === "0.0.0.0") return true;
+  if (h === "::1" || h === "[::1]") return true;
+  return /^127\.\d{1,3}\.\d{1,3}\.\d{1,3}$/.test(h);
+}
+
+async function probeReachable(url: string, timeoutMs: number): Promise<boolean> {
+  // Plain `fetch` with an AbortController — no need for SSRF guard here:
+  // the caller passes a URL we constructed from a Tailscale interface, not
+  // operator-supplied input.
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    const resp = await fetch(`${url}/health`, {
+      method: "GET",
+      signal: controller.signal,
+    });
+    return resp.ok;
+  } catch {
+    return false;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+export type DetectedBaseUrl = {
+  baseUrl: string;
+  source: "explicit" | "loopback" | "tailscale-flipped";
+  detail?: string;
+};
+
+/**
+ * Returns the baseUrl that catalog-sync should publish, after considering
+ * Tailscale availability.
+ *
+ * Decision tree:
+ *   - Operator explicitly set FFAI_URL or pluginConfig.baseUrl → use that (no flip)
+ *   - Resolved baseUrl is non-loopback → use that (already explicit enough)
+ *   - Resolved baseUrl is loopback AND Tailscale interface exists AND
+ *     FFAI is reachable on the Tailscale IP → flip to Tailscale URL
+ *   - Otherwise → keep loopback
+ */
+export async function resolveDetectedBaseUrl(params: {
+  resolved: { baseUrl: string; explicitlySet: boolean };
+  probeTimeoutMs?: number;
+}): Promise<DetectedBaseUrl> {
+  const { resolved } = params;
+  const probeTimeoutMs = params.probeTimeoutMs ?? 2000;
+
+  if (resolved.explicitlySet) {
+    return { baseUrl: resolved.baseUrl, source: "explicit" };
+  }
+
+  let parsed: URL;
+  try {
+    parsed = new URL(resolved.baseUrl);
+  } catch {
+    return { baseUrl: resolved.baseUrl, source: "loopback", detail: "unparseable URL" };
+  }
+  if (!isLoopbackHost(parsed.hostname)) {
+    return { baseUrl: resolved.baseUrl, source: "loopback" };
+  }
+
+  const tailscaleIp = findTailscaleIp();
+  if (!tailscaleIp) {
+    return { baseUrl: resolved.baseUrl, source: "loopback", detail: "no Tailscale interface" };
+  }
+
+  const candidate = `${parsed.protocol}//${tailscaleIp}:${parsed.port || (parsed.protocol === "https:" ? "443" : "80")}`;
+  const reachable = await probeReachable(candidate, probeTimeoutMs);
+  if (!reachable) {
+    return {
+      baseUrl: resolved.baseUrl,
+      source: "loopback",
+      detail: `Tailscale found (${tailscaleIp}) but FFAI not reachable there — set FFAI_BIND=0.0.0.0 to expose FFAI on Tailscale`,
+    };
+  }
+
+  return {
+    baseUrl: candidate,
+    source: "tailscale-flipped",
+    detail: `auto-flipped from ${resolved.baseUrl} (Discord-friendly)`,
+  };
 }
 
 export function resolveCatalogSyncApiKey(env: NodeJS.ProcessEnv): string | undefined {
@@ -330,7 +471,14 @@ export async function runCatalogSync(ctx: CatalogSyncStartContext): Promise<void
     return;
   }
 
-  const baseUrl = resolveCatalogSyncBaseUrl({ pluginConfig, env });
+  const resolved = resolveCatalogSyncBaseUrl({ pluginConfig, env });
+  const detected = await resolveDetectedBaseUrl({ resolved });
+  if (detected.source === "tailscale-flipped") {
+    logger?.info?.(`[ffai] catalog-sync: ${detected.detail}; using ${detected.baseUrl}`);
+  } else if (detected.detail) {
+    logger?.info?.(`[ffai] catalog-sync: ${detected.detail}`);
+  }
+  const baseUrl = detected.baseUrl;
   const apiKey = resolveCatalogSyncApiKey(env);
 
   // Retry loop: try once immediately, then after each delay in

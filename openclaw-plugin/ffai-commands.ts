@@ -11,6 +11,7 @@
  */
 import { fetchWithSsrFGuard } from "openclaw/plugin-sdk/ssrf-runtime";
 import { buildFfaiSsrfPolicy } from "./models.js";
+import { findTailscaleIp, isLoopbackHost } from "./catalog-sync.js";
 
 // ── Public exports ──────────────────────────────────────────────────────────
 
@@ -505,22 +506,36 @@ export async function handleFfaiDoctor(params: {
   //    0.0.0.0). FFAI defaults to 127.0.0.1:8010, so users running Discord
   //    + FFAI on the same host see no ffai-* entries in Discord's /models
   //    while Telegram works fine. See openclaw/openclaw#35516. Surface
-  //    this as a warn whenever the combo is detected — it's the single
-  //    most common "Discord shows nothing" cause and there's no signal
-  //    on the Discord side that filtering happened.
+  //    this as a warn whenever the combo is detected.
+  //
+  //    catalog-sync auto-flips the published baseUrl to a Tailscale IP
+  //    when one is reachable (see catalog-sync.ts → resolveDetectedBaseUrl).
+  //    The doctor's `baseUrl` arg is the runtime resolution from index.ts,
+  //    which doesn't apply that auto-flip. We do the same detection here
+  //    so the doctor reports the actual user-visible state.
   const discordConfigured = isDiscordConfigured(openclawConfig);
   const baseUrlIsLoopback = isLoopbackBaseUrl(baseUrl);
+  const tailscaleIp = findTailscaleIp();
   if (discordConfigured && baseUrlIsLoopback) {
+    const tailscaleHint = tailscaleIp
+      ? `A Tailscale interface is available (${tailscaleIp}). To use it: ` +
+        `set FFAI_BIND=0.0.0.0 (so FFAI listens on all interfaces) and ` +
+        `FFAI_URL=http://${tailscaleIp}:8010, then restart both FFAI and the gateway. ` +
+        "catalog-sync also auto-flips to Tailscale at gateway start when FFAI is " +
+        "reachable there — restarting the gateway after FFAI_BIND is changed should " +
+        "do this automatically."
+      : "No Tailscale interface detected. Set FFAI_URL to a non-loopback address " +
+        "(Tailscale IP, private LAN IP, or hostname) and restart the gateway. " +
+        "Installing Tailscale (https://tailscale.com) is the recommended path.";
     checks.push({
       name: "Discord/loopback compatibility",
       status: "warn",
       detail: `Discord channel detected and baseUrl=${baseUrl} resolves to loopback`,
       remediation:
         "Discord's /models picker silently hides providers with a loopback baseUrl " +
-        "(see openclaw/openclaw#35516). Set FFAI_URL to a non-loopback address — " +
-        "Tailscale IP (http://100.x.x.x:8010), private LAN IP, or a hostname — and " +
-        "restart the gateway. ffai-* models will then appear in Discord's /models " +
-        "alongside Telegram. The README FAQ has more detail.",
+        `(see openclaw/openclaw#35516). ${tailscaleHint} ` +
+        "ffai-* models will then appear in Discord's /models alongside Telegram. " +
+        "See the README FAQ for more detail.",
     });
   } else if (discordConfigured) {
     checks.push({
@@ -528,6 +543,35 @@ export async function handleFfaiDoctor(params: {
       status: "ok",
       detail: `Discord channel detected; baseUrl=${baseUrl} is non-loopback`,
     });
+  }
+
+  // 10. Tailscale availability — informational only. Reports whether the
+  //     gateway host has a Tailscale interface and whether catalog-sync
+  //     should be using it. This fires regardless of whether Discord is
+  //     configured because the auto-flip is the recommended setup
+  //     even for Telegram-only users (sets up cleanly if they later add
+  //     Discord).
+  if (tailscaleIp) {
+    if (baseUrlIsLoopback) {
+      checks.push({
+        name: "Tailscale auto-flip",
+        status: "warn",
+        detail: `Tailscale interface present (${tailscaleIp}) but baseUrl=${baseUrl} is loopback`,
+        remediation:
+          `catalog-sync prefers Tailscale when FFAI is reachable there. Currently ` +
+          `it isn't (FFAI is bound to loopback only). To enable: set FFAI_BIND=0.0.0.0 ` +
+          `in FFAI's environment, restart FFAI, then restart the gateway. ` +
+          `catalog-sync will detect the Tailscale interface, probe ${tailscaleIp}:` +
+          `<port>, and publish the Tailscale URL automatically — making the catalog ` +
+          `Discord-friendly without you doing anything else.`,
+      });
+    } else {
+      checks.push({
+        name: "Tailscale auto-flip",
+        status: "ok",
+        detail: `Tailscale interface present (${tailscaleIp}) and baseUrl=${baseUrl} is non-loopback`,
+      });
+    }
   }
 
   // ── Format output ─────────────────────────────────────────────────────────
@@ -580,23 +624,16 @@ function isDiscordConfigured(openclawConfig: unknown): boolean {
 }
 
 /**
- * True if the URL's hostname resolves to a loopback interface, in the
- * same shape Discord's model picker uses to hide "local" providers.
- * Covers 127.0.0.0/8, ::1, 0.0.0.0, and the literal "localhost".
+ * True if the URL's hostname looks like loopback. Wraps `isLoopbackHost`
+ * (in catalog-sync.ts) with URL parsing so we don't re-implement the
+ * regex set here.
  */
 function isLoopbackBaseUrl(baseUrl: string): boolean {
-  let host: string;
   try {
-    host = new URL(baseUrl).hostname.toLowerCase();
+    return isLoopbackHost(new URL(baseUrl).hostname);
   } catch {
     return false;
   }
-  if (host === "localhost") return true;
-  if (host === "0.0.0.0") return true;
-  if (host === "::1" || host === "[::1]") return true;
-  // 127.0.0.0/8
-  if (/^127\.\d{1,3}\.\d{1,3}\.\d{1,3}$/.test(host)) return true;
-  return false;
 }
 
 async function probeFfaiProviders(params: { baseUrl: string; apiKey: string }): Promise<
