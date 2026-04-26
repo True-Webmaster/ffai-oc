@@ -37,6 +37,13 @@ This is the explicit step-by-step. If you skip a step or do them in the
 wrong order, run [`/ffai_doctor`](#ffai_doctor) afterwards — it will tell
 you exactly which invariant is broken.
 
+> **If you're using Discord** (or plan to), follow
+> [Tailscale setup](#tailscale-setup-required-for-discord) **before** the
+> steps below. The default `127.0.0.1` setup makes FFAI invisible in
+> Discord's `/models` due to an upstream OpenClaw filter; Tailscale
+> auto-flip is the documented workaround. Telegram-only installs can
+> skip Tailscale and use loopback as today.
+
 ### 1. Install FFAI itself
 
 The plugin needs FFAI running on a reachable host (default: `127.0.0.1:8010`).
@@ -113,9 +120,11 @@ In any OpenClaw chat (Telegram, web, CLI), run:
 /ffai_doctor
 ```
 
-You should see eight `✓ ok` lines and a `Summary: 8 ok · 0 warn · 0 fail · …`
-footer. If anything is `✗ fail`, the line right below it tells you what
-to fix. Common first-install failures:
+You should see all `✓ ok` lines (typically 8 on a fresh Telegram-only
+install, up to 10 on Discord + Tailscale setups) and a `Summary: N ok ·
+0 warn · 0 fail · …` footer. If anything is `✗ fail` or `⚠ warn`, the
+line right below it tells you what to fix. Common first-install
+failures:
 
 - **`✗ FFAI_KEY in gateway env: missing`** — env var isn't visible to the
   running gateway. Either it isn't set at all, or you set it after the
@@ -131,6 +140,11 @@ to fix. Common first-install failures:
   populated `models.providers.ffai-*` yet. Restart the gateway after
   FFAI is reachable. Check `journalctl --user -u openclaw-gateway` for
   `[ffai] catalog-sync:` log lines.
+- **`⚠ Discord/loopback compatibility`** or **`⚠ Tailscale auto-flip`** —
+  FFAI works in Telegram but Discord's `/models` is empty because
+  OpenClaw's Discord channel filters loopback `baseUrl`s. Follow
+  [Tailscale setup](#tailscale-setup-required-for-discord). The doctor's
+  remediation line tells you the exact env vars to flip.
 
 ### 7. Try a model
 
@@ -280,7 +294,7 @@ something doesn't work and you don't know which layer is at fault — the
 output covers gateway env, FFAI reachability, provider configuration,
 key population, catalog-sync state, and allowlist coverage.
 
-Sample output:
+Sample output (Telegram-only, FFAI on `127.0.0.1`):
 
 ```
 FFAI doctor — preflight diagnostics
@@ -299,6 +313,16 @@ FFAI doctor — preflight diagnostics
 ✓ /models allowlist coverage: 65/65 ffai-* model refs in allowlist
 ────────────────────────────────────────
 Summary: 8 ok · 1 warn · 0 fail · 0 skipped
+```
+
+Sample output (Discord + Tailscale, FFAI on `0.0.0.0` for auto-flip):
+
+```
+…  (same first 9 checks) …
+✓ Discord/loopback compatibility: Discord channel detected; baseUrl=http://100.64.1.1:8010 is non-loopback
+✓ Tailscale auto-flip: Tailscale interface present (100.64.1.1) and baseUrl=http://100.64.1.1:8010 is non-loopback
+────────────────────────────────────────
+Summary: 10 ok · 1 warn · 0 fail · 0 skipped
 ```
 
 Acceptable resting state is "all-ok" with at most warnings on
@@ -535,63 +559,39 @@ Three likely causes, in order:
 
 Two things to check, in order:
 
-1. **Discord's model picker hides "local" providers.** The Discord
-   channel plugin in OpenClaw silently filters out providers whose
-   `baseUrl` looks like loopback (`127.0.0.1`, `localhost`,
-   `0.0.0.0`). FFAI's default `baseUrl` is `http://127.0.0.1:8010`, so
-   FFAI providers get hidden from Discord's `/models` even when they
-   show up correctly in Telegram. Telegram doesn't apply this filter.
-   See [openclaw/openclaw#35516](https://github.com/openclaw/openclaw/issues/35516)
+1. **Discord hides loopback providers.** OpenClaw's Discord channel
+   plugin silently filters out providers whose `baseUrl` looks like
+   loopback (`127.0.0.1`, `localhost`, `0.0.0.0`). FFAI's default is
+   `http://127.0.0.1:8010`, so Discord hides every `ffai-*` provider
+   even though Telegram shows them fine. See
+   [openclaw/openclaw#35516](https://github.com/openclaw/openclaw/issues/35516)
    (closed/stale).
 
-   **The plugin auto-flips to Tailscale when it can.** At catalog-sync
-   time, if the operator hasn't explicitly set `FFAI_URL`, the plugin:
+   **Fix:** follow [Tailscale setup](#tailscale-setup-required-for-discord)
+   end to end. The plugin's auto-flip detects Tailscale and switches
+   the published `baseUrl` to your Tailscale IP, which Discord's
+   filter accepts. If you can't use Tailscale, the same section
+   covers manual `FFAI_URL` overrides for LAN IPs and hostnames.
 
-   1. Checks for a Tailscale interface (any IPv4 address in
-      `100.64.0.0/10` CGNAT range).
-   2. Probes `http://<tailscale-ip>:<port>/health` to confirm FFAI is
-      actually reachable there.
-   3. If the probe succeeds → publishes the Tailscale URL to
-      `openclaw.json` instead of `127.0.0.1`. Discord's filter no
-      longer matches and `/models` works.
-   4. If the probe fails → keeps loopback. Auto-flip never breaks the
-      gateway's ability to reach FFAI.
+   Run `/ffai_doctor` from the Discord channel after restarting the
+   gateway. The "Tailscale auto-flip" check is the canonical signal
+   that the workaround is in effect.
 
-   For auto-flip to actually work, FFAI must be listening on the
-   Tailscale interface. Default `FFAI_BIND=127.0.0.1` means it isn't.
-   Set `FFAI_BIND=0.0.0.0` in FFAI's environment and restart FFAI.
-   The next gateway restart will detect the working Tailscale URL and
-   publish it.
-
-   **If you don't have Tailscale or the auto-flip doesn't work**, set
-   `FFAI_URL` explicitly:
-   - **Tailscale** (still recommended — install at <https://tailscale.com>
-     if you haven't): `FFAI_URL=http://100.x.x.x:8010`. Same security
-     profile as loopback (Tailnet-only), no firewall changes needed.
-   - **Private LAN IP**: `FFAI_URL=http://192.168.x.x:8010` if FFAI
-     and the gateway are on the same LAN.
-   - **Hostname**: any DNS name that doesn't resolve to a loopback
-     address.
-
-   After changing, **restart the gateway** so catalog-sync re-runs
-   with the new baseUrl. Run `/ffai_doctor` to verify — the
-   "Tailscale auto-flip" check tells you exactly what state you're in.
-
-2. **Discord and Telegram are routed to different agents.** Per
-   OpenClaw's config, channels can be bound to different agents and
-   each agent computes its own model picker. catalog-sync only writes
-   to `agents.defaults.models`. If your Discord channel is bound to a
-   non-default agent that has its own model overrides, the FFAI
-   entries we added to defaults don't propagate.
+2. **Discord and Telegram are routed to different agents.** Channels
+   can be bound to different agents, and each agent computes its own
+   model picker. catalog-sync only writes to `agents.defaults.models`.
+   If your Discord channel is bound to a non-default agent that has
+   its own model overrides, the FFAI entries we added to defaults
+   don't propagate.
 
    **Fix:** either bind the Discord channel to the same agent
    Telegram uses, or copy the `ffai-*` model refs from
    `agents.defaults.models` into that agent's config manually.
 
-   Run `/ffai_doctor` from the **Discord channel** to see exactly
-   what that agent's model picker resolves to. If the doctor shows
-   the expected ffai-* providers but Discord's `/models` doesn't,
-   you've hit cause (1) — the localhost filter — not cause (2).
+   `/ffai_doctor` from the Discord channel resolves the picker for
+   that channel's agent. If doctor shows the ffai-* providers but
+   `/models` doesn't, you've hit cause (1) — the loopback filter —
+   not cause (2).
 
 ### Why does the gateway "see" `FFAI_KEY` when the rest of my shell doesn't?
 
@@ -708,6 +708,168 @@ for the full architecture explanation. Disabling catalog-sync leaves
 The opt-out exists for a hypothetical future where the upstream
 dispatch starts working. Keep it on for now.
 
+## Tailscale setup (required for Discord)
+
+OpenClaw's Discord channel plugin hides any provider whose `baseUrl`
+looks like loopback (see
+[openclaw/openclaw#35516](https://github.com/openclaw/openclaw/issues/35516)).
+FFAI defaults to `http://127.0.0.1:8010`, so users running Discord +
+FFAI on the same host see no `ffai-*` entries in Discord's `/models`
+even though Telegram works fine.
+
+The plugin works around this with **Tailscale auto-flip**: at gateway
+start, if a Tailscale interface is available and FFAI is reachable on
+it, the plugin publishes the Tailscale URL to `openclaw.json` instead
+of `127.0.0.1`. Discord's filter no longer matches and `/models`
+populates correctly.
+
+**This is currently the only way to make FFAI work on Discord.** Until
+upstream OpenClaw fixes the loopback filter, every Discord install
+needs Tailscale (or some other non-loopback address). For Telegram-only
+installs, Tailscale is optional but recommended — it sets you up
+correctly if you later add Discord.
+
+### Setup steps
+
+These work for both new installs and existing Telegram-only setups
+that want to add Discord.
+
+#### 1. Install Tailscale on the FFAI host
+
+Skip this if Tailscale is already running. Otherwise:
+
+```bash
+curl -fsSL https://tailscale.com/install.sh | sh
+sudo tailscale up
+# Follow the auth flow. You'll get an IP in the 100.64.0.0/10 CGNAT range.
+tailscale ip -4
+# → 100.64.1.1 (your IP will differ)
+```
+
+#### 2. Bind FFAI to all interfaces
+
+FFAI's default `FFAI_BIND=127.0.0.1` only listens on loopback, so the
+auto-flip probe fails. Change it to listen everywhere:
+
+```bash
+# In FFAI's .env (typically ~/ffai/.env or wherever your FFAI install lives)
+FFAI_BIND=0.0.0.0
+
+# Restart FFAI
+systemctl --user restart ffai          # if running under user systemd
+# or
+systemctl restart ffai                 # if system-wide
+# or whatever you use to manage the FFAI process
+```
+
+`FFAI_BIND=0.0.0.0` exposes FFAI on every network interface — loopback,
+Tailscale, and any LAN. Because FFAI requires `FFAI_KEY` for all
+authenticated endpoints, this isn't a wide-open exposure; it just means
+the auth wall is what protects the API instead of the kernel's loopback
+restriction. If you want stricter binding, use the specific Tailscale
+IP: `FFAI_BIND=100.64.1.1`.
+
+#### 3. Verify FFAI is reachable on Tailscale
+
+```bash
+curl -s --max-time 2 http://$(tailscale ip -4):8010/health
+# → {"status":"ok"}
+```
+
+If this fails, FFAI isn't actually listening on the Tailscale
+interface. Common causes:
+
+- A firewall (`ufw`, `firewalld`) blocking the port — open it for the
+  Tailscale interface only: `sudo ufw allow in on tailscale0`
+- Wrong process restarted — `ss -tlnp | grep 8010` should show
+  `0.0.0.0:8010` (or the Tailscale IP), not `127.0.0.1:8010`
+
+#### 4. Restart the gateway
+
+```bash
+systemctl --user restart openclaw-gateway
+```
+
+Catalog-sync runs once per gateway start. The auto-flip detection
+fires here and writes the Tailscale URL into `openclaw.json` if the
+probe succeeds.
+
+#### 5. Verify auto-flip ran
+
+Check the gateway log:
+
+```bash
+journalctl --user -u openclaw-gateway --since '1 min ago' \
+  | grep '\[ffai\] catalog-sync'
+```
+
+Expected output if auto-flip worked:
+
+```
+[ffai] catalog-sync config: baseUrl=http://127.0.0.1:8010, favorites=…, catalogSync=true
+[ffai] catalog-sync: auto-flipped from http://127.0.0.1:8010 (Discord-friendly); using http://100.64.1.1:8010
+[ffai] catalog-sync: wrote 6 ffai-* providers to /home/.../openclaw.json
+```
+
+If you see `Tailscale found … but FFAI not reachable there`, FFAI
+isn't bound to the Tailscale interface. Recheck step 2.
+
+#### 6. Run `/ffai_doctor` from Discord
+
+In your Discord chat:
+
+```
+/ffai_doctor
+```
+
+The "Tailscale auto-flip" check should be `✓ ok`. If it's `⚠ warn`,
+the doctor's remediation line tells you what's wrong.
+
+### When auto-flip does NOT apply
+
+Auto-flip is skipped (and the plugin keeps using whatever URL was
+resolved) in these cases:
+
+- **Operator explicitly set `FFAI_URL`** — env override always wins.
+  If you've set `FFAI_URL=http://...`, the plugin assumes you know
+  what you're doing.
+- **Operator set a non-loopback `baseUrl` in the plugin config** —
+  same logic: not loopback, no need to flip.
+- **No Tailscale interface present** — nothing to flip to.
+- **Probe failed** — Tailscale interface exists but FFAI isn't
+  listening on it. Plugin keeps loopback so the gateway can still
+  reach FFAI.
+
+### Manual override (no Tailscale)
+
+If you can't or won't install Tailscale and you need Discord, set
+`FFAI_URL` to any non-loopback address:
+
+```bash
+# In the gateway's environment (NOT the FFAI host's environment)
+FFAI_URL=http://192.168.1.5:8010      # private LAN IP
+# or
+FFAI_URL=http://ffai.lan:8010         # internal hostname
+```
+
+The plugin treats any non-loopback URL as "explicit" and uses it as-is.
+You're responsible for making sure FFAI is actually reachable at that
+address — set `FFAI_BIND` accordingly.
+
+**Avoid public IPs unless you genuinely want FFAI exposed to the
+internet.** Set `FFAI_BIND` to bind only on the interface you've chosen,
+and verify with a port scan from outside the host that nothing else is
+exposed.
+
+### When the upstream filter is fixed
+
+OpenClaw `#35516` is currently closed/stale. If the maintainers ever
+ship a fix that lets loopback providers be visible in Discord, the
+auto-flip becomes unnecessary. The plugin's behavior won't break —
+auto-flip is gated on detecting Tailscale, not on Discord-being-broken.
+We'll deprecate the auto-flip in a future release once the filter is
+configurable upstream.
+
 ## Catalog sync
 
 OpenClaw plugins normally publish their model catalog through the
@@ -741,32 +903,34 @@ backoff: 5s, 10s, 30s, 60s, 120s, 120s — about 5 minutes of total
 budget. After all retries exhaust, a single warn line is logged and
 the catalog stays as it was; restart the gateway after FFAI is up.
 
-### Tailscale auto-flip
+### Tailscale auto-flip (mechanism)
 
-The Discord channel plugin in OpenClaw hides any provider whose
-`baseUrl` looks like loopback (see
-[openclaw/openclaw#35516](https://github.com/openclaw/openclaw/issues/35516)).
-FFAI's default URL is `http://127.0.0.1:8010`, which makes FFAI
-invisible in Discord's `/models` even though Telegram works fine.
+The operator playbook lives in
+[Tailscale setup](#tailscale-setup-required-for-discord). This
+subsection documents only the catalog-sync internals — what the
+auto-flip code actually does at gateway start.
 
-Catalog sync auto-detects Tailscale and flips the published URL to
-the Tailscale interface when it can:
+Decision tree (in `resolveDetectedBaseUrl`):
 
-1. If the operator explicitly set `FFAI_URL` or `pluginConfig.baseUrl`
-   → use that, no auto-flip.
-2. If the resolved URL is non-loopback → use it, no auto-flip.
+1. If `FFAI_URL` is set in the gateway env → use it, no auto-flip.
+2. If `pluginConfig.baseUrl` is non-loopback → use it, no auto-flip.
 3. If the resolved URL is loopback AND a Tailscale interface exists
    (any IPv4 in `100.64.0.0/10` CGNAT range) AND
    `http://<tailscale-ip>:<port>/health` responds → flip to the
    Tailscale URL.
-4. Otherwise → keep loopback.
+4. Otherwise → keep loopback. Probe failure means FFAI isn't
+   listening on the Tailscale interface; flipping anyway would break
+   every gateway → FFAI request.
 
-Step 3 includes a 2-second reachability probe before flipping, so
-auto-flip never breaks the gateway-to-FFAI path. If FFAI is bound to
-loopback only (default `FFAI_BIND=127.0.0.1`), the probe fails and
-catalog sync stays on loopback. To enable auto-flip, set
-`FFAI_BIND=0.0.0.0` in FFAI's environment so it listens on all
-interfaces (Tailscale + loopback both work) and restart FFAI.
+The probe has a 2-second timeout. The whole detection adds <100ms to
+gateway boot in steady state.
+
+Note: a `pluginConfig.baseUrl` of `127.0.0.1:8010` (which `openclaw
+configure` writes during onboarding) is treated as **not explicit**
+for auto-flip purposes — same logic as the default. Otherwise nearly
+every install would fail step 1's gate. If you genuinely want
+loopback even with Tailscale available, set `FFAI_URL=http://127.0.0.1:8010`
+explicitly; that wins.
 
 The flip is logged at gateway startup:
 

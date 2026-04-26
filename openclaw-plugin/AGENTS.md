@@ -67,6 +67,18 @@ populating the model catalog (the host's native dispatch doesn't fire
 for this plugin's combo of `providerDiscoveryEntry` + runtime entry).
 Disabling it leaves `/models` empty for FFAI providers.
 
+**5. Tailscale is the only path that works for Discord** until the
+upstream OpenClaw filter is fixed
+([openclaw#35516](https://github.com/openclaw/openclaw/issues/35516)).
+If a user is on Discord and `/models` is empty, the answer is "set up
+Tailscale, then `FFAI_BIND=0.0.0.0`" — point them at
+[README → Tailscale setup](README.md#tailscale-setup-required-for-discord).
+Don't suggest unauthenticated public-internet exposure of FFAI. Don't
+suggest disabling auth on `FFAI_BIND`. Don't suggest editing
+`openclaw.json` to bypass the filter — there's no manifest field that
+opts out, and any value you set there gets clobbered on the next
+gateway restart.
+
 ### Common user questions and the right answers
 
 **"Why isn't `gemini-2.5-pro` working?"**
@@ -82,6 +94,30 @@ The import response says `restart_hint` if hot-reload was best-effort
 only. Restart FFAI to force a full reload (`systemctl restart ffai` or
 equivalent), then retry. The keys are persisted to `config.json`
 regardless — they're not lost.
+
+**"`/models` works in Telegram but is empty in Discord."**
+This is the loopback-filter gotcha. OpenClaw's Discord channel hides
+providers whose `baseUrl` looks like loopback
+([openclaw#35516](https://github.com/openclaw/openclaw/issues/35516),
+closed/stale). Default FFAI lives on `127.0.0.1`, so Discord hides it.
+
+The fix is **Tailscale** (currently the only way to make this work
+short of an OpenClaw upstream fix). The plugin auto-detects a
+Tailscale interface and flips the published `baseUrl` to it — but
+only if FFAI is reachable there, which requires `FFAI_BIND=0.0.0.0`
+(or specifically the Tailscale IP) in FFAI's environment. Default
+`FFAI_BIND=127.0.0.1` blocks the auto-flip.
+
+Send the user to the canonical playbook in
+[`README.md` → "Tailscale setup (required for Discord)"](README.md#tailscale-setup-required-for-discord).
+Don't recite the steps inline — that section is the source of truth
+and stays current. Tell the user to run `/ffai_doctor` from the
+Discord channel after restarting the gateway; the "Tailscale
+auto-flip" check is `✓ ok` when it's working.
+
+If the user can't or won't use Tailscale, the same section covers
+manual `FFAI_URL` overrides (LAN IP, hostname). Avoid recommending
+public IPs unless the user explicitly says they want that.
 
 **"I changed `.env` but nothing changed."**
 The gateway reads env at startup. Changing `.env` after the gateway is
