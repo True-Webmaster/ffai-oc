@@ -1,0 +1,66 @@
+{
+  "favorites": [],
+  "providers": {
+    "gemini": {
+      "keys_var": "GEMINI_KEYS",
+      "upstream_url": "https://generativelanguage.googleapis.com/v1beta/openai",
+      "auth_scheme": "bearer",
+      "rpm_limit": 15,
+      "tpm_limit": 1000000,
+      "rpd_limit": 1500,
+      "default_cooldown": 10,
+      "max_cooldown": 300,
+      "retryable_statuses": [429, 502, 503],
+      "key_cb_threshold": 5,
+      "key_cb_cooldown": 120000
+    },
+    "groq": {
+      "keys_var": "GROQ_KEYS",
+      "upstream_url": "https://api.groq.com/openai",
+      "auth_scheme": "bearer",
+      "rpm_limit": 30,
+      "default_cooldown": 5,
+      "max_cooldown": 120,
+      "retryable_statuses": [429, 502, 503],
+      "key_cb_threshold": 5,
+      "key_cb_cooldown": 60000
+    },
+    "cerebras": {
+      "keys_var": "CEREBRAS_KEYS",
+      "upstream_url": "https://api.cerebras.ai",
+      "auth_scheme": "bearer",
+      "default_cooldown": 5,
+      "max_cooldown": 120,
+      "retryable_statuses": [429, 502, 503],
+      "key_cb_threshold": 5,
+      "key_cb_cooldown": 60000
+    },
+    "ollama": {
+      "keys_var": "OLLAMA_KEYS",
+      "upstream_url": "https://ollama.com",
+      "auth_scheme": "bearer",
+      "request_timeout": 180000,
+      "max_concurrent": 2,
+      "acquire_wait_ms": 30000,
+      "rpm_limit": 10,
+      "default_cooldown": 10,
+      "max_cooldown": 300,
+      "retryable_statuses": [429, 502, 503],
+      "key_cb_threshold": 5,
+      "key_cb_cooldown": 120000
+    },
+    "sambanova": {
+      "keys_var": "SAMBANOVA_KEYS",
+      "upstream_url": "https://api.sambanova.ai",
+      "auth_scheme": "bearer",
+      "rpm_limit": 20,
+      "rpd_limit": 20,
+      "default_cooldown": 10,
+      "max_cooldown": 300,
+      "retryable_statuses": [429, 502, 503],
+      "key_cb_threshold": 3,
+      "key_cb_cooldown": 120000,
+      "model_exclude": []
+    }
+  }
+}

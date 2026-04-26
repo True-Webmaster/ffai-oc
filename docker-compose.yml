@@ -1,25 +1,25 @@
 services:
-  keymux:
+  ffai:
     build: .
-    container_name: keymux
+    container_name: ffai
     restart: unless-stopped
     ports:
-      - "127.0.0.1:${PORT:-8002}:${PORT:-8002}"
+      - "127.0.0.1:${FFAI_PORT:-8010}:${FFAI_PORT:-8010}"
     env_file:
       - .env
     volumes:
-      - ./providers.json:/app/providers.json:ro
-      - keymux-data:/app/data
+      - ./config.json:/app/config.json:ro
+      - ffai-data:/app/data
     logging:
       driver: json-file
       options:
         max-size: "10m"
         max-file: "3"
     healthcheck:
-      test: ["CMD", "wget", "-q", "--spider", "http://localhost:${PORT:-8002}/health"]
+      test: ["CMD", "wget", "-q", "--spider", "http://localhost:${FFAI_PORT:-8010}/health"]
       interval: 30s
       timeout: 5s
       retries: 3
 
 volumes:
-  keymux-data:
+  ffai-data:

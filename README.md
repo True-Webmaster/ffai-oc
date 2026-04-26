@@ -1,73 +1,75 @@
-# KeyMux
+# FFAI — Free Freaking AI
 
-Multi-provider API key multiplexer with smart scoring, circuit breakers, streaming, and automatic model discovery. Zero dependencies — pure Node.js.
-
-Provider-agnostic — works with any HTTP API: OpenAI, Gemini, Anthropic, Groq, Ollama, or anything that accepts key-based auth. Each provider runs independently with its own key pool, mode, scoring, circuit breaker, and stats.
+Zero-dependency, key-pooling proxy for OpenAI-compatible LLM APIs. Pool
+keys across multiple providers (Gemini, Groq, Cerebras, Ollama,
+SambaNova — anything OpenAI-compatible), get free-tier capacity rotated
+across keys, and surface the unified catalog to OpenClaw via the
+first-party plugin in `openclaw-plugin/`.
 
 ## Features
 
 ### Core
-- **Multi-provider** — define multiple upstreams in `providers.json`, each with independent keys, mode, and settings
-- **Path-based routing** — `/:provider/...` dispatches to the correct upstream
-- **Two modes per provider** — `proxy` (full gateway) or `rotation` (key dispenser)
-- **Key rotation** — round-robin or smart scoring across multiple API keys
-- **Provider-agnostic auth** — configurable per provider: Bearer, custom header, query param, or none
-- **Inbound auth** — protect endpoints with `PROXY_KEY` / `ADMIN_KEY` (timing-safe comparison)
-- **Streaming** — pipes upstream responses directly (SSE, chunked) with extended timeouts
-- **Graceful shutdown** — sends `[DONE]` to active SSE connections, flushes stats on SIGTERM/SIGINT
-- **No secrets in config** — keys referenced indirectly via `keys_var` env vars
+- **Multi-provider** — define providers in `config.json`, each with independent keys, rate limits, and circuit breakers
+- **Path-based routing** — `/{provider}/v1/...` dispatches to the correct upstream
+- **Auto-routing** — `/v1/chat/completions` picks the provider based on the requested model
+- **Smart key selection** — scores keys by RPM/TPM/RPD usage, cooldown proximity, error history, and recency
+- **Adaptive rate-limit learning** — discovers actual provider RPM from 429 responses
+- **Streaming** — pipes upstream SSE/chunked responses with extended timeouts
+- **Hot reload** — `SIGHUP` reloads `config.json` without dropping live connections
+- **Graceful shutdown** — drains active SSE connections on SIGTERM/SIGINT
 
-### Smart Scoring
-- **Intelligent key selection** — scores keys by RPM/TPM/RPD usage ratios, cooldown proximity, error history, and recency
-- **Adaptive RPM learning** — discovers actual rate limits from 429 responses and adjusts scoring
-- **Per-key circuit breakers** — individual keys tripped after consecutive errors (default: 3 errors = 2min cooldown)
-- **Daily usage tracking** — per-key request counts for RPD-aware distribution
+### Model discovery
+- **Dynamic catalog** — periodically queries each provider's `/v1/models` and builds a unified list
+- **Native spec enrichment** — Gemini specs from `generativelanguage.googleapis.com`, Ollama context windows from `/api/show`, SambaNova from `context_length`
+- **Filtering** — drops models below `FFAI_MIN_CONTEXT_WINDOW`, `FFAI_MIN_TPM`, and `FFAI_MIN_PARAM_BILLIONS` so the catalog only shows agent-usable models
 
 ### Security
-- **Header allowlist** — strict allowlists for both outbound request and inbound response headers (no leaking internal headers)
-- **Path traversal protection** — blocks raw, double-encoded (`%252e%252e`), and post-decoded traversal attempts
+- **Encrypted key import** — paste an encrypted blob in chat, FFAI decrypts with its private key. ECDH P-256 + HKDF-SHA256 + AES-256-GCM. The HTML page contains no decryption secret. See [`openclaw-plugin/README.md`](openclaw-plugin/README.md#security-model).
+- **Per-provider key-format validation** — mismatched keys are rejected at import time, never silently trip circuit breakers
+- **Header allowlist** — strict allowlists for both outbound request and inbound response headers
+- **Path traversal protection** — three-layer check (raw, decoded, post-resolution)
 - **SSRF protection** — hostname validation on all constructed upstream URLs
 - **Auth brute-force protection** — per-IP rate limiting (10 failures/min = 5min block) with stale-first eviction
-- **Body size limits** — configurable per-provider max request body, enforced pre-read and during streaming
-- **Request body sanitization** — strips non-standard OpenAI params, enforces output token caps
+- **Body size limits** — configurable per-provider, enforced pre-read and during streaming
+- **Body sanitization** — strips non-standard OpenAI params, normalizes `max_completion_tokens`, caps `max_tokens` per provider
 - **Log scrubbing** — API keys never appear in logs (shown as `...xxxx` suffixes)
-- **Timing-safe auth** — constant-time comparison for PROXY_KEY and ADMIN_KEY
+- **Timing-safe auth** — constant-time comparison for `FFAI_KEY` and `FFAI_ADMIN_KEY`
 
 ### Reliability
-- **Provider-level circuit breaker** — auto-disable on repeated errors (configurable threshold/window/cooldown)
-- **Per-key circuit breaker** — individual keys isolated on consecutive failures
-- **Exponential retry backoff** — 100ms, 200ms, 400ms... capped at 2s, with body reset between retries
-- **Rate-limit handling** — respects `Retry-After` (seconds and HTTP-date formats), auto-cooldown with configurable cap
-- **Alert webhook** — throttled notifications (1/min per event type) on key exhaustion and circuit breaks
-- **Async stats persistence** — non-blocking writes to disk with atomic rename
+- **Provider-level circuit breaker** — auto-disable on repeated errors, alert webhook fires on trip
+- **Per-key circuit breaker** — individual keys isolated on consecutive failures, others keep serving
+- **Exponential retry backoff** — 100ms → 200ms → 400ms, capped at 2s, with body reset between retries
+- **Rate-limit handling** — respects `Retry-After` (seconds and HTTP-date formats)
+- **Wipe protection** — discovery never overwrites the live catalog with empty/error results
+- **Async stats persistence** — non-blocking writes with atomic rename
 
-### OpenClaw Integration
-- **First-party OpenClaw plugin** — `openclaw-plugin/` registers FFAI as a
-  provider through OpenClaw's `providerDiscoveryEntry` API with dynamic
-  catalog discovery, favorites grouping, and three slash commands
-  (`/ffai_stats`, `/ffai_encrypt`, `/ffai_import_keys`). See the plugin's
-  own README for install and configuration.
+### OpenClaw integration
+- **First-party plugin** in `openclaw-plugin/` — registers FFAI as an OpenClaw provider, discovers the model catalog dynamically, and ships three slash commands (`/ffai_stats`, `/ffai_encrypt`, `/ffai_import_keys`). See the plugin's [README](openclaw-plugin/README.md) for install and configuration.
 
-## Quick Start
+## Quick start
 
 ```bash
-# 1. Create your providers config
-cp providers.json.example providers.json
-# Edit providers.json — define your providers
+# 1. Create your provider config
+cp config.json.example config.json
+#    Edit config.json — define providers and rate limits
 
 # 2. Create your environment
 cp .env.example .env
-chmod 600 .env  # Recommended — .env holds API keys
-# Edit .env — set your API keys and optional settings
+chmod 600 .env       # .env holds API keys
+#    Edit .env — set FFAI_KEY and your provider key vars (GEMINI_KEYS, GROQ_KEYS, …)
 
 # 3. Run
 node serve.js
 ```
 
+Default port is `8010`, default bind is `127.0.0.1`. To talk to FFAI from
+elsewhere on the network, set `FFAI_BIND=0.0.0.0` (and **definitely** set
+`FFAI_KEY` first — without it, anyone reachable can use your keys).
+
 ## Docker
 
 ```bash
-cp providers.json.example providers.json
+cp config.json.example config.json
 cp .env.example .env
 chmod 600 .env
 # Edit both files
@@ -75,270 +77,195 @@ chmod 600 .env
 docker compose up -d
 ```
 
-The Docker setup binds to `127.0.0.1:${PORT}` on the host (loopback only). The container binds internally to `0.0.0.0`.
+The container binds internally to `0.0.0.0:8010`. The compose setup
+publishes that to `127.0.0.1:${FFAI_PORT:-8010}` on the host (loopback
+only) — change `docker-compose.yml` if you want it reachable from outside.
 
 ## Architecture
 
 ```
-Client -> GET /gemini/v1/models          -> KeyMux -> generativelanguage.googleapis.com
-Client -> POST /groq/v1/chat/completions -> KeyMux -> api.groq.com (key rotation + retry)
-Client -> GET /spare-keys/key            -> KeyMux returns next available key (rotation mode)
+Client -> POST /v1/chat/completions          -> FFAI auto-routes by model -> upstream
+Client -> POST /gemini/v1/chat/completions   -> FFAI key-rotates Gemini keys
+Client -> GET  /models                       -> Unified catalog from all providers
+Client -> GET  /savings                      -> Cost-avoided stats
 ```
 
-Each provider defined in `providers.json` gets its own:
-- Key pool with independent rotation or smart scoring
-- Mode (proxy or rotation)
-- Auth scheme (bearer, header, query, none)
-- Circuit breaker (provider-level and per-key)
-- Retry settings with exponential backoff
+Each provider in `config.json` gets its own:
+- Key pool with smart scoring
+- Auth scheme (bearer, header, or query)
+- Rate-limit budget (RPM/TPM/RPD)
+- Circuit breaker (per-key and per-provider)
 - Stats tracking (per-key, per-day)
+- Optional model exclusion list (`model_exclude`)
 
-### Request Flow (Proxy Mode)
+### Request flow (proxy mode)
 
-1. Client sends request to `/:provider/path`
-2. Auth check (PROXY_KEY, brute-force protection)
+1. Client POSTs to `/v1/chat/completions` (auto-route) or `/{provider}/v1/...` (explicit)
+2. Auth check (`FFAI_KEY`, brute-force protection)
 3. Path validation (traversal, allowed paths)
-4. Body collection with size limits
-5. Body sanitization (strip non-standard params, cap tokens, inject thought signatures)
-6. Smart key selection (or round-robin fallback)
+4. Body collection with size limit
+5. Body sanitization (strip non-standard params, normalize/cap tokens)
+6. Smart key selection
 7. Forward to upstream with allowlisted headers
 8. On retryable error: backoff, reset body, try next key
 9. Stream response back with allowlisted headers + correlation ID
 
 ## Configuration
 
-### providers.json
+### `config.json`
 
-Define one or more providers. Each provider has its own settings:
+Define providers and their keys/limits. The full field list lives in
+[`lib/config-validator.js`](lib/config-validator.js). Common fields:
 
 ```json
 {
-  "gemini": {
-    "mode": "proxy",
-    "upstream_url": "https://generativelanguage.googleapis.com/v1beta/openai",
-    "keys_var": "GEMINI_API_KEYS",
-    "auth_scheme": "bearer",
-    "rpm_limit": 15,
-    "tpm_limit": 1000000,
-    "rpd_limit": 1500
-  },
-  "groq": {
-    "mode": "proxy",
-    "upstream_url": "https://api.groq.com/openai",
-    "keys_var": "GROQ_API_KEYS",
-    "auth_scheme": "bearer",
-    "rpm_limit": 30,
-    "tpm_limit": 6000,
-    "rpd_limit": 14400
-  },
-  "anthropic": {
-    "mode": "proxy",
-    "upstream_url": "https://api.anthropic.com",
-    "keys_var": "ANTHROPIC_KEYS",
-    "auth_scheme": "header",
-    "auth_header": "x-api-key"
-  },
-  "spare-keys": {
-    "mode": "rotation",
-    "keys_var": "SPARE_API_KEYS"
+  "favorites": ["gemini-2.5-pro", "qwen3-coder:480b"],
+  "providers": {
+    "gemini": {
+      "keys_var": "GEMINI_KEYS",
+      "upstream_url": "https://generativelanguage.googleapis.com/v1beta/openai",
+      "auth_scheme": "bearer",
+      "rpm_limit": 15,
+      "tpm_limit": 1000000,
+      "rpd_limit": 1500,
+      "default_cooldown": 10,
+      "max_cooldown": 300,
+      "retryable_statuses": [429, 502, 503],
+      "key_cb_threshold": 5,
+      "key_cb_cooldown": 120000
+    }
   }
 }
 ```
 
-#### Per-provider Settings
+| Field                | Default                | Description                                                              |
+|----------------------|------------------------|--------------------------------------------------------------------------|
+| `upstream_url`       | *(required)*           | Upstream API base URL                                                    |
+| `keys`               | —                      | Array of API keys (alternative to `keys_var`)                            |
+| `keys_var`           | —                      | Env var name holding comma-separated keys                                |
+| `auth_scheme`        | `bearer`               | `bearer`, `header`, or `query`                                           |
+| `auth_header`        | `authorization`        | Header name when `auth_scheme: "header"`                                 |
+| `auth_query`         | `key`                  | Query param name when `auth_scheme: "query"`                             |
+| `rpm_limit`          | `0` (off)              | Requests per minute per key (enables smart scoring)                      |
+| `tpm_limit`          | `0` (off)              | Tokens per minute per key                                                |
+| `rpd_limit`          | `0` (off)              | Requests per day per key                                                 |
+| `tpd_limit`          | `0` (off)              | Tokens per day per key                                                   |
+| `max_concurrent`     | unlimited              | Max in-flight requests per provider                                      |
+| `acquire_wait_ms`    | `3000`                 | How long to wait for a free key before 503                               |
+| `request_timeout`    | `120000`               | Upstream request timeout (ms)                                            |
+| `key_cb_threshold`   | `3`                    | Consecutive errors to trip per-key CB                                    |
+| `key_cb_cooldown`    | `120000`               | Per-key CB cooldown (ms)                                                 |
+| `default_cooldown`   | `60`                   | Cooldown seconds when no `Retry-After` header                            |
+| `max_cooldown`       | `300`                  | Maximum cooldown seconds                                                 |
+| `retryable_statuses` | `[429, 502, 503]`      | HTTP status codes that trigger retry                                     |
+| `models`             | —                      | Static model list (otherwise discovered dynamically)                     |
+| `model_aliases`      | —                      | Map of `alias → real_id` for incoming requests                           |
+| `model_exclude`      | `[]`                   | Model IDs to drop from discovery output (e.g. higher-tier models)        |
 
-| Field | Default | Description |
-|---|---|---|
-| `mode` | `proxy` | `proxy` (full gateway) or `rotation` (key dispenser) |
-| `upstream_url` | *(required for proxy)* | Upstream API base URL |
-| `keys_var` | `API_KEYS` | Env var name holding comma-separated keys |
-| `auth_scheme` | `bearer` | `bearer`, `header`, `query`, or `none` |
-| `auth_header` | `authorization` | Header name when `auth_scheme: "header"` |
-| `auth_query` | `key` | Query param name when `auth_scheme: "query"` |
-| `allowed_paths` | `[]` (all) | Array of allowed path prefixes |
-| `max_retries` | `3` | Max retry attempts (capped at key count) |
-| `default_cooldown` | `60` | Cooldown seconds when no Retry-After header |
-| `max_cooldown` | `300` | Maximum cooldown seconds |
-| `retryable_statuses` | `[429,502,503]` | HTTP status codes that trigger retry |
-| `request_timeout` | `120000` | Upstream request timeout (ms) |
-| `max_body_size` | `2097152` | Max request body (2MB default, bytes) |
-| `max_output_tokens` | `0` | Max output tokens cap (0 = no cap) |
-| `cb_threshold` | `0` (off) | Errors within window to trip provider circuit breaker |
-| `cb_window` | `60000` | Provider CB error counting window (ms) |
-| `cb_cooldown` | `120000` | Provider CB open duration (ms) |
-| `rpm_limit` | `0` | Requests per minute per key (0 = unknown, enables smart scoring) |
-| `tpm_limit` | `0` | Tokens per minute per key |
-| `rpd_limit` | `0` | Requests per day per key |
-| `key_cb_threshold` | `3` | Consecutive errors to trip per-key CB |
-| `key_cb_cooldown` | `120000` | Per-key CB cooldown (ms) |
-| `models_cache_ttl` | `300000` | /models response cache TTL (ms) |
+A complete starter config is in [`config.json.example`](config.json.example).
 
-### Environment Variables (.env)
+### Environment variables (`.env`)
 
-Global settings. Because `.env` holds API keys, `chmod 600 .env` is strongly recommended.
+Global runtime knobs. Because `.env` holds API keys, `chmod 600 .env`
+before starting the server.
 
-| Variable | Default | Description |
-|---|---|---|
-| `PORT` | `8002` | Listen port |
-| `BIND_ADDRESS` | `127.0.0.1` | Bind address (`0.0.0.0` in Docker) |
-| `PROVIDERS_FILE` | `./providers.json` | Path to providers config |
-| `PROXY_KEY` | *(empty)* | Shared secret for proxy/rotation endpoints |
-| `ADMIN_KEY` | *(empty)* | Shared secret for `/stats` endpoint |
-| `ALERT_WEBHOOK_URL` | *(empty)* | Webhook URL for alerts |
-| `ALERT_TIMEOUT` | `5000` | Webhook request timeout (ms) |
-| `STATS_FILE` | `./data/stats.json` | Stats persistence path |
-| `STATS_FLUSH_INTERVAL` | `60000` | Stats write interval (ms) |
-| `STATS_RETENTION_DAYS` | `7` | Days of stats history |
-| `SHUTDOWN_TIMEOUT` | `5000` | Force-exit timeout (ms) |
+| Variable                     | Default                     | Description                                                              |
+|------------------------------|-----------------------------|--------------------------------------------------------------------------|
+| `FFAI_PORT`                  | `8010` (also reads `PORT`)  | Listen port                                                              |
+| `FFAI_BIND`                  | `127.0.0.1`                 | Bind address (`0.0.0.0` in Docker)                                       |
+| `FFAI_KEY`                   | —                           | Shared secret clients send as `Authorization: Bearer <FFAI_KEY>`         |
+| `FFAI_ADMIN_KEY`             | falls back to `FFAI_KEY`    | Required for `/stats`, `/savings`, `/providers`, `/smush`, `/generate-import` |
+| `FFAI_CONFIG`                | `./config.json`             | Path to provider config                                                  |
+| `FFAI_STATS_FILE`            | `./data/stats.json`         | Stats persistence path                                                   |
+| `FFAI_STATS_RETENTION_DAYS`  | `7`                         | Days of stats history                                                    |
+| `FFAI_STATS_FLUSH_INTERVAL`  | `60000`                     | Stats write interval (ms)                                                |
+| `FFAI_REQUEST_TIMEOUT`       | `120000`                    | Default upstream request timeout (ms)                                    |
+| `FFAI_MAX_BODY_SIZE`         | `2097152`                   | Default max request body (2 MB)                                          |
+| `FFAI_ACQUIRE_WAIT_MS`       | `3000`                      | Default key-acquire wait before 503                                      |
+| `FFAI_DRAIN_TIMEOUT`         | `10000`                     | Graceful-shutdown drain window (ms)                                      |
+| `FFAI_DISCOVERY_TIMEOUT`     | `30000`                     | `/v1/models` discovery wall timeout                                      |
+| `FFAI_DISCOVERY_SOCKET_TIMEOUT` | `15000`                  | Discovery socket-idle timeout                                            |
+| `FFAI_DISCOVERY_SPEC_TIMEOUT`| `30000`                     | Native-spec fetch budget (Gemini, Ollama)                                |
+| `FFAI_MIN_CONTEXT_WINDOW`    | `32768`                     | Drop discovered models below this context size                           |
+| `FFAI_MIN_OUTPUT_TOKENS`     | `4096`                      | Drop discovered models below this output cap                             |
+| `FFAI_MIN_PARAM_BILLIONS`    | `4`                         | Drop discovered models smaller than N billion params                     |
+| `FFAI_MIN_TPM`               | `20000`                     | Drop providers whose TPM is below this                                   |
+| `FFAI_AUTH_FAIL_MAX`         | `10`                        | Max auth failures per IP before block                                    |
+| `FFAI_AUTH_FAIL_WINDOW`      | `60000`                     | Failure-counting window (ms)                                             |
+| `FFAI_AUTH_BLOCK_DURATION`   | `300000`                    | Block duration after too many failures (ms)                              |
+| `FFAI_ALERT_WEBHOOK`         | —                           | Webhook URL for circuit-break/key-exhausted events                       |
+| `FFAI_ALERT_TIMEOUT`         | `5000`                      | Webhook request timeout (ms)                                             |
+| `FFAI_VALIDATE_KEYS`         | `false`                     | Validate keys against upstream `/models` on startup                      |
+| `FFAI_VALIDATE_TIMEOUT`      | `10000`                     | Per-key validation timeout (ms)                                          |
+| `FFAI_STRUCTURED_LOGS`       | `false`                     | Emit JSON logs instead of human-readable lines                           |
 
-API keys are set in `.env`, referenced by `keys_var` in each provider:
+Provider keys go in `.env` and are referenced by `keys_var`:
+
 ```bash
-GEMINI_API_KEYS=key1,key2,key3
-GROQ_API_KEYS=gsk_abc,gsk_def
-ANTHROPIC_KEYS=sk-ant-xxx,sk-ant-yyy
+GEMINI_KEYS=key1,key2,key3
+GROQ_KEYS=gsk_abc,gsk_def
+CEREBRAS_KEYS=csk-...
+OLLAMA_KEYS=...
+SAMBANOVA_KEYS=...
 ```
+
+Both `.env` (env vars) and the imported keys in `config.json` (under
+`providers.<name>.keys[]`) are loaded — env keys load first, imported
+keys append.
 
 ## Endpoints
 
-| Method | Path | Auth | Description |
-|---|---|---|---|
-| `GET` | `/health` | open | Health check (503 when any provider degraded). Detailed per-key stats require `ADMIN_KEY` |
-| `GET` | `/models` | `PROXY_KEY` | Aggregated model list from all proxy-mode providers (10s per-provider timeout) |
-| `GET` | `/stats` | `ADMIN_KEY`* | Full stats with daily history per provider/key |
-| `GET` | `/providers` | `PROXY_KEY` | List all providers (names, modes, key counts) |
-| `GET` | `/:provider/key` | `PROXY_KEY` | Get next available key (rotation mode only) |
-| `POST` | `/:provider/key/:id/cooldown` | `PROXY_KEY` | Report key rate-limited (rotation mode, requires unique suffix match) |
-| `*` | `/:provider/*` | `PROXY_KEY` | Proxied to upstream (proxy mode) |
+| Method | Path                              | Auth                | Description                                                                       |
+|--------|-----------------------------------|---------------------|-----------------------------------------------------------------------------------|
+| `GET`  | `/health`                         | open / `FFAI_KEY`   | Health check (degraded → 503). Detailed per-provider stats require auth.          |
+| `GET`  | `/models`                         | `FFAI_KEY`          | Unified model catalog from all providers, enriched with native specs.             |
+| `POST` | `/v1/chat/completions`            | `FFAI_KEY`          | Auto-routes to the provider that owns the requested model.                        |
+| `*`    | `/{provider}/v1/*`                | `FFAI_KEY`          | Proxy to a specific provider with key rotation and retries.                       |
+| `GET`  | `/providers`                      | `FFAI_ADMIN_KEY`    | Provider status, key health, and circuit-breaker state.                           |
+| `GET`  | `/stats`                          | `FFAI_ADMIN_KEY`    | Full per-key, per-day usage stats.                                                |
+| `GET`  | `/savings`                        | `FFAI_ADMIN_KEY`    | Cost-avoided breakdown (today / month / lifetime).                                |
+| `GET`  | `/smush`                          | `FFAI_ADMIN_KEY`    | Compression cache stats.                                                          |
+| `GET`  | `/families`                       | `FFAI_KEY`          | Model-family routing map (provider groups serving the same family).               |
+| `GET`  | `/capabilities`                   | `FFAI_KEY`          | Per-model learned capabilities (RPM/TPM observed in the wild).                    |
+| `GET`  | `/generate-import`                | `FFAI_ADMIN_KEY`    | Generates the encrypt HTML page for `/ffai_encrypt`. See plugin docs.             |
+| `POST` | `/import`                         | none (token in blob) | Receives an encrypted `FFAI-IMPORT:` blob, decrypts, and writes keys to the pool.|
 
-*`ADMIN_KEY` falls back to `PROXY_KEY` if not set. Rotation mode requires `PROXY_KEY` (enforced at startup).
+`FFAI_ADMIN_KEY` falls back to `FFAI_KEY` if not set.
 
-### Response Headers
+### Response headers
 
-All proxied responses include:
-- `x-request-id` — 8-character correlation ID for log tracing
-- `x-keymux-modified` — present when request body was sanitized (params stripped, tokens capped, thought signatures injected)
+Every proxied response includes:
+- `x-ffai-provider` — which provider handled the request
+- `x-ffai-request-id` — 8-char correlation ID for log tracing
+- `x-ffai-latency-ms` — total proxy latency
+- `x-ffai-utilization` — current provider utilisation (`0.0` – `1.0`)
+- `x-ffai-capacity-warning: low` — when the provider is running hot
+- `x-ffai-modified: true` — when body sanitization rewrote the request
+- `x-ffai-deprecated: true` — when the upstream model is flagged as deprecated
 
-## Smart Scoring
+## Smart scoring
 
-When `rpm_limit`, `tpm_limit`, or `rpd_limit` are set for a provider, KeyMux uses intelligent key selection instead of round-robin:
+When `rpm_limit`, `tpm_limit`, or `rpd_limit` are set, FFAI uses
+intelligent key selection instead of round-robin:
 
-```json
-{
-  "gemini": {
-    "rpm_limit": 15,
-    "tpm_limit": 1000000,
-    "rpd_limit": 1500
-  }
-}
-```
-
-**How it works:**
-1. Each key gets a score based on current usage ratios (0.0 = idle, 1.0 = at limit)
+1. Each key gets a score based on current usage ratios (`0.0` = idle, `1.0` = at limit)
 2. Keys closer to their limits score lower
 3. Recently-used keys get a small recency penalty to spread load
 4. The highest-scoring (least-loaded) key is selected
 5. If a 429 reveals the actual RPM limit, it's learned and used for future scoring
 
-**Per-key circuit breaker:** After 3 consecutive errors (configurable via `key_cb_threshold`), the individual key is isolated for 2 minutes. Other keys continue serving. The key auto-recovers after the cooldown.
+**Per-key circuit breaker.** After `key_cb_threshold` consecutive errors
+(default 3), the individual key is isolated for `key_cb_cooldown` ms
+(default 120000). Other keys continue serving. The key auto-recovers
+after the cooldown.
 
-## Circuit Breaker
+## Auth schemes
 
-### Provider-Level
-
-Protects against cascading failures. Set in `providers.json`:
-
-```json
-{
-  "gemini": {
-    "cb_threshold": 10,
-    "cb_window": 60000,
-    "cb_cooldown": 120000
-  }
-}
-```
-
-- 10 errors within 1 minute (with no intervening 2xx/3xx success) trips the circuit
-- Provider is blocked for 2 minutes, returns 503 to clients
-- `/health` shows `"circuitBreaker": "open"`
-- Alert webhook fires with event `circuit_open` (throttled to 1/min)
-- Episode tracking prevents alert spam during key flapping
-
-### Per-Key
-
-Automatic, always active:
-- 3 consecutive errors per key = 2min isolation (configurable)
-- Other keys in the same provider continue working
-- Key auto-recovers after cooldown
-
-## Auth Schemes
-
-| Scheme | How it works | Use with |
-|---|---|---|
-| `bearer` | `Authorization: Bearer <key>` | OpenAI, Gemini OpenAI-compat, Groq |
-| `header` | `<auth_header>: <key>` | Anthropic (`x-api-key`), Google (`x-goog-api-key`) |
-| `query` | `?<auth_query>=<key>` | Google native APIs, legacy REST |
-| `none` | No auth injection | Ollama, pre-authed upstreams |
-
-## Modes
-
-### Proxy Mode (default)
-
-Full transparent proxy. Clients send requests to KeyMux as if it were the upstream API:
-
-```bash
-curl http://localhost:8002/gemini/v1/chat/completions \
-  -H "Authorization: Bearer $PROXY_KEY" \
-  -H "Content-Type: application/json" \
-  -d '{"model":"gemini-2.0-flash","messages":[{"role":"user","content":"hi"}]}'
-```
-
-KeyMux injects the API key, sanitizes the request body, forwards to upstream with retries, and streams the response back.
-
-**Body sanitization** (for `/chat/completions` requests):
-- Strips non-standard keys (e.g., `store`, `reasoning_effort`, `thinking`)
-- Normalizes `max_completion_tokens` to `max_tokens`
-- Caps `max_tokens` if provider has `max_output_tokens` set
-- Injects cached Gemini 3 thought signatures for tool calling
-- Compacts unsigned tool calls to text (prevents Gemini rejection)
-
-### Rotation Mode
-
-Key-dispenser mode. No proxying — clients fetch a key and connect directly:
-
-```bash
-# Get next available key (includes audit trail with correlation ID)
-curl http://localhost:8002/spare-keys/key \
-  -H "Authorization: Bearer $PROXY_KEY"
-# {"key":"sk-abc...xyz","upstream_url":null,"provider":"spare-keys"}
-
-# Report a rate limit (suffix must uniquely identify one key)
-curl -X POST http://localhost:8002/spare-keys/key/xyz1/cooldown \
-  -H "Authorization: Bearer $PROXY_KEY" \
-  -H "Content-Type: application/json" \
-  -d '{"retry_after": 60}'
-```
-
-## Alert Webhook
-
-KeyMux POSTs to `ALERT_WEBHOOK_URL` on critical events (throttled to 1 per event type per 60 seconds):
-
-```json
-{
-  "event": "all_keys_exhausted",
-  "timestamp": "2026-04-04T12:00:00.000Z",
-  "message": "[gemini] All 10 keys are rate limited."
-}
-```
-
-Events: `all_keys_exhausted`, `circuit_open`
-
-## OpenClaw Integration
-
-FFAI ships with a first-party OpenClaw plugin in `openclaw-plugin/`. Install
-it by copying or symlinking that directory into `~/.openclaw/extensions/ffai`
-and running `openclaw configure`. Full install instructions, config schema,
-and the `/ffai_stats`, `/ffai_encrypt`, `/ffai_import_keys` command reference
-live in [`openclaw-plugin/README.md`](openclaw-plugin/README.md).
+| Scheme   | How it works                              | Use with                                       |
+|----------|-------------------------------------------|------------------------------------------------|
+| `bearer` | `Authorization: Bearer <key>`             | OpenAI, Gemini OpenAI-compat, Groq, Cerebras, SambaNova |
+| `header` | `<auth_header>: <key>`                    | Anthropic (`x-api-key`), Google native (`x-goog-api-key`) |
+| `query`  | `?<auth_query>=<key>`                     | Google native APIs, legacy REST                |
 
 ## Streaming
 
@@ -349,32 +276,66 @@ SSE (Server-Sent Events) streams get extended timeouts:
 - Cross-chunk buffering with `\n\n` delimiter parsing for JSON extraction
 - Pipe timeout flag guards against writes after connection close
 
-## Security Details
+## OpenClaw integration
 
-### Header Allowlists
+FFAI ships with a first-party OpenClaw plugin in `openclaw-plugin/`.
+Install it by copying or symlinking that directory into
+`~/.openclaw/extensions/ffai` and running `openclaw configure`. Full
+install instructions, security model (public-key import), config schema,
+and the `/ffai_stats`, `/ffai_encrypt`, `/ffai_import_keys` command
+reference live in [`openclaw-plugin/README.md`](openclaw-plugin/README.md).
 
-**Outbound request headers** (to upstream):
+## Alert webhook
+
+FFAI POSTs to `FFAI_ALERT_WEBHOOK` on critical events (throttled to 1
+per event type per 60 seconds):
+
+```json
+{
+  "event": "all_keys_exhausted",
+  "timestamp": "2026-04-04T12:00:00.000Z",
+  "message": "[gemini] All 10 keys are rate limited."
+}
+```
+
+Events: `all_keys_exhausted`, `circuit_open`.
+
+## Security details
+
+### Header allowlists
+
+**Outbound request headers (to upstream):**
 `content-type`, `content-length`, `user-agent`, `accept`, `x-request-id`, `x-stainless-*`
 
-**Response headers** (back to client):
-`content-type`, `content-length`, `content-encoding`, `cache-control`, `date`, `vary`, `x-request-id`, `x-ratelimit-*`, `retry-after`, `openai-*`
+**Response headers (back to client):**
+`content-type`, `content-length`, `transfer-encoding`, `cache-control`,
+`vary`, `retry-after`, `retry-after-ms`, `x-request-id`, `x-ratelimit-*`,
+`anthropic-ratelimit-*`, `openai-processing-ms`, `openai-model`
 
 All other headers are stripped to prevent information leakage.
 
-### Path Traversal Protection
+### Path traversal protection
 
 Three-layer defense:
 1. Raw path check for `..` and null bytes
 2. Decoded path check (`decodeURIComponent`) for double-encoded attacks (`%252e%252e`)
 3. Post-construction check on resolved `url.pathname`
 
-### Auth Brute-Force Protection
+### Auth brute-force protection
 
 - 10 failed auth attempts per IP within 1 minute = 5-minute block
 - Stale-first eviction when tracking map exceeds 100K entries
 - Periodic cleanup of expired entries every 5 minutes
 
-## File Structure
+### Encrypted key import
+
+Adding API keys without SSH'ing to the server. The flow uses ECDH P-256 +
+HKDF-SHA256 + AES-256-GCM so the HTML page contains only a public key —
+an attacker who captures the page AND the encrypted blob still cannot
+decrypt without compromising the FFAI host. Full threat model and rate
+limits in [`openclaw-plugin/README.md`](openclaw-plugin/README.md#security-model).
+
+## File structure
 
 ```
 ffai/
@@ -383,15 +344,17 @@ ffai/
   index.js              # Library entry
   openclaw-plugin/      # First-party OpenClaw provider plugin
   lib/                  # Core modules (pool, discovery, smush, auth, …)
-  providers.json        # Provider configuration (not in git)
-  .env                  # Environment variables (not in git, mode 600)
+  test/                 # node:test integration tests
+  config.json           # Provider configuration (not in git, mode 0600)
+  config.json.example   # Provider config template
+  .env                  # Environment variables (not in git, mode 0600)
   .env.example          # Environment template
-  providers.json.example # Provider config template
   Dockerfile            # Alpine Node.js 22 container
   docker-compose.yml    # Docker Compose with loopback binding
   package.json          # Project metadata
   data/
     stats.json          # Persisted stats (auto-created)
+  import-audit.log      # Per-import audit trail, in same dir as config.json
 ```
 
 ## License
