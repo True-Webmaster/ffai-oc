@@ -18,8 +18,8 @@ automatically.
 - **Favourites group.** Configure a list of model IDs and the plugin
   publishes them under a virtual `ffai-favorites` provider. The first entry
   is promoted to the agent default during onboarding.
-- **Three slash commands.** `/ffai_stats`, `/ffai_encrypt`, and
-  `/ffai_import_keys` (see [Slash commands](#slash-commands)).
+- **Four slash commands.** `/ffai_stats`, `/ffai_encrypt`,
+  `/ffai_import_keys`, and `/ffai_doctor` (see [Slash commands](#slash-commands)).
 - **Per-provider key-format validation.** A Groq key accidentally dropped
   into the Gemini pool is rejected at import time, never silently trips
   circuit breakers.
@@ -31,30 +31,130 @@ automatically.
 - **SSRF-hardened fetches.** Every outbound request to FFAI goes through the
   OpenClaw SDK's SSRF guard, pinned to the configured baseUrl hostname.
 
-## Install
+## Quick install
 
-Drop the plugin into your OpenClaw extensions directory (either copy or
-symlink for development):
+This is the explicit step-by-step. If you skip a step or do them in the
+wrong order, run [`/ffai_doctor`](#ffai_doctor) afterwards — it will tell
+you exactly which invariant is broken.
+
+### 1. Install FFAI itself
+
+The plugin needs FFAI running on a reachable host (default: `127.0.0.1:8010`).
+See the top-level FFAI README for installation. Verify FFAI is up before
+continuing:
 
 ```bash
-# Copy
+curl -s -H "Authorization: Bearer $FFAI_KEY" http://127.0.0.1:8010/health
+# expected: {"status":"ok",...}
+```
+
+### 2. Install the plugin
+
+Copy or symlink the plugin into your OpenClaw extensions directory:
+
+```bash
+# Copy (production)
 cp -r openclaw-plugin ~/.openclaw/extensions/ffai
 
-# Or symlink
+# Or symlink (development — picks up edits without re-copying)
 ln -s /path/to/ffai/openclaw-plugin ~/.openclaw/extensions/ffai
 ```
 
-Then run the OpenClaw setup wizard:
+### 3. Allow and enable the plugin
 
-```bash
-openclaw configure
+In `~/.openclaw/openclaw.json`, ensure `ffai` is in `plugins.allow` and
+the entry is enabled:
+
+```json
+{
+  "plugins": {
+    "allow": ["ffai"],
+    "entries": {
+      "ffai": {
+        "enabled": true,
+        "config": {
+          "baseUrl": "http://127.0.0.1:8010",
+          "favorites": []
+        }
+      }
+    }
+  }
+}
 ```
 
-Pick **FFAI** from the provider list and paste your FFAI API key when
-prompted. The wizard writes the provider shell into `openclaw.json` and,
-if you've pre-configured favourites, sets the first one as your default
-model. Do **not** hand-edit `openclaw.json` to add the provider — the
-plugin owns that section and discovery will overwrite stale entries.
+### 4. Set gateway environment variables
+
+The gateway process reads env at startup. Set these in the gateway's
+`.env` file or systemd unit (NOT just your shell — the gateway won't see
+shell-only vars):
+
+| Variable         | Required for                              |
+|------------------|-------------------------------------------|
+| `FFAI_KEY`       | Catalog discovery, `/ffai_stats`          |
+| `FFAI_URL`       | Optional — defaults to `http://127.0.0.1:8010` |
+| `FFAI_ADMIN_KEY` | `/ffai_encrypt` only                      |
+
+### 5. Restart the gateway
+
+Without restart, the gateway is still running the old environment and
+won't see your new env vars. This is the single most common cause of
+post-install confusion:
+
+```bash
+systemctl --user restart openclaw-gateway
+# or however your installation manages the gateway process
+```
+
+### 6. Verify with /ffai_doctor
+
+In any OpenClaw chat (Telegram, web, CLI), run:
+
+```
+/ffai_doctor
+```
+
+You should see eight `✓ ok` lines and a `Summary: 8 ok · 0 warn · 0 fail · …`
+footer. If anything is `✗ fail`, the line right below it tells you what
+to fix. Common first-install failures:
+
+- **`✗ FFAI_KEY in gateway env: missing`** — env var isn't visible to the
+  running gateway. Either it isn't set at all, or you set it after the
+  gateway started. Set it in the gateway's environment, restart, retry.
+- **`✗ FFAI providers configured`** — FFAI's own `config.json` has zero
+  providers. Add at least one provider stanza (Gemini, Groq, Cerebras,
+  Ollama, SambaNova) and restart FFAI. See FFAI's `config.json.example`.
+- **`✗ FFAI keys configured`** — providers exist but have zero keys. Set
+  the matching `keys_var` env vars (e.g. `GEMINI_KEYS=...,...`) and
+  restart FFAI, OR use `/ffai_encrypt` → `/ffai_import_keys` to import
+  via the encrypted blob flow.
+- **`✗ openclaw.json catalog-sync`** — the plugin's catalog-sync hasn't
+  populated `models.providers.ffai-*` yet. Restart the gateway after
+  FFAI is reachable. Check `journalctl --user -u openclaw-gateway` for
+  `[ffai] catalog-sync:` log lines.
+
+### 7. Try a model
+
+Once `/ffai_doctor` is all-green:
+
+```
+/models                             → should list ffai-gemini, ffai-groq, …
+/model ffai-gemini/gemini-2.5-pro   → switch to a specific FFAI model
+```
+
+If `/models` shows no `ffai-*` entries despite doctor passing, your
+`agents.defaults.models` allowlist is non-empty and missing the model
+refs — restart the gateway so catalog-sync's allowlist pass runs again.
+
+## Install (legacy / opinionated)
+
+If you used `openclaw configure` to onboard FFAI, the wizard handles
+steps 3 and parts of 4 for you. It picks **FFAI** from the provider list,
+prompts for an API key, writes the provider shell into `openclaw.json`,
+and sets the first configured favourite as your default model. The
+upgrade path from a wizard install is identical to the steps above. Do
+**not** hand-edit `openclaw.json` to add the `ffai` provider — the plugin
+owns that section and catalog-sync will overwrite stale entries on the
+next gateway boot.
 
 ## Configure
 
@@ -172,6 +272,40 @@ cannot trigger key import without you explicitly typing `/ffai_import_keys`.
 Blobs must start with the literal `FFAI-IMPORT:` prefix; bare base64
 payloads are rejected.
 
+### `/ffai_doctor`
+
+Runs preflight diagnostics for the plugin and prints OK/FAIL per check
+with one-line remediation hints for any failures. Use this when
+something doesn't work and you don't know which layer is at fault — the
+output covers gateway env, FFAI reachability, provider configuration,
+key population, catalog-sync state, and allowlist coverage.
+
+Sample output:
+
+```
+FFAI doctor — preflight diagnostics
+────────────────────────────────────────
+✓ plugin loaded: this command ran, so the plugin's register() executed
+✓ FFAI_KEY in gateway env: present (48 chars)
+⚠ FFAI_ADMIN_KEY in gateway env: missing
+    → Optional — needed only for /ffai_encrypt. If you plan to import keys
+      via the encrypt page, set FFAI_ADMIN_KEY in the gateway environment
+      and restart the gateway.
+✓ FFAI reachable: http://127.0.0.1:8010 responded ok
+✓ FFAI providers configured: 5 provider(s): gemini, groq, cerebras, ollama, sambanova
+✓ FFAI keys configured: keys per provider: gemini=10, groq=3, cerebras=1, ollama=1, sambanova=1
+✓ FFAI /models populated: 61 model(s) discovered
+✓ openclaw.json catalog-sync: 6 ffai-* provider(s): ffai-gemini, ffai-groq, ffai-cerebras, ffai-ollama, ffai-sambanova, ffai-favorites
+✓ /models allowlist coverage: 65/65 ffai-* model refs in allowlist
+────────────────────────────────────────
+Summary: 8 ok · 1 warn · 0 fail · 0 skipped
+```
+
+Acceptable resting state is "all-ok" with at most warnings on
+`FFAI_ADMIN_KEY` (only matters if you use `/ffai_encrypt`) and the
+allowlist coverage line (only matters if you actively curate
+`agents.defaults.models`).
+
 ## Security model
 
 This section matters — read it if you're going to use the key-import flow
@@ -284,6 +418,7 @@ them down.
 /ffai_stats                         → compression & savings stats
 /ffai_encrypt                       → get the import HTML page (as file)
 /ffai_import_keys FFAI-IMPORT:...   → import encrypted keys
+/ffai_doctor                        → preflight diagnostics (run after install)
 ```
 
 ## Where keys end up

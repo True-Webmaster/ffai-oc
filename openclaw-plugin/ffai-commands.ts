@@ -26,7 +26,14 @@ export async function handleFfaiStats(params: {
 }): Promise<CommandResult> {
   const { baseUrl, apiKey } = params;
   if (!apiKey) {
-    return { text: "FFAI_KEY not configured. Cannot fetch stats.", isError: true };
+    return {
+      text:
+        "FFAI_KEY is not visible to this gateway process.\n\n" +
+        "If you've set FFAI_KEY in .env but the gateway was started before that change, " +
+        "the running process won't see it until restart — env is read at startup, not on demand.\n\n" +
+        "Fix: set FFAI_KEY in the gateway environment, restart the gateway, then run /ffai_doctor.",
+      isError: true,
+    };
   }
 
   return ffaiRequest(
@@ -62,7 +69,14 @@ export async function handleFfaiEncrypt(params: {
   const { baseUrl, adminKey } = params;
   if (!adminKey) {
     return {
-      text: "FFAI_ADMIN_KEY not configured. Set it in your environment to generate import pages.",
+      text:
+        "FFAI_ADMIN_KEY is not visible to this gateway process.\n\n" +
+        "Two common causes:\n" +
+        "  1. The variable isn't set anywhere — add `FFAI_ADMIN_KEY=...` to the gateway's .env or systemd unit.\n" +
+        "  2. It IS set in your shell or .env, but the gateway was started before that change. " +
+        "The running process reads env at startup; updating .env after the gateway is up has no effect until restart.\n\n" +
+        "Fix: set FFAI_ADMIN_KEY in the gateway environment, then RESTART the gateway. " +
+        "Run /ffai_doctor afterwards to confirm the env var is live.",
       isError: true,
     };
   }
@@ -168,6 +182,8 @@ export async function handleFfaiImportKeys(params: {
         invalid?: unknown;
         mismatched?: unknown;
         message?: unknown;
+        restart_hint?: unknown;
+        provider_auto_created?: unknown;
         error?: unknown;
       };
       try {
@@ -180,7 +196,7 @@ export async function handleFfaiImportKeys(params: {
       }
 
       if (data.error) {
-        const errMsg = redactSecrets(String(data.error)).slice(0, 300);
+        const errMsg = redactSecrets(String(data.error)).slice(0, 600);
         return { text: `FFAI /import error: ${errMsg}`, isError: true };
       }
 
@@ -202,11 +218,396 @@ export async function handleFfaiImportKeys(params: {
       if (invalid > 0) extras.push(`${invalid} invalid`);
       if (mismatched > 0) extras.push(`${mismatched} did not match "${provider}" format`);
       const suffix = extras.length > 0 ? ` (${extras.join(", ")})` : "";
+      const autoCreatedLine = data.provider_auto_created === true
+        ? `\nProvider stanza for "${provider}" was auto-created in FFAI's config.json from a built-in template.`
+        : "";
+      const restartHint = typeof data.restart_hint === "string"
+        ? `\n\nNote: ${data.restart_hint}`
+        : "";
       return {
-        text: `Keys imported successfully! ${imported} key(s) added for provider "${provider}"${suffix}.`,
+        text: `Keys imported successfully! ${imported} key(s) added for provider "${provider}"${suffix}.${autoCreatedLine}${restartHint}`,
       };
     },
   );
+}
+
+// ── /ffai_doctor — preflight diagnostics ────────────────────────────────────
+//
+// Runs the same checks an installer's "did this actually work?" step would
+// run, prints OK/FAIL per check with one-line remediation hints, and returns
+// a summary count. Designed to catch every common install-time failure mode
+// (FFAI unreachable, env var missing from gateway process, no providers
+// configured, no keys, catalog-sync hasn't populated openclaw.json,
+// allowlist gating /models output) without the operator having to chase
+// logs or grep config files.
+
+type DoctorCheck = {
+  name: string;
+  status: "ok" | "warn" | "fail" | "skip";
+  detail: string;
+  remediation?: string;
+};
+
+export async function handleFfaiDoctor(params: {
+  baseUrl: string;
+  apiKey: string | undefined;
+  adminKey: string | undefined;
+  openclawConfig: unknown;
+}): Promise<CommandResult> {
+  const { baseUrl, apiKey, adminKey, openclawConfig } = params;
+  const checks: DoctorCheck[] = [];
+
+  // 1. Plugin loaded — we're running, so this is implicit. Surface it
+  //    anyway because operators reading the output want to confirm.
+  checks.push({
+    name: "plugin loaded",
+    status: "ok",
+    detail: "this command ran, so the plugin's register() executed",
+  });
+
+  // 2. Gateway env: FFAI_KEY visible to the running process
+  if (apiKey) {
+    checks.push({
+      name: "FFAI_KEY in gateway env",
+      status: "ok",
+      detail: `present (${apiKey.length} chars)`,
+    });
+  } else {
+    checks.push({
+      name: "FFAI_KEY in gateway env",
+      status: "fail",
+      detail: "missing",
+      remediation:
+        "Set FFAI_KEY in the gateway environment (.env or systemd unit) and RESTART the gateway. " +
+        "The running process reads env at startup; updating .env after the gateway is up has no effect until restart.",
+    });
+  }
+
+  // 3. Gateway env: FFAI_ADMIN_KEY (only required for /ffai_encrypt)
+  if (adminKey) {
+    checks.push({
+      name: "FFAI_ADMIN_KEY in gateway env",
+      status: "ok",
+      detail: `present (${adminKey.length} chars)`,
+    });
+  } else {
+    checks.push({
+      name: "FFAI_ADMIN_KEY in gateway env",
+      status: "warn",
+      detail: "missing",
+      remediation:
+        "Optional — needed only for /ffai_encrypt. If you plan to import keys via the encrypt page, " +
+        "set FFAI_ADMIN_KEY in the gateway environment and restart the gateway.",
+    });
+  }
+
+  // 4. FFAI reachability + provider count via /providers
+  let providerNames: string[] = [];
+  let providerHealthOk = false;
+  if (!apiKey) {
+    checks.push({
+      name: "FFAI reachable",
+      status: "skip",
+      detail: "skipped (no FFAI_KEY to authenticate)",
+    });
+  } else {
+    const providersResult = await probeFfaiProviders({ baseUrl, apiKey });
+    if (providersResult.ok) {
+      providerHealthOk = true;
+      providerNames = providersResult.providers;
+      checks.push({
+        name: "FFAI reachable",
+        status: "ok",
+        detail: `${baseUrl} responded ok`,
+      });
+      if (providerNames.length === 0) {
+        checks.push({
+          name: "FFAI providers configured",
+          status: "fail",
+          detail: "FFAI is running but has zero providers in config.json",
+          remediation:
+            "Add at least one provider stanza to FFAI's config.json. " +
+            "See config.json.example in the FFAI repo for templates (gemini, groq, cerebras, ollama, sambanova).",
+        });
+      } else {
+        checks.push({
+          name: "FFAI providers configured",
+          status: "ok",
+          detail: `${providerNames.length} provider(s): ${providerNames.join(", ")}`,
+        });
+
+        // 5. At least one key per provider
+        const keyDetails = providersResult.providerDetails;
+        const emptyProviders: string[] = [];
+        const ok: string[] = [];
+        for (const name of providerNames) {
+          const total = keyDetails[name]?.total ?? 0;
+          if (total === 0) emptyProviders.push(name);
+          else ok.push(`${name}=${total}`);
+        }
+        if (emptyProviders.length === providerNames.length) {
+          checks.push({
+            name: "FFAI keys configured",
+            status: "fail",
+            detail: `every provider has zero keys (${providerNames.join(", ")})`,
+            remediation:
+              "Set the matching `keys_var` env vars (e.g. GEMINI_KEYS, GROQ_KEYS) and restart FFAI, " +
+              "OR run /ffai_encrypt to import keys via the encrypted blob flow.",
+          });
+        } else if (emptyProviders.length > 0) {
+          checks.push({
+            name: "FFAI keys configured",
+            status: "warn",
+            detail: `keys: ${ok.join(", ")}; empty: ${emptyProviders.join(", ")}`,
+            remediation:
+              "Some providers have keys; others have none. Either populate the empty ones (env or import) " +
+              "or remove them from FFAI's config.json so they don't show up in /models as broken entries.",
+          });
+        } else {
+          checks.push({
+            name: "FFAI keys configured",
+            status: "ok",
+            detail: `keys per provider: ${ok.join(", ")}`,
+          });
+        }
+      }
+    } else {
+      checks.push({
+        name: "FFAI reachable",
+        status: "fail",
+        detail: `${baseUrl} unreachable (${providersResult.reason})`,
+        remediation:
+          `Verify FFAI is running and bound to ${new URL(baseUrl).host}. ` +
+          "If FFAI is on a different host or port, set FFAI_URL in the gateway environment and restart.",
+      });
+    }
+  }
+
+  // 6. /models returns at least one model
+  if (!apiKey) {
+    checks.push({
+      name: "FFAI /models populated",
+      status: "skip",
+      detail: "skipped (no FFAI_KEY)",
+    });
+  } else if (!providerHealthOk) {
+    checks.push({
+      name: "FFAI /models populated",
+      status: "skip",
+      detail: "skipped (FFAI unreachable)",
+    });
+  } else {
+    const modelsResult = await probeFfaiModels({ baseUrl, apiKey });
+    if (modelsResult.ok) {
+      if (modelsResult.modelCount === 0) {
+        checks.push({
+          name: "FFAI /models populated",
+          status: "fail",
+          detail: "/models returned an empty list",
+          remediation:
+            "FFAI has providers but discovery hasn't populated any models yet. " +
+            "Check FFAI logs for [discovery] errors. Common causes: invalid API keys, " +
+            "FFAI_MIN_CONTEXT_WINDOW / FFAI_MIN_TPM filtering everything out.",
+        });
+      } else {
+        checks.push({
+          name: "FFAI /models populated",
+          status: "ok",
+          detail: `${modelsResult.modelCount} model(s) discovered`,
+        });
+      }
+    } else {
+      checks.push({
+        name: "FFAI /models populated",
+        status: "fail",
+        detail: `/models returned ${modelsResult.reason}`,
+      });
+    }
+  }
+
+  // 7. catalog-sync wrote ffai-* providers into openclaw.json
+  const cfg = openclawConfig as { models?: { providers?: Record<string, unknown> } } | undefined;
+  const ffaiProvidersInConfig = Object.keys(cfg?.models?.providers ?? {})
+    .filter((p) => p.startsWith("ffai-"));
+  if (ffaiProvidersInConfig.length === 0) {
+    checks.push({
+      name: "openclaw.json catalog-sync",
+      status: "fail",
+      detail: "no ffai-* providers in models.providers",
+      remediation:
+        "catalog-sync hasn't run successfully yet, or it ran when FFAI was unreachable. " +
+        "Restart the gateway after FFAI is reachable. If catalog-sync logs show retry exhaustion, " +
+        "check FFAI's /providers endpoint manually.",
+    });
+  } else {
+    checks.push({
+      name: "openclaw.json catalog-sync",
+      status: "ok",
+      detail: `${ffaiProvidersInConfig.length} ffai-* provider(s): ${ffaiProvidersInConfig.join(", ")}`,
+    });
+  }
+
+  // 8. Allowlist coverage — if agents.defaults.models is non-empty, every
+  //    discovered ffai-* model ref should be in it (otherwise /models hides
+  //    them).
+  const allowlist = (cfg as {
+    agents?: { defaults?: { models?: Record<string, unknown> } };
+  } | undefined)?.agents?.defaults?.models;
+  if (!allowlist || Object.keys(allowlist).length === 0) {
+    checks.push({
+      name: "/models allowlist coverage",
+      status: "ok",
+      detail: "no allowlist (all discovered models visible)",
+    });
+  } else {
+    const allowlistKeys = new Set(Object.keys(allowlist));
+    let totalRefs = 0;
+    let covered = 0;
+    for (const provKey of ffaiProvidersInConfig) {
+      const prov = (cfg?.models?.providers as Record<string, unknown>)?.[provKey] as
+        { models?: Array<{ id?: unknown }> } | undefined;
+      const models = Array.isArray(prov?.models) ? prov.models : [];
+      for (const m of models) {
+        const id = typeof m === "object" && m && "id" in m && typeof (m as { id: unknown }).id === "string"
+          ? (m as { id: string }).id
+          : null;
+        if (!id) continue;
+        totalRefs++;
+        if (allowlistKeys.has(`${provKey}/${id}`)) covered++;
+      }
+    }
+    if (totalRefs === 0) {
+      checks.push({
+        name: "/models allowlist coverage",
+        status: "skip",
+        detail: "no ffai-* models to check",
+      });
+    } else if (covered === totalRefs) {
+      checks.push({
+        name: "/models allowlist coverage",
+        status: "ok",
+        detail: `${covered}/${totalRefs} ffai-* model refs in allowlist`,
+      });
+    } else {
+      checks.push({
+        name: "/models allowlist coverage",
+        status: "warn",
+        detail: `${covered}/${totalRefs} ffai-* model refs in allowlist`,
+        remediation:
+          `${totalRefs - covered} model(s) discovered but not in agents.defaults.models. ` +
+          "Restart the gateway so catalog-sync's allowlist pass runs again, or add them manually.",
+      });
+    }
+  }
+
+  // ── Format output ─────────────────────────────────────────────────────────
+  const lines: string[] = ["FFAI doctor — preflight diagnostics", "─".repeat(40)];
+  let pass = 0, warn = 0, fail = 0, skip = 0;
+  for (const check of checks) {
+    const icon = check.status === "ok" ? "✓"
+      : check.status === "warn" ? "⚠"
+      : check.status === "fail" ? "✗"
+      : "·";
+    lines.push(`${icon} ${check.name}: ${check.detail}`);
+    if (check.remediation) {
+      lines.push(`    → ${check.remediation}`);
+    }
+    if (check.status === "ok") pass++;
+    else if (check.status === "warn") warn++;
+    else if (check.status === "fail") fail++;
+    else skip++;
+  }
+  lines.push("─".repeat(40));
+  lines.push(`Summary: ${pass} ok · ${warn} warn · ${fail} fail · ${skip} skipped`);
+  if (fail > 0) {
+    lines.push("");
+    lines.push(
+      "One or more checks failed. Resolve the items above (each fix is shown after the failing line), " +
+        "then re-run /ffai_doctor.",
+    );
+  } else if (warn > 0) {
+    lines.push("");
+    lines.push("Warnings are non-fatal but worth investigating before relying on this in production.");
+  }
+
+  return { text: lines.join("\n"), isError: fail > 0 };
+}
+
+async function probeFfaiProviders(params: { baseUrl: string; apiKey: string }): Promise<
+  | { ok: true; providers: string[]; providerDetails: Record<string, { total: number }> }
+  | { ok: false; reason: string }
+> {
+  let release: (() => Promise<void> | void) | undefined;
+  try {
+    const result = await fetchWithSsrFGuard({
+      url: `${params.baseUrl}/providers`,
+      init: {
+        headers: { Authorization: `Bearer ${params.apiKey}`, Accept: "application/json" },
+        signal: AbortSignal.timeout(5_000),
+      },
+      policy: buildFfaiSsrfPolicy(params.baseUrl),
+      auditContext: "ffai-provider.doctor.providers",
+    });
+    release = result.release;
+    if (!result.response.ok) return { ok: false, reason: `HTTP ${result.response.status}` };
+    let data: unknown;
+    try { data = await result.response.json(); }
+    catch { return { ok: false, reason: "invalid JSON" }; }
+    const map = (data && typeof data === "object" && "providers" in data
+      && typeof (data as { providers?: unknown }).providers === "object")
+      ? (data as { providers: Record<string, unknown> }).providers
+      : null;
+    if (!map) return { ok: false, reason: "missing providers field" };
+    const providers = Object.keys(map);
+    const providerDetails: Record<string, { total: number }> = {};
+    for (const name of providers) {
+      const p = map[name] as { keys?: unknown } | undefined;
+      const total = typeof p?.keys === "number" ? p.keys : 0;
+      providerDetails[name] = { total };
+    }
+    return { ok: true, providers, providerDetails };
+  } catch (err) {
+    return { ok: false, reason: describe(err) };
+  } finally {
+    if (release) {
+      try { await release(); } catch { /* release failure is not actionable */ }
+    }
+  }
+}
+
+async function probeFfaiModels(params: { baseUrl: string; apiKey: string }): Promise<
+  | { ok: true; modelCount: number }
+  | { ok: false; reason: string }
+> {
+  let release: (() => Promise<void> | void) | undefined;
+  try {
+    const result = await fetchWithSsrFGuard({
+      url: `${params.baseUrl}/models`,
+      init: {
+        headers: { Authorization: `Bearer ${params.apiKey}`, Accept: "application/json" },
+        signal: AbortSignal.timeout(10_000),
+      },
+      policy: buildFfaiSsrfPolicy(params.baseUrl),
+      auditContext: "ffai-provider.doctor.models",
+    });
+    release = result.release;
+    if (!result.response.ok) return { ok: false, reason: `HTTP ${result.response.status}` };
+    let data: unknown;
+    try { data = await result.response.json(); }
+    catch { return { ok: false, reason: "invalid JSON" }; }
+    const list = (data && typeof data === "object" && "data" in data
+      && Array.isArray((data as { data?: unknown }).data))
+      ? (data as { data: unknown[] }).data
+      : null;
+    if (!list) return { ok: false, reason: "missing data array" };
+    return { ok: true, modelCount: list.length };
+  } catch (err) {
+    return { ok: false, reason: describe(err) };
+  } finally {
+    if (release) {
+      try { await release(); } catch { /* release failure is not actionable */ }
+    }
+  }
 }
 
 // ── Shared fetch helper ─────────────────────────────────────────────────────

@@ -366,6 +366,77 @@ const PROVIDER_KEY_PATTERNS = {
   ollama:    /^[0-9a-f]{32}\.[A-Za-z0-9]{20,}$/,
   sambanova: /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/,
 };
+
+// ── Provider stanza templates ───────────────────────────────────────────────
+// When /import receives keys for a provider that isn't in config.json yet,
+// auto-create a stanza from these templates so operators don't have to seed
+// providers.<name> by hand before their first import. Templates mirror the
+// shape of config.json.example. Only providers we know enough about to
+// configure correctly (upstream URL, auth scheme, sensible rate limits) are
+// listed — anything else gets the old "add it to config.json first" error.
+const PROVIDER_TEMPLATES = {
+  gemini: {
+    keys_var: "GEMINI_KEYS",
+    upstream_url: "https://generativelanguage.googleapis.com/v1beta/openai",
+    auth_scheme: "bearer",
+    rpm_limit: 15,
+    tpm_limit: 1000000,
+    rpd_limit: 1500,
+    default_cooldown: 10,
+    max_cooldown: 300,
+    retryable_statuses: [429, 502, 503],
+    key_cb_threshold: 5,
+    key_cb_cooldown: 120000,
+  },
+  groq: {
+    keys_var: "GROQ_KEYS",
+    upstream_url: "https://api.groq.com/openai",
+    auth_scheme: "bearer",
+    rpm_limit: 30,
+    default_cooldown: 5,
+    max_cooldown: 120,
+    retryable_statuses: [429, 502, 503],
+    key_cb_threshold: 5,
+    key_cb_cooldown: 60000,
+  },
+  cerebras: {
+    keys_var: "CEREBRAS_KEYS",
+    upstream_url: "https://api.cerebras.ai",
+    auth_scheme: "bearer",
+    default_cooldown: 5,
+    max_cooldown: 120,
+    retryable_statuses: [429, 502, 503],
+    key_cb_threshold: 5,
+    key_cb_cooldown: 60000,
+  },
+  ollama: {
+    keys_var: "OLLAMA_KEYS",
+    upstream_url: "https://ollama.com",
+    auth_scheme: "bearer",
+    request_timeout: 180000,
+    max_concurrent: 2,
+    acquire_wait_ms: 30000,
+    rpm_limit: 10,
+    default_cooldown: 10,
+    max_cooldown: 300,
+    retryable_statuses: [429, 502, 503],
+    key_cb_threshold: 5,
+    key_cb_cooldown: 120000,
+  },
+  sambanova: {
+    keys_var: "SAMBANOVA_KEYS",
+    upstream_url: "https://api.sambanova.ai",
+    auth_scheme: "bearer",
+    rpm_limit: 20,
+    rpd_limit: 20,
+    default_cooldown: 10,
+    max_cooldown: 300,
+    retryable_statuses: [429, 502, 503],
+    key_cb_threshold: 3,
+    key_cb_cooldown: 120000,
+    model_exclude: [],
+  },
+};
 /** Redact potential API key patterns in upstream error bodies before forwarding to client. */
 const _KEY_PATTERNS = /\b(sk-[a-zA-Z0-9_-]{10,}|gsk_[a-zA-Z0-9]{20,}|AIzaSy[a-zA-Z0-9_-]{30,}|csk-[a-zA-Z0-9]{20,}|Bearer\s+[a-zA-Z0-9_-]{20,})\b/g;
 function _redactKeys(body) {
@@ -1462,8 +1533,27 @@ async function handleImport(req, res) {
   const currentConfig = tryLoadConfig();
   if (!currentConfig) return sendJson(res, 500, { error: "failed to read config" });
 
+  let providerAutoCreated = false;
   if (!currentConfig.providers || !currentConfig.providers[provider]) {
-    return sendJson(res, 400, { error: `unknown provider: "${provider}"` });
+    // For known providers we have a template baked in (PROVIDER_TEMPLATES,
+    // see below). Auto-create a stub stanza in config.json so the import
+    // can proceed — operators don't have to seed providers.<name> by hand.
+    // For truly unknown providers we keep the old error but make it
+    // actionable.
+    const template = PROVIDER_TEMPLATES[provider];
+    if (template) {
+      currentConfig.providers = currentConfig.providers || {};
+      currentConfig.providers[provider] = { ...template };
+      providerAutoCreated = true;
+      console.log(`[ffai] /import: auto-created provider stanza for "${provider}" from built-in template`);
+    } else {
+      return sendJson(res, 400, {
+        error:
+          `Unknown provider: "${provider}". FFAI's config.json has no entry for it, and no built-in ` +
+          `template exists. Add a provider stanza to config.json (see config.json.example) and restart FFAI, ` +
+          `then retry the import. Built-in templates available for: ${Object.keys(PROVIDER_TEMPLATES).join(", ")}.`,
+      });
+    }
   }
 
   const provConf = currentConfig.providers[provider];
@@ -1557,11 +1647,26 @@ async function handleImport(req, res) {
     ip,
   });
 
-  // Trigger hot-reload so the pool picks up the new keys
+  // Trigger hot-reload so the pool picks up the new keys without a restart.
+  // The signal is best-effort — if the reload handler throws, the keys are
+  // still on disk and a manual `systemctl restart ffai` (or equivalent)
+  // will pick them up. Surface that fallback in the response so the
+  // operator knows what to do if hot-reload silently fails.
   console.log(`[ffai] Import v${auditContext.version}: ${imported} key(s) added to "${provider}" (${duplicates} dupes, ${invalid} invalid, ${mismatched} mismatched)`);
   process.kill(process.pid, "SIGHUP");
 
-  sendJson(res, 200, { imported, duplicates, invalid, mismatched, provider });
+  sendJson(res, 200, {
+    imported,
+    duplicates,
+    invalid,
+    mismatched,
+    provider,
+    provider_auto_created: providerAutoCreated,
+    hot_reload: "signaled",
+    restart_hint:
+      "Keys are persisted to config.json. The pool was signaled to hot-reload; " +
+      "if discovery doesn't show the new keys within ~30 seconds, restart FFAI to force a full reload.",
+  });
 }
 
 // Fix #1: Helper to remove a used token from config

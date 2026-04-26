@@ -568,4 +568,72 @@ describe("Import endpoints (/generate-import, /import)", { concurrency: 1 }, () 
       );
     });
   });
+
+  // ── Regression: auto-create provider stanza on first import ─────────────
+  //
+  // /import for a known provider that isn't yet in config.json should
+  // create the stanza from the built-in template (PROVIDER_TEMPLATES) and
+  // proceed with the import, instead of returning the old "unknown
+  // provider" error.
+  describe("POST /import — auto-creates provider stanza for known providers", () => {
+    it("creates a gemini stanza when missing and reports it in the response", async () => {
+      // Drop any existing gemini stanza from the seed config first
+      const before = JSON.parse(fs.readFileSync(configFile, "utf8"));
+      delete before.providers?.gemini;
+      fs.writeFileSync(configFile, JSON.stringify(before, null, 2));
+      // Server hot-reloads on SIGHUP from prior tests, but we don't trigger
+      // one here — handleImport reads the config fresh via tryLoadConfig().
+
+      const genRes = await request("/generate-import", { headers: authHeader(ADMIN_KEY) });
+      const pub = extractPubKeyFromHtml(genRes.body);
+
+      // Synthetic key matching the Gemini fingerprint: AIza + 35 chars
+      const newKey = "AIzaTestSynthAutoCreateGeminiAbcd123-_x";
+      assert.equal(newKey.length, 39, "test key must be 39 chars (Gemini pattern)");
+      const envelope = encryptPayloadV2(pub, {
+        provider: "gemini",
+        keys: [newKey],
+        ts: Date.now(),
+        nonce: randomNonce(),
+      });
+      const res = await request("/import", {
+        method: "POST",
+        headers: { ...authHeader(ADMIN_KEY), "content-type": "application/json" },
+        body: JSON.stringify({ payload: envelopeToPayload(envelope) }),
+      });
+      assert.equal(res.status, 200, `expected 200, got ${res.status}: ${res.body}`);
+      assert.equal(res.json.imported, 1);
+      assert.equal(res.json.provider, "gemini");
+      assert.equal(res.json.provider_auto_created, true,
+        "response should flag that the provider stanza was auto-created");
+
+      const cfg = JSON.parse(fs.readFileSync(configFile, "utf8"));
+      assert.ok(cfg.providers.gemini, "gemini stanza should now exist in config");
+      assert.equal(cfg.providers.gemini.upstream_url,
+        "https://generativelanguage.googleapis.com/v1beta/openai",
+        "gemini stanza should match the built-in template");
+      assert.ok(cfg.providers.gemini.keys.includes(newKey),
+        "imported key should be in the new stanza");
+    });
+
+    it("rejects an import for a provider with no built-in template", async () => {
+      const genRes = await request("/generate-import", { headers: authHeader(ADMIN_KEY) });
+      const pub = extractPubKeyFromHtml(genRes.body);
+
+      const envelope = encryptPayloadV2(pub, {
+        provider: "totally-unknown-provider-xyz",
+        keys: ["some-key-12345abcdef"],
+        ts: Date.now(),
+        nonce: randomNonce(),
+      });
+      const res = await request("/import", {
+        method: "POST",
+        headers: { ...authHeader(ADMIN_KEY), "content-type": "application/json" },
+        body: JSON.stringify({ payload: envelopeToPayload(envelope) }),
+      });
+      assert.equal(res.status, 400);
+      assert.match(res.json?.error || "", /unknown provider/i);
+      assert.match(res.json?.error || "", /Built-in templates available for/i);
+    });
+  });
 });

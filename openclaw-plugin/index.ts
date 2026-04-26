@@ -27,7 +27,12 @@ import {
   normalizePluginConfig,
   type FfaiBasePluginConfig,
 } from "./defaults.js";
-import { handleFfaiStats, handleFfaiEncrypt, handleFfaiImportKeys } from "./ffai-commands.js";
+import {
+  handleFfaiStats,
+  handleFfaiEncrypt,
+  handleFfaiImportKeys,
+  handleFfaiDoctor,
+} from "./ffai-commands.js";
 import { runCatalogSync } from "./catalog-sync.js";
 
 function resolveFfaiBaseUrl(pluginConfig: FfaiBasePluginConfig): string {
@@ -99,6 +104,29 @@ export default definePluginEntry({
         const { baseUrl } = runtimeFor();
         const blob = typeof ctx.args === "string" ? ctx.args.trim() : "";
         return handleFfaiImportKeys({ baseUrl, blob });
+      },
+    });
+
+    // ── /ffai_doctor command — preflight diagnostics ─────────────────────
+    // Walks every install-time invariant (gateway env, FFAI reachability,
+    // providers configured, keys present, catalog-sync wrote openclaw.json,
+    // allowlist coverage) and prints OK/FAIL with a one-line remediation
+    // hint per failure. Run this when something doesn't work and you don't
+    // know which layer to debug first.
+    api.registerCommand({
+      name: "ffai_doctor",
+      description: "Run preflight diagnostics for the FFAI plugin",
+      acceptsArgs: false,
+      requireAuth: true,
+      handler: async (_ctx: PluginCommandContext) => {
+        const { baseUrl, apiKey } = runtimeFor();
+        const adminKey = process.env.FFAI_ADMIN_KEY?.trim() || undefined;
+        return handleFfaiDoctor({
+          baseUrl,
+          apiKey,
+          adminKey,
+          openclawConfig: api.config,
+        });
       },
     });
 
