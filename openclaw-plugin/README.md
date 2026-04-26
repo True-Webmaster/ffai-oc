@@ -420,11 +420,11 @@ one event per line). Events include:
 The server rejects import attempts where the key doesn't match the declared
 provider's format. These are the patterns:
 
-| Provider    | Pattern                                                 | Example                                                  |
+| Provider    | Pattern                                                 | Example shape (synthetic — not a real key)               |
 |-------------|---------------------------------------------------------|----------------------------------------------------------|
 | `gemini`    | `AIza` + 35 URL-safe chars                              | `AIzaXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX`                |
 | `groq`      | `gsk_` + 52 alphanumeric                                | `gsk_XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX` |
-| `cerebras`  | `csk-` + 40+ lowercase alphanumeric                     | `csk-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx`   |
+| `cerebras`  | `csk-` + 40+ lowercase alphanumeric                     | `csk-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx`           |
 | `ollama`    | 32 hex, dot, 20+ alphanumeric                           | `0123456789abcdef0123456789abcdef.XXXXXXXXXXXXXXXXXXXXXXXX` |
 | `sambanova` | standard UUID (`8-4-4-4-12`)                            | `00000000-0000-0000-0000-000000000000`                   |
 
