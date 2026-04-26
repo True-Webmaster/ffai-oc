@@ -500,6 +500,36 @@ export async function handleFfaiDoctor(params: {
     }
   }
 
+  // 9. Discord-specific gotcha: the Discord channel plugin hides
+  //    providers whose baseUrl looks like loopback (127.0.0.1, localhost,
+  //    0.0.0.0). FFAI defaults to 127.0.0.1:8010, so users running Discord
+  //    + FFAI on the same host see no ffai-* entries in Discord's /models
+  //    while Telegram works fine. See openclaw/openclaw#35516. Surface
+  //    this as a warn whenever the combo is detected — it's the single
+  //    most common "Discord shows nothing" cause and there's no signal
+  //    on the Discord side that filtering happened.
+  const discordConfigured = isDiscordConfigured(openclawConfig);
+  const baseUrlIsLoopback = isLoopbackBaseUrl(baseUrl);
+  if (discordConfigured && baseUrlIsLoopback) {
+    checks.push({
+      name: "Discord/loopback compatibility",
+      status: "warn",
+      detail: `Discord channel detected and baseUrl=${baseUrl} resolves to loopback`,
+      remediation:
+        "Discord's /models picker silently hides providers with a loopback baseUrl " +
+        "(see openclaw/openclaw#35516). Set FFAI_URL to a non-loopback address — " +
+        "Tailscale IP (http://100.x.x.x:8010), private LAN IP, or a hostname — and " +
+        "restart the gateway. ffai-* models will then appear in Discord's /models " +
+        "alongside Telegram. The README FAQ has more detail.",
+    });
+  } else if (discordConfigured) {
+    checks.push({
+      name: "Discord/loopback compatibility",
+      status: "ok",
+      detail: `Discord channel detected; baseUrl=${baseUrl} is non-loopback`,
+    });
+  }
+
   // ── Format output ─────────────────────────────────────────────────────────
   const lines: string[] = ["FFAI doctor — preflight diagnostics", "─".repeat(40)];
   let pass = 0, warn = 0, fail = 0, skip = 0;
@@ -531,6 +561,42 @@ export async function handleFfaiDoctor(params: {
   }
 
   return { text: lines.join("\n"), isError: fail > 0 };
+}
+
+/**
+ * True if the gateway has the Discord channel plugin configured.
+ * Checks both the channel binding (`channels.discord`) and the plugin
+ * registration (`plugins.entries.discord.enabled`); either is enough to
+ * surface the loopback-filter warning.
+ */
+function isDiscordConfigured(openclawConfig: unknown): boolean {
+  const cfg = openclawConfig as {
+    channels?: Record<string, unknown>;
+    plugins?: { entries?: Record<string, { enabled?: unknown }> };
+  } | undefined;
+  if (cfg?.channels?.discord) return true;
+  const entry = cfg?.plugins?.entries?.discord;
+  return entry?.enabled === true;
+}
+
+/**
+ * True if the URL's hostname resolves to a loopback interface, in the
+ * same shape Discord's model picker uses to hide "local" providers.
+ * Covers 127.0.0.0/8, ::1, 0.0.0.0, and the literal "localhost".
+ */
+function isLoopbackBaseUrl(baseUrl: string): boolean {
+  let host: string;
+  try {
+    host = new URL(baseUrl).hostname.toLowerCase();
+  } catch {
+    return false;
+  }
+  if (host === "localhost") return true;
+  if (host === "0.0.0.0") return true;
+  if (host === "::1" || host === "[::1]") return true;
+  // 127.0.0.0/8
+  if (/^127\.\d{1,3}\.\d{1,3}\.\d{1,3}$/.test(host)) return true;
+  return false;
 }
 
 async function probeFfaiProviders(params: { baseUrl: string; apiKey: string }): Promise<

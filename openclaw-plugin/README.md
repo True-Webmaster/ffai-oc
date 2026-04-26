@@ -531,6 +531,48 @@ Three likely causes, in order:
 3. **FFAI itself has no providers configured.** Run `/ffai_doctor` —
    the "FFAI providers configured" check reports zero.
 
+### `/models` shows `ffai-*` in Telegram but not in Discord — why?
+
+Two things to check, in order:
+
+1. **Discord's model picker hides "local" providers.** The Discord
+   channel plugin in OpenClaw silently filters out providers whose
+   `baseUrl` looks like loopback (`127.0.0.1`, `localhost`,
+   `0.0.0.0`). FFAI's default `baseUrl` is `http://127.0.0.1:8010`, so
+   FFAI providers get hidden from Discord's `/models` even when they
+   show up correctly in Telegram. Telegram doesn't apply this filter.
+   See [openclaw/openclaw#35516](https://github.com/openclaw/openclaw/issues/35516)
+   (closed/stale).
+
+   **Fix:** point the plugin at FFAI via a non-loopback address.
+   Options:
+   - **Tailscale** (recommended): set `FFAI_URL=http://100.x.x.x:8010`
+     using your FFAI host's Tailscale IP. Same security profile as
+     loopback (Tailnet-only), no firewall changes needed.
+   - **Private LAN IP**: `FFAI_URL=http://192.168.x.x:8010` if FFAI
+     and the gateway are on the same LAN.
+   - **Hostname**: any DNS name that doesn't resolve to a loopback
+     address.
+
+   After changing, **restart the gateway** so catalog-sync re-runs
+   with the new baseUrl.
+
+2. **Discord and Telegram are routed to different agents.** Per
+   OpenClaw's config, channels can be bound to different agents and
+   each agent computes its own model picker. catalog-sync only writes
+   to `agents.defaults.models`. If your Discord channel is bound to a
+   non-default agent that has its own model overrides, the FFAI
+   entries we added to defaults don't propagate.
+
+   **Fix:** either bind the Discord channel to the same agent
+   Telegram uses, or copy the `ffai-*` model refs from
+   `agents.defaults.models` into that agent's config manually.
+
+   Run `/ffai_doctor` from the **Discord channel** to see exactly
+   what that agent's model picker resolves to. If the doctor shows
+   the expected ffai-* providers but Discord's `/models` doesn't,
+   you've hit cause (1) — the localhost filter — not cause (2).
+
 ### Why does the gateway "see" `FFAI_KEY` when the rest of my shell doesn't?
 
 The gateway process inherits whatever environment it was launched with.
