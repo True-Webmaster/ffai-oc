@@ -57,6 +57,13 @@ in tool calls that go to external services. If you need to refer to a
 key, refer to its position ("the third key in `GEMINI_KEYS`") or its
 last 4 characters.
 
+This applies to **anything you write to disk** too — files, commits,
+PR descriptions. If you're editing the plugin source or docs, real
+keys you saw in this session must NEVER end up in a committed file.
+Use synthetic placeholders instead. See the top-level
+[`AGENTS.md` → "Examples and documentation — never use real secrets"](../AGENTS.md#examples-and-documentation--never-use-real-secrets)
+for the rule and the recovery flow if it's already happened.
+
 **3. Don't suggest manual edits to `models.providers.ffai-*` in
 `openclaw.json`.** That section is owned by the plugin. Manual edits
 get overwritten on the next gateway restart. If the user wants to add
@@ -194,7 +201,7 @@ The plugin and the FFAI server ship as a pair. If you change:
 - The catalog-sync v1/v2 envelope shape → update both sides of
   `serve.js`'s `handleImport` and the encrypt HTML page.
 
-### Three things in particular
+### Four things in particular
 
 1. **Key import is user-initiated only.** The plugin does NOT register
    a hook that auto-invokes `/ffai_import_keys` on pasted content.
@@ -208,6 +215,16 @@ The plugin and the FFAI server ship as a pair. If you change:
 3. **Don't introduce npm runtime dependencies.** The plugin is loaded
    directly by the OpenClaw gateway; every dep is a supply-chain
    risk for users who installed the plugin trusting it stays minimal.
+
+4. **Never paste real secrets into documentation.** The Key-format
+   requirements table, error messages, sample doctor output, and any
+   other text shipped with the plugin must use synthetic placeholders
+   that match the regex patterns but are obviously fake. Real keys
+   harvested from a session (`/ffai_doctor` output, `.env` inspection,
+   live `curl /providers` results) must not be copied verbatim into
+   any committed file. See the top-level [`AGENTS.md`](../AGENTS.md)
+   for the full rule, the placeholder patterns, and the scrub flow if
+   it's already happened.
 
 ### Tests
 

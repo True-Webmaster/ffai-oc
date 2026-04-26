@@ -122,6 +122,57 @@ crypto code) — the two halves of the protocol must stay in sync.
 - Upstream error bodies pass through `_redactKeys()` before being
   forwarded to the client.
 
+### Examples and documentation — never use real secrets
+
+When you write README tables, CHANGELOG entries, code comments, error
+messages, or any other text that ships with the repo, **never** paste
+a real secret you've seen during a session. This includes API keys,
+tokens, UUIDs from running services, plaintext passwords, private
+URLs with embedded credentials — anything that would still work if
+someone ran it.
+
+Use synthetic placeholders that match the format but are obviously
+fake. Patterns that work:
+
+- All-X or all-zero filler that matches the regex length:
+  `AIzaXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX`,
+  `00000000-0000-0000-0000-000000000000`,
+  `gsk_XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX`.
+- The `EXAMPLE` / `RFC2606` / `documentation` literal:
+  `sk-EXAMPLE...`, `example.com`, `203.0.113.1` (TEST-NET-3).
+- An incrementing pattern that's clearly not a key:
+  `0123456789abcdef0123456789abcdef.aBcDeFgHiJkLmNoPqRsTuVwXyZ`.
+
+Verify your placeholder matches the format requirement (`PROVIDER_KEY_PATTERNS`
+regex) so the table's claim about format is accurate, but make sure it
+contains no real key material. Run a quick sanity check before committing:
+
+```bash
+git diff --staged | grep -E '(AIza|gsk_|csk-|sk-[a-zA-Z0-9])'
+```
+
+If anything matches and isn't a synthetic placeholder, stop and use a
+fake one.
+
+This is a **hard rule** because GitHub's secret scanner will catch
+some of these on push (Google API keys, AWS keys, Slack tokens) and
+**will publicly expose the leak in the rejection notice URL**. Even
+when the scanner doesn't catch it, the secret is in your local git
+history and may be in transcripts, log files, or shared notebooks
+the operator doesn't control.
+
+If you've already committed a real secret:
+1. Replace it with a synthetic placeholder in a new commit.
+2. Run `git filter-repo --replace-text <file>` with `find==>replace`
+   rules to scrub it from history.
+3. Force-push (`--force-with-lease`) to remote if the bad commit was
+   ever pushed.
+4. Tell the user to rotate the secret regardless of whether it was
+   pushed — local-history exposure is real exposure.
+
+The plugin doc-update commit `dee89da` (April 2026) leaked five real
+provider keys this way; the scrub flow above is what fixed it.
+
 ## Things you can change freely
 
 - Adding a new env var (follow the `envInt` / `process.env.FFAI_*`

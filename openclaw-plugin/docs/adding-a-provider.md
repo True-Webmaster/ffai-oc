@@ -58,6 +58,14 @@ const PROVIDER_KEY_PATTERNS = {
 providers. Test at least 3 real keys against it; test a Gemini key
 against it to confirm no false positive.
 
+**Test the regex with real keys, but never commit those keys.** The
+README's "Key-format requirements" table needs an example for the new
+provider — use a synthetic placeholder there (all-X filler that
+matches the regex shape, like `togetherai-XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX`).
+Real keys are for your local test runs only; they must not end up in
+any committed file. See [`AGENTS.md`](../AGENTS.md#examples-and-documentation--never-use-real-secrets)
+for the full rule.
+
 ### 2. `serve.js` — `PROVIDER_TEMPLATES`
 
 Used for auto-creating the provider stanza on `/import` when the user
@@ -282,8 +290,12 @@ After the code changes:
       guessed.
 - [ ] Auto-create path works in an integration test.
 - [ ] `/ffai_doctor` shows the new provider as `ok` after restart.
-- [ ] README "Key-format requirements" table updated.
+- [ ] README "Key-format requirements" table updated **with a synthetic
+      placeholder** (NOT a real key from your test set).
 - [ ] `config.json.example` template added.
+- [ ] `git diff --staged | grep -E '(AIza|gsk_|csk-|sk-[a-zA-Z0-9])'`
+      returns no real keys before committing. Real test keys stay on
+      your local machine only.
 
 ## What NOT to do
 
