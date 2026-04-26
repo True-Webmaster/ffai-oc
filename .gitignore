@@ -9,3 +9,8 @@ import-audit.log
 *.bak
 *.pre-security-audit
 .claude/
+
+# Local Claude/agent memory files — operator-specific notes, paths, and
+# infra references. Keep them out of git so they don't leak operational
+# metadata (VPS IPs, SSH users, deploy patterns, personal profile).
+memory/

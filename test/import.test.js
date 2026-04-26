@@ -38,8 +38,11 @@ const configFile = path.join(tmpDir, "config.json");
 const statsFile = path.join(tmpDir, "stats.json");
 const auditFile = path.join(tmpDir, "import-audit.log");
 
-// Seed config with one provider that has one pre-existing key, so we can
-// test dedup against it.
+// Seed config with two providers:
+//   - testprov uses inline `keys` so we can dedup against an explicit array
+//   - envprov uses `keys_var` so we can verify imports do NOT promote env
+//     keys into the plaintext config (regression coverage for the bug
+//     Mateo flagged in his review)
 const testConfig = {
   providers: {
     testprov: {
@@ -51,9 +54,20 @@ const testConfig = {
       rpd_limit: 1000,
       family: "testfam",
     },
+    envprov: {
+      keys_var: "ENVPROV_KEYS",
+      upstream_url: "https://localhost:19999",
+      auth_scheme: "bearer",
+      rpm_limit: 10,
+      tpm_limit: 100000,
+      rpd_limit: 1000,
+      family: "envfam",
+    },
   },
   import_tokens: [],
 };
+
+const ENVPROV_BASELINE_KEYS = "envprov-baseline-key-aaa-1234,envprov-baseline-key-bbb-5678";
 
 fs.writeFileSync(configFile, JSON.stringify(testConfig, null, 2));
 
@@ -211,6 +225,10 @@ describe("Import endpoints (/generate-import, /import)", { concurrency: 1 }, () 
         FFAI_ADMIN_KEY: ADMIN_KEY,
         FFAI_CONFIG: configFile,
         FFAI_STATS_FILE: statsFile,
+        ENVPROV_KEYS: ENVPROV_BASELINE_KEYS,
+        // Bump the import rate limit so the test suite (which fires more
+        // than 10 imports back-to-back from 127.0.0.1) doesn't trip 429.
+        FFAI_IMPORT_RATE_MAX: "1000",
       },
       stdio: ["ignore", "pipe", "pipe"],
     });
@@ -463,6 +481,91 @@ describe("Import endpoints (/generate-import, /import)", { concurrency: 1 }, () 
       const log = readAuditLog();
       const hit = log.find((e) => e.event === "import_failed" && e.reason === "stale_blob");
       assert.ok(hit, "audit log should have stale_blob entry");
+    });
+  });
+
+  // ── Regression: Mateo's keys_var → plaintext promotion finding ──────────
+  //
+  // Before the fix, importing a key for a provider that used `keys_var`
+  // would copy the entire env-sourced key list into provConf.keys on disk
+  // and stop honouring the env var on subsequent boots. These tests pin
+  // the corrected behaviour: env keys stay in env, imported keys live in
+  // config.json alongside them, and resolveKeys() merges both at runtime.
+
+  describe("POST /import — does not promote env keys into config (envprov)", () => {
+    it("imports a new key without copying env baseline into provConf.keys", async () => {
+      const genRes = await request("/generate-import", { headers: authHeader(ADMIN_KEY) });
+      const pub = extractPubKeyFromHtml(genRes.body);
+
+      const newKey = "envprov-imported-fresh-key-zzz-9999";
+      const envelope = encryptPayloadV2(pub, {
+        provider: "envprov",
+        keys: [newKey],
+        ts: Date.now(),
+        nonce: randomNonce(),
+      });
+      const res = await request("/import", {
+        method: "POST",
+        headers: { ...authHeader(ADMIN_KEY), "content-type": "application/json" },
+        body: JSON.stringify({ payload: envelopeToPayload(envelope) }),
+      });
+      assert.equal(res.status, 200, `expected 200, got ${res.status}: ${res.body}`);
+      assert.equal(res.json.imported, 1);
+
+      const cfg = JSON.parse(fs.readFileSync(configFile, "utf8"));
+      const ep = cfg.providers.envprov;
+
+      // The fresh key must be persisted (so it survives restarts even
+      // though it didn't come from the env baseline).
+      assert.ok(Array.isArray(ep.keys), "envprov.keys should now exist");
+      assert.ok(ep.keys.includes(newKey), "imported key must be persisted");
+
+      // CRITICAL: the env baseline must NOT have been copied into config.
+      // If this assertion fires, we've regressed Mateo's finding —
+      // operators using keys_var would have their secrets silently moved
+      // to disk.
+      const envBaselineKeys = ENVPROV_BASELINE_KEYS.split(",");
+      for (const baseline of envBaselineKeys) {
+        assert.ok(
+          !ep.keys.includes(baseline),
+          `env baseline key "${baseline}" must NOT be promoted into config.json`,
+        );
+      }
+
+      // keys_var must remain set so the env source stays canonical.
+      assert.equal(ep.keys_var, "ENVPROV_KEYS", "keys_var must not be removed");
+    });
+
+    it("dedupes against env-baseline keys without writing them to config", async () => {
+      const genRes = await request("/generate-import", { headers: authHeader(ADMIN_KEY) });
+      const pub = extractPubKeyFromHtml(genRes.body);
+
+      // Try to import a baseline key (already present via env). Server
+      // should report it as a duplicate, not as imported, and crucially
+      // must NOT add it to provConf.keys to "satisfy" the dedup.
+      const baselineKey = ENVPROV_BASELINE_KEYS.split(",")[0];
+      const envelope = encryptPayloadV2(pub, {
+        provider: "envprov",
+        keys: [baselineKey],
+        ts: Date.now(),
+        nonce: randomNonce(),
+      });
+      const res = await request("/import", {
+        method: "POST",
+        headers: { ...authHeader(ADMIN_KEY), "content-type": "application/json" },
+        body: JSON.stringify({ payload: envelopeToPayload(envelope) }),
+      });
+      assert.equal(res.status, 200);
+      assert.equal(res.json.imported, 0);
+      assert.equal(res.json.duplicates, 1);
+
+      const cfg = JSON.parse(fs.readFileSync(configFile, "utf8"));
+      const ep = cfg.providers.envprov;
+      const onDiskKeys = Array.isArray(ep.keys) ? ep.keys : [];
+      assert.ok(
+        !onDiskKeys.includes(baselineKey),
+        "duplicate-of-env-baseline must not get promoted to config",
+      );
     });
   });
 });

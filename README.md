@@ -210,8 +210,19 @@ SAMBANOVA_KEYS=...
 ```
 
 Both `.env` (env vars) and the imported keys in `config.json` (under
-`providers.<name>.keys[]`) are loaded — env keys load first, imported
-keys append.
+`providers.<name>.keys[]`) are loaded and **union-merged** at runtime.
+Env keys load first; config-side keys append; duplicates are removed.
+
+This matters for two reasons:
+
+1. **Imports never promote env keys to disk.** When you `/ffai_import_keys`
+   for a provider that uses `keys_var`, the new keys land in `config.json`
+   alongside (not on top of) the env baseline. Your env-sourced secrets
+   stay in env.
+2. **Either source can be edited freely.** Rotate a Gemini key by editing
+   `.env`, or add a new one via `/ffai_import_keys` — both take effect on
+   the next pool reload (`SIGHUP` or restart). The pre-0.4.0 behaviour
+   silently disabled env updates after the first import; that's fixed.
 
 ## Endpoints
 

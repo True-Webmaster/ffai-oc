@@ -104,11 +104,30 @@ function tryLoadConfig() {
 }
 
 function resolveKeys(provConfig) {
-  if (Array.isArray(provConfig.keys) && provConfig.keys.length > 0) return provConfig.keys;
-  if (provConfig.keys_var) {
-    return (process.env[provConfig.keys_var] || "").split(",").map(k => k.trim()).filter(Boolean);
-  }
-  return [];
+  // Union-merge env-sourced keys with config-sourced keys.
+  //
+  // The previous behaviour treated `keys` and `keys_var` as mutually exclusive
+  // (return `keys` if present, else read env). That broke key rotation for
+  // operators who used `keys_var` until the first /import wrote into `keys`,
+  // after which env updates were silently ignored. Operators editing .env to
+  // rotate a compromised key would see no effect, with no warning.
+  //
+  // Now both sources are alive simultaneously. Imported keys live in
+  // `provConfig.keys`; baseline keys stay in `keys_var`. Edit either, both
+  // are honoured. Duplicates are de-duplicated; insertion order is env-first
+  // (so smart-scoring's recency tiebreak prefers the env-baseline keys when
+  // all else is equal).
+  const fromEnv = provConfig.keys_var
+    ? (process.env[provConfig.keys_var] || "").split(",").map(k => k.trim()).filter(Boolean)
+    : [];
+  const fromConfig = Array.isArray(provConfig.keys) ? provConfig.keys.filter(Boolean) : [];
+  if (fromEnv.length === 0) return fromConfig;
+  if (fromConfig.length === 0) return fromEnv;
+  const seen = new Set();
+  const out = [];
+  for (const k of fromEnv) { if (!seen.has(k)) { seen.add(k); out.push(k); } }
+  for (const k of fromConfig) { if (!seen.has(k)) { seen.add(k); out.push(k); } }
+  return out;
 }
 
 const config = loadConfig();
@@ -225,8 +244,8 @@ function writeConfigAtomic(configData) {
 
 // ── Import rate limiter (fix #5) ────────────────────────────────────────────
 const _importAttempts = new Map(); // ip -> { count, firstAttempt }
-const IMPORT_RATE_WINDOW = 60000;  // 1 minute
-const IMPORT_RATE_MAX = 10;        // max attempts per window
+const IMPORT_RATE_WINDOW = envInt("FFAI_IMPORT_RATE_WINDOW", 60000); // 1 minute
+const IMPORT_RATE_MAX = envInt("FFAI_IMPORT_RATE_MAX", 10);          // attempts per window
 
 function checkImportRateLimit(ip) {
   const now = Date.now();
@@ -1449,16 +1468,20 @@ async function handleImport(req, res) {
 
   const provConf = currentConfig.providers[provider];
 
-  // Determine existing keys for this provider
-  let existingKeys = [];
-  if (Array.isArray(provConf.keys)) {
-    existingKeys = provConf.keys;
-  } else if (provConf.keys_var) {
-    existingKeys = (process.env[provConf.keys_var] || "").split(",").map(k => k.trim()).filter(Boolean);
-  }
+  // Build the dedup set from *both* sources (env + already-in-config) so a key
+  // that's already in the env baseline is correctly counted as a duplicate
+  // and not appended to the config-side list. We do NOT promote env keys
+  // into config here — the previous behaviour copied env keys into
+  // `provConf.keys`, which (under the old mutually-exclusive resolveKeys
+  // semantics) caused future env edits to be silently ignored. Now `keys`
+  // and `keys_var` are union-merged at runtime, so we simply leave the env
+  // baseline alone and append imports to `provConf.keys`.
+  const envKeys = provConf.keys_var
+    ? (process.env[provConf.keys_var] || "").split(",").map(k => k.trim()).filter(Boolean)
+    : [];
+  const configKeys = Array.isArray(provConf.keys) ? provConf.keys.filter(Boolean) : [];
+  const existingSet = new Set([...envKeys, ...configKeys]);
 
-  // Deduplicate and validate
-  const existingSet = new Set(existingKeys);
   const providerPattern = PROVIDER_KEY_PATTERNS[provider];
   let imported = 0;
   let duplicates = 0;
@@ -1502,8 +1525,13 @@ async function handleImport(req, res) {
     return sendJson(res, 200, { imported: 0, duplicates, invalid, mismatched, provider, message: msg });
   }
 
-  // Write keys into config
-  if (!Array.isArray(provConf.keys)) provConf.keys = [...existingKeys];
+  // Append the new keys to provConf.keys. We do NOT seed this list from the
+  // env baseline — that would silently move env-sourced keys into the
+  // plaintext config file, surprising operators who deliberately keep
+  // secrets out of the JSON. Env keys remain in the env; imported keys
+  // live alongside them in `provConf.keys`. resolveKeys() merges both at
+  // runtime.
+  if (!Array.isArray(provConf.keys)) provConf.keys = [];
   provConf.keys.push(...newKeys);
 
   consumeV1Token();
