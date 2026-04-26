@@ -14,3 +14,25 @@ import-audit.log
 # infra references. Keep them out of git so they don't leak operational
 # metadata (VPS IPs, SSH users, deploy patterns, personal profile).
 memory/
+
+# OS / editor artifacts
+.DS_Store
+.idea/
+.vscode/
+*.swp
+*~
+
+# Test / build artifacts
+coverage/
+.nyc_output/
+tsconfig.tsbuildinfo
+*.tsbuildinfo
+
+# Atomic-write tempfiles produced by serve.js and catalog-sync (foo.tmp.<pid>)
+*.tmp.*
+*.tmp-*
+
+# Local secrets stash — never commit any file with these prefixes
+*.local
+*.private
+secrets/

@@ -236,7 +236,7 @@ async function runFfaiCatalog(ctx: ProviderCatalogContext): Promise<ProviderCata
 const ffaiProviderPlugin: ProviderPlugin = {
   id: PROVIDER_ID,
   label: "FFAI",
-  docsPath: "https://github.com/truewebmaster/ffai#openclaw-plugin",
+  docsPath: "https://github.com/True-Webmaster/ffai-oc#openclaw-plugin",
   envVars: ["FFAI_KEY", "FFAI_URL", "FFAI_ADMIN_KEY"],
   auth: [
     {

@@ -1,6 +1,6 @@
 # FFAI OpenClaw Plugin
 
-OpenClaw provider plugin for [FFAI](https://github.com/truewebmaster/ffai) — a
+OpenClaw provider plugin for [FFAI](https://github.com/True-Webmaster/ffai-oc) — a
 zero-dependency, free-tier AI key-pooling proxy.
 
 The plugin discovers the models FFAI is currently serving, registers one
