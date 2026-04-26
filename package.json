@@ -1,6 +1,6 @@
 {
   "name": "ffai-engine",
-  "version": "0.4.0",
+  "version": "0.5.0",
   "description": "Free Freaking AI — zero-dependency key pooling and rotation engine for LLM providers",
   "main": "index.js",
   "bin": {

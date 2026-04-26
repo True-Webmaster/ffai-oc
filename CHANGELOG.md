@@ -2,6 +2,88 @@
 
 All notable changes to FFAI are documented in this file.
 
+## [0.5.0] - 2026-04-26
+
+Reliability and onboarding pass after operator feedback. Plugin
+companion bump: `1.3.0`.
+
+### Fixes (server)
+
+- **Stop promoting env-sourced keys to plaintext config on `/import`**
+  — pre-0.5.0, importing a key for a provider that used `keys_var`
+  copied the entire env-sourced key list into `provConf.keys` on disk,
+  which silently disabled future env updates. Now `resolveKeys()`
+  union-merges both sources and `/import` only writes the new keys.
+  Two regression tests added.
+- **`compat-sync` → `catalog-sync` rename, drop heartbeat code, add
+  backoff retry.** The native `providerDiscoveryEntry` dispatch path
+  doesn't fire for plugins that combine catalog discovery with a
+  runtime entry that registers commands — the upstream tracking issue
+  closed without addressing this. Catalog publication is now the
+  documented mechanism, not a workaround. Backoff retry (5s..120s..
+  120s, ~5min budget) handles the gateway-races-FFAI-startup case.
+- **Auto-create provider stanzas on `/import`** — for the five known
+  providers (Gemini, Groq, Cerebras, Ollama, SambaNova), an import for
+  a provider not yet in `config.json` creates the stanza from a
+  built-in `PROVIDER_TEMPLATES` entry instead of returning the old
+  "unknown provider" error.
+
+### New features (server)
+
+- **Tailscale auto-flip in catalog-sync** — when no operator override
+  is set and the resolved baseUrl is loopback, catalog-sync detects a
+  Tailscale interface (`100.64.0.0/10` CGNAT), probes
+  `http://<tailscale-ip>:<port>/health`, and publishes the Tailscale
+  URL to `openclaw.json` if the probe succeeds. Workaround for
+  OpenClaw's Discord loopback filter (openclaw#35516, closed/stale)
+  that hides loopback providers from Discord's `/models` picker.
+  Probe-before-flip ensures we never break the gateway-to-FFAI path
+  — if FFAI is bound to loopback only, the probe fails and we keep
+  loopback. To enable: set `FFAI_BIND=0.0.0.0` in FFAI's environment.
+- **Sharper error messages on env-not-visible-to-gateway** — `/ffai_stats`
+  and `/ffai_encrypt` now distinguish "env var unset" from "set but
+  the gateway was started before the change" and explicitly tell the
+  operator to restart the gateway, then run `/ffai_doctor` to verify.
+- **`/import` response carries `restart_hint`** that the plugin
+  surfaces in chat ("if discovery doesn't show the new keys within
+  ~30s, restart FFAI"). Keys are persisted to `config.json` even when
+  hot-reload is best-effort, so a restart always picks them up.
+
+### New features (plugin)
+
+- **`/ffai_doctor` slash command** — eight-to-ten preflight checks
+  covering plugin loaded, gateway env, FFAI reachability, providers
+  configured, keys present, /models populated, openclaw.json
+  catalog-sync, allowlist coverage, and (when applicable)
+  Discord/loopback compatibility + Tailscale auto-flip status. Each
+  failing line carries a one-sentence remediation.
+- **Plugin-side mismatch reporting** — `/ffai_import_keys` chat output
+  now distinguishes `imported`, `duplicates`, `invalid`, and
+  `mismatched` counts.
+
+### Documentation
+
+- New top-level [`AGENTS.md`](AGENTS.md) and
+  [`openclaw-plugin/AGENTS.md`](openclaw-plugin/AGENTS.md) for AI
+  agents working in the codebase or in OpenClaw runtime contexts.
+- New "Tailscale setup (required for Discord)" section in the plugin
+  README — six numbered steps end-to-end. Every other Tailscale
+  reference in the repo points at this section instead of restating.
+- Plugin README FAQ section answering common gotchas (gateway env
+  visibility, key persistence, hot-reload, format mismatch, context
+  windows, FFAI_KEY vs FFAI_ADMIN_KEY, `/models` empty in Discord).
+- Plugin Quick Install rewritten as eight numbered steps with
+  `/ffai_doctor` as the verification step.
+- New developer guide at [`openclaw-plugin/docs/adding-a-provider.md`](openclaw-plugin/docs/adding-a-provider.md)
+  covering the 4-file checklist for adding a new OpenAI-compatible
+  provider.
+
+### Breaking changes
+
+- **None.** Plugin config still accepts `compatSync: false` as an
+  alias for `catalogSync: false`. v1 import blobs (pre-0.4.0
+  shared-secret crypto) still work within their 24h TTL window.
+
 ## [0.4.0] - 2026-04-26
 
 Provider expansion, public-key key-import upgrade, and a documentation
