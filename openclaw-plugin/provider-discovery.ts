@@ -37,7 +37,6 @@ import {
 } from "./defaults.js";
 import { applyFfaiConfig } from "./onboard.js";
 import { buildFfaiProviders, buildFfaiStaticProvider } from "./provider-catalog.js";
-import { writeCatalogHeartbeat } from "./compat-sync.js";
 
 const PROVIDER_ID = FFAI_PROVIDER_ID;
 
@@ -147,14 +146,12 @@ async function runFfaiApiKeyAuth(ctx: ProviderAuthContext): Promise<ProviderAuth
 // ── Catalog: dynamic model discovery ───────────────────────────────────────
 
 async function runFfaiCatalog(ctx: ProviderCatalogContext): Promise<ProviderCatalogResult> {
-  // Heartbeat: tell the compat-sync shim that the native discovery path
-  // has fired during this gateway session. The shim reads this marker in
-  // its service `start()` hook and skips its sync when the marker is fresh.
-  // `writeCatalogHeartbeat` is best-effort internally — it swallows its
-  // own errors — so awaiting it is safe and eliminates a theoretical race
-  // where a fast shim start() reads a still-unflushed heartbeat.
-  await writeCatalogHeartbeat(ctx.workspaceDir);
-
+  // This hook is registered for completeness, but the OpenClaw host's
+  // dispatch path does not currently invoke catalog.run for plugins that
+  // also register a runtime entry. Catalog population happens via
+  // catalog-sync.ts running from inside register(). If a future host
+  // version starts calling this hook, both paths will produce the same
+  // openclaw.json shape.
   const pluginConfig = readFfaiPluginConfig(ctx.config);
   const explicit = ctx.config.models?.providers?.[PROVIDER_ID];
 

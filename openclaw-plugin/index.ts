@@ -1,19 +1,19 @@
 /**
  * FFAI OpenClaw Plugin — runtime entry.
  *
- * Provider registration (auth methods + dynamic model catalog) lives in the
+ * Provider auth methods and the model-catalog descriptor live in the
  * lightweight `./provider-discovery.ts` module declared via the
- * `providerDiscoveryEntry` field in `openclaw.plugin.json`. OpenClaw loads
- * that module directly during catalog resolution without booting this full
- * plugin runtime, which is the supported pattern for provider plugins (see
- * first-party ollama/anthropic-vertex plugins for reference).
+ * `providerDiscoveryEntry` field in `openclaw.plugin.json`. The host's
+ * dispatch path does not invoke `catalog.run` for plugins that also
+ * register a runtime entry, so the catalog gets populated by the
+ * `runCatalogSync` call further down — see `catalog-sync.ts`.
  *
- * This file exists only to register user-invocable commands:
- *   /ffai_stats        — compression & usage savings
- *   /ffai_encrypt      — generate an encrypted key import HTML page
- *   /ffai_import_keys  — import an encrypted key blob
+ * This file is responsible for:
+ *   - registering user-invocable commands (/ffai_stats, /ffai_encrypt,
+ *     /ffai_import_keys)
+ *   - kicking off the catalog sync at gateway start
  *
- * Env vars:  FFAI_KEY, FFAI_URL, FFAI_ADMIN_KEY
+ * Env vars: FFAI_KEY, FFAI_URL, FFAI_ADMIN_KEY
  */
 import {
   definePluginEntry,
@@ -28,7 +28,7 @@ import {
   type FfaiBasePluginConfig,
 } from "./defaults.js";
 import { handleFfaiStats, handleFfaiEncrypt, handleFfaiImportKeys } from "./ffai-commands.js";
-import { runCompatSync } from "./compat-sync.js";
+import { runCatalogSync } from "./catalog-sync.js";
 
 function resolveFfaiBaseUrl(pluginConfig: FfaiBasePluginConfig): string {
   // Priority: env var > plugin config > default. Provider-config lookup is
@@ -102,24 +102,24 @@ export default definePluginEntry({
       },
     });
 
-    // ── Compat-sync (fire-and-forget from register) ─────────────────────
-    // Temporary workaround for upstream OpenClaw bugs (see compat-sync.ts
-    // header and README). Fires exactly ONCE at gateway start: no polling,
-    // no teardown.
+    // ── Catalog sync (fire-and-forget from register) ────────────────────
+    // Populates `models.providers.ffai-*` and the model allowlist in
+    // `openclaw.json` based on what FFAI is currently serving. The host's
+    // `providerDiscoveryEntry` dispatch path does not invoke catalog.run
+    // for plugins that also register a runtime entry, so this runs from
+    // register() instead. Fires exactly ONCE per gateway start, with a
+    // bounded backoff retry to handle the gateway-races-FFAI-startup case.
     //
-    // Why not `api.registerService()`?  Provider plugins (those declaring
-    // `"providers"` in the manifest) are loaded by the gateway through a
-    // deferred path where `registerService` is a no-op.  Calling
-    // `runCompatSync` directly from `register()` avoids that limitation.
-    // Self-disables when the native providerDiscoveryEntry path writes a
-    // fresh heartbeat during this process session.  Can also be turned off
-    // by setting `compatSync: false` in the plugin config.
-    runCompatSync({
+    // Disable with `catalogSync: false` in the plugin config (legacy
+    // `compatSync: false` is also accepted).
+    //
+    // See catalog-sync.ts header for the full design rationale.
+    runCatalogSync({
       config: api.config as Record<string, unknown>,
       pluginConfig: api.pluginConfig,
       logger: api.logger,
     }).catch(() => {
-      // Errors are already logged inside runCompatSync; swallow the
+      // Errors are already logged inside runCatalogSync; swallow the
       // rejection so it never surfaces as an unhandled promise.
     });
   },

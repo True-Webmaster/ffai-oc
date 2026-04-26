@@ -22,7 +22,7 @@
   "include": [
     "index.ts",
     "provider-discovery.ts",
-    "compat-sync.ts",
+    "catalog-sync.ts",
     "models.ts",
     "provider-catalog.ts",
     "onboard.ts",

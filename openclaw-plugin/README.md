@@ -95,7 +95,7 @@ sees:
             "gemma-4-31b-it",
             "qwen3-coder:480b"
           ],
-          "compatSync": true
+          "catalogSync": true
         }
       }
     }
@@ -107,7 +107,7 @@ sees:
 |--------------|------------|---------|----------------------------------------------------------------------------------------------------------------------------------------------------|
 | `baseUrl`    | `string`   | `http://127.0.0.1:8010` | FFAI server URL. Overridden by `FFAI_URL` env var.                                                                          |
 | `favorites`  | `string[]` | `[]`    | Bare model IDs to group under `ffai-favorites`. The first entry is promoted to the agent default during onboarding. Missing IDs are logged, not silently dropped. |
-| `compatSync` | `boolean`  | `true`  | Runs a one-shot catalog sync at gateway start to work around an upstream OpenClaw packaging bug. See [Compatibility sync](#compatibility-sync-temporary-workaround). Leave on unless your host has the upstream fix. |
+| `catalogSync` | `boolean` | `true`  | Run a one-shot sync of the FFAI catalog into `openclaw.json` at gateway start. This is how `models.providers.ffai-*` gets populated — see [Catalog sync](#catalog-sync). Leave on; disabling it leaves `/models` empty for FFAI providers. Legacy alias: `compatSync`. |
 
 ## Slash commands
 
@@ -309,12 +309,11 @@ a fresh keypair is generated on next boot and all old blobs will fail
 
 ## How it works
 
-1. On each OpenClaw catalog refresh, the plugin's `providerDiscoveryEntry`
-   catalog hook fires. (See [Compatibility sync](#compatibility-sync-temporary-workaround)
-   below for the one-shot shim that runs in parallel during the upstream
-   broken window.)
-2. It `GET`s `${baseUrl}/models` with `Bearer ${FFAI_KEY}`, through the
-   SDK SSRF guard pinned to the configured hostname.
+1. At gateway start, the plugin's `register()` runs, registers the three
+   slash commands, and kicks off [catalog sync](#catalog-sync) as a
+   fire-and-forget task.
+2. Catalog sync `GET`s `${baseUrl}/models` with `Bearer ${FFAI_KEY}`,
+   through the SDK SSRF guard pinned to the configured hostname.
 3. The response is validated at the boundary (every field re-checked at
    runtime — no blind `as` casts on network data). Invalid records are
    dropped.
@@ -378,30 +377,59 @@ in `openclaw.json` under `models.providers.ffai-<name>.models[]`.
   `/ffai_encrypt` returns 403 means `FFAI_ADMIN_KEY` is wrong or missing
   (the two are distinct — stats uses the user key, encrypt uses admin).
 
-## Compatibility sync (temporary workaround)
+## Catalog sync
 
-Current OpenClaw hosts have a packaging issue that prevents
-`providerDiscoveryEntry` plugins — this one included — from being loaded
-at gateway start (see upstream tracking issue
-[`openclaw/openclaw#65715`](https://github.com/openclaw/openclaw/issues/65715)).
-Until the fix ships, the plugin includes a narrowly-scoped compatibility
-service that performs the same catalog sync the native discovery hook
-would have performed. It fires exactly **once** at gateway start — no
-polling loop — and produces the same `openclaw.json` state the native
-path would produce, so the two paths are idempotent when both are
-working.
+OpenClaw plugins normally publish their model catalog through the
+`providerDiscoveryEntry` hook: the host loads the discovery module,
+calls `catalog.run` on its own schedule, and writes the result into
+`openclaw.json`. That dispatch path does not currently invoke
+`catalog.run` for plugins that combine `providerDiscoveryEntry` with
+a runtime entry registering slash commands — the host either runs
+the discovery module without firing the runtime register (no commands)
+or runs the runtime register without firing the discovery hook (no
+catalog). Filing one upstream issue closed; the underlying
+chicken-and-egg persists.
 
-**Self-disabling.** The native discovery hook writes a heartbeat marker
-at `<workspaceDir>/.plugin-state/ffai-compat-sync/catalog-heartbeat.json`
-every time it runs. If the shim's `start()` hook sees a heartbeat that
-was written during the current gateway process (younger than process
-uptime), it concludes the native path is healthy and skips the sync.
-No user action is needed when upstream ships — the shim goes dormant on
-its own at the next gateway restart.
+**Catalog sync is how this plugin populates the catalog instead.** It
+runs from inside the plugin's `register()` at gateway start, fetches
+FFAI's `/models`, and writes the discovered providers + allowlist
+entries directly into `~/.openclaw/openclaw.json`. The on-disk shape
+is identical to what the host would have written if its dispatch had
+reached us, so nothing else in OpenClaw needs to know whether the
+catalog came from native dispatch or from us.
 
-**Manual override.** If you want to disable the shim explicitly (for
-example, you've verified your host has the upstream fix), set
-`compatSync: false` under the plugin config:
+Fires exactly **once** per gateway start. No periodic refresh — the
+catalog stays as written until the next gateway boot. To pick up
+changes from FFAI's upstream models mid-run, restart the gateway.
+
+### Backoff retry
+
+If FFAI is briefly unreachable when the gateway boots (common under
+Docker/systemd parallel start), catalog sync retries with bounded
+backoff: 5s, 10s, 30s, 60s, 120s, 120s — about 5 minutes of total
+budget. After all retries exhaust, a single warn line is logged and
+the catalog stays as it was; restart the gateway after FFAI is up.
+
+### Wipe protection
+
+Only writes when discovery returns `source: "fetched"` with a non-empty
+providers map. Empty, HTTP-error, and unreachable results never
+overwrite the live `openclaw.json` — a transient FFAI restart or 5xx
+must not erase provider state mid-conversation.
+
+### Allowlist sync
+
+`agents.defaults.models` is OpenClaw's allowlist: when non-empty, only
+listed model refs appear in `/models`. Catalog sync ADDS discovered
+ffai-* model refs to it so newly added providers (e.g. SambaNova)
+appear automatically. Never removes — manually curated entries
+(including non-ffai entries) are preserved.
+
+### Disabling
+
+Catalog sync is on by default. Disabling it leaves `/models` empty for
+FFAI providers, so it should stay on for typical use. The opt-out
+exists for hosts that someday do dispatch correctly:
 
 ```json
 {
@@ -410,7 +438,7 @@ example, you've verified your host has the upstream fix), set
       "ffai": {
         "enabled": true,
         "config": {
-          "compatSync": false
+          "catalogSync": false
         }
       }
     }
@@ -418,19 +446,14 @@ example, you've verified your host has the upstream fix), set
 }
 ```
 
-**Wipe protection.** The shim only writes when FFAI returns a populated
-catalog. Empty, HTTP-error, and unreachable results never overwrite a
-live `openclaw.json` — same policy as the native discovery hook.
+The legacy key `compatSync: false` is still accepted as an alias for
+backwards compatibility with pre-1.2.0 configs.
 
-**Allowlist sync.** The shim also writes discovered model refs into
-`agents.defaults.models` when that section is non-empty — otherwise your
-curated allowlist would block newly-discovered ffai models from appearing
-in `/models`. Nothing is removed from the allowlist; only added.
+### Auth scope
 
-**Auth during the workaround window.** The shim syncs the model catalog
-only; it does not write auth profiles. `openclaw configure` may fail to
-onboard FFAI until upstream ships. In the meantime, set `FFAI_KEY` in
-the environment before starting the gateway — the plugin's synthetic
-auth path uses it directly, and once the catalog sync runs you can use
-any `ffai-*` model. When upstream ships, `openclaw configure` starts
-working again with no migration needed.
+Catalog sync writes the model catalog and allowlist only. It does not
+write auth profiles. The plugin's synthetic-auth hook synthesises an
+api-key credential from `FFAI_KEY` plus the populated baseUrl, so
+completions work without an explicit `openclaw configure` step. Set
+`FFAI_KEY` in the environment before starting the gateway and any
+`ffai-*` model is usable as soon as the catalog is synced.

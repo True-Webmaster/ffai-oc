@@ -2,7 +2,7 @@
   "id": "ffai",
   "name": "FFAI Provider",
   "description": "Free-tier AI key-pooling proxy with multi-provider model discovery",
-  "version": "1.1.0",
+  "version": "1.2.0",
   "entryPoint": "index.ts",
   "providerDiscoveryEntry": "./provider-discovery.ts",
   "enabledByDefault": true,
@@ -26,10 +26,14 @@
         },
         "description": "Model IDs to include in the ffai-favorites provider group. The first entry is promoted to the default model during onboarding."
       },
-      "compatSync": {
+      "catalogSync": {
         "type": "boolean",
         "default": true,
-        "description": "Temporary workaround: run a one-shot catalog sync into openclaw.json at gateway start. Needed until upstream OpenClaw ships the fix for providerDiscoveryEntry plugins. Leave true unless you know your host already has the fix."
+        "description": "Run a one-shot sync of the FFAI model catalog into openclaw.json at gateway start. This is how the plugin populates models.providers.ffai-* — the host's providerDiscoveryEntry dispatch path does not currently invoke catalog.run for plugins that also register a runtime entry. Leave enabled unless you have a host that does dispatch correctly. Legacy alias: compatSync."
+      },
+      "compatSync": {
+        "type": "boolean",
+        "description": "Deprecated alias for catalogSync. Set catalogSync instead. Existing configs continue to work."
       }
     }
   },
@@ -42,9 +46,13 @@
       "label": "Favorite Models",
       "help": "List of model IDs to group under ffai-favorites for quick access in /models. Leave empty to see all discovered models ungrouped."
     },
+    "catalogSync": {
+      "label": "Catalog Sync",
+      "help": "Populates models.providers.ffai-* in openclaw.json at gateway start. Required — disabling it leaves /models empty for FFAI providers."
+    },
     "compatSync": {
-      "label": "Compatibility Sync",
-      "help": "Workaround for upstream OpenClaw packaging bug. Leave enabled for now; disable once your openclaw host ships the fix for providerDiscoveryEntry plugins."
+      "label": "Catalog Sync (legacy key)",
+      "help": "Deprecated. Use catalogSync."
     }
   }
 }
