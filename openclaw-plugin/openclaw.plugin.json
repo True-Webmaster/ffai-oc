@@ -2,7 +2,7 @@
   "id": "ffai",
   "name": "FFAI Provider",
   "description": "Free-tier AI key-pooling proxy with multi-provider model discovery",
-  "version": "1.3.0",
+  "version": "1.4.0",
   "entryPoint": "index.ts",
   "providerDiscoveryEntry": "./provider-discovery.ts",
   "enabledByDefault": true,
@@ -34,6 +34,10 @@
       "compatSync": {
         "type": "boolean",
         "description": "Deprecated alias for catalogSync. Set catalogSync instead. Existing configs continue to work."
+      },
+      "probeTimeoutMs": {
+        "type": "number",
+        "description": "Timeout (ms) for the Tailscale auto-flip reachability probe. Defaults to 2000. Raise on cross-continent Tailnets where RTT exceeds 2s. Capped at 30000."
       }
     }
   },

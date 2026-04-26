@@ -146,9 +146,13 @@ export default definePluginEntry({
       config: api.config as Record<string, unknown>,
       pluginConfig: api.pluginConfig,
       logger: api.logger,
-    }).catch(() => {
-      // Errors are already logged inside runCatalogSync; swallow the
-      // rejection so it never surfaces as an unhandled promise.
+    }).catch((err: unknown) => {
+      // runCatalogSync's outer try/catch logs and swallows its own throws,
+      // so this path is only reachable for a programmer bug (e.g. a throw
+      // before the try). Surface it via the host logger rather than
+      // black-holing it as an unhandled rejection.
+      const msg = err instanceof Error ? err.message : String(err);
+      api.logger?.error?.(`[ffai] catalog-sync crashed: ${msg}`);
     });
   },
 });

@@ -2,6 +2,106 @@
 
 All notable changes to FFAI are documented in this file.
 
+## [0.6.0] - 2026-04-26
+
+Plugin hardening pass driven by an internal multi-agent code review.
+Plugin companion bump: `1.4.0`. No server-side behaviour change — all
+fixes are inside `openclaw-plugin/`.
+
+### Security
+
+- **Pin port + scheme in outbound FFAI requests.** The SDK SSRF policy
+  is hostname-only; a tampered `baseUrl` could otherwise pivot from
+  `127.0.0.1:8010` to `127.0.0.1:22`. New `buildFfaiEndpointUrl`
+  rejects non-http(s) schemes, embedded credentials, and query/hash,
+  and composes URLs explicitly so a path can't be smuggled through
+  string concatenation.
+- **Cap response body size at 10 MB.** Streaming bounded reader on
+  `/models` responses prevents a malicious or misconfigured FFAI
+  server from OOM-ing the gateway at boot.
+- **Redact and sanitize all server-supplied strings before echoing to
+  channels.** `/import`'s `message`, `restart_hint`, and `provider`
+  fields go through `redactSecrets` (now also catches `?api_key=`,
+  `?token=` query-string credentials) and a strict charset filter
+  before being interpolated into Telegram/Discord output. Closes a
+  channel-rendering injection vector (a server-controlled provider
+  name like `[click](http://attacker)` would otherwise become a
+  clickable link).
+- **Bound `/ffai_import_keys` blob size and validate charset.** 64 KB
+  cap and `^FFAI-IMPORT:[A-Za-z0-9+/=._-]+$` regex stop hostile pasted
+  blobs from consuming memory or smuggling JSON-injection bytes
+  before the FFAI server gets to reject them.
+- **Drop key-length disclosure from `/ffai_doctor`.** Reporting
+  `present (39 chars)` is a small side-channel that helps an attacker
+  distinguish key formats; now reports just `present`.
+
+### Reliability
+
+- **Cross-process file lock around `openclaw.json` writes.** New
+  `withConfigLock` (mkdir-mutex + 60s stale-detection) wraps the full
+  read-modify-write cycle. Without this, gateway + `openclaw configure`
+  running concurrently could interleave and silently drop one writer's
+  changes.
+- **Atomic write hardened.** UUID tmp suffix (no PID-reuse collisions
+  or leftover tmps from prior processes), `fsync` before rename (no
+  zero-byte file published on power loss), finally-unlink on any
+  failure path.
+- **`runCatalogSync` body wrapped in try/finally** so an early throw
+  never leaves the `inFlight` flag stuck and blocks future syncs.
+- **Sync flags promoted to `globalThis[Symbol.for(...)]`** so plugin
+  hot-reload (which clears module-level bindings) doesn't cause
+  duplicate sync runs on the same gateway process.
+- **IPv6 Tailscale ULA detection.** `findTailscaleIp` now recognises
+  the `fd7a:115c:a1e0::/48` ULA range and brackets IPv6 hosts in
+  generated URLs (`[fd7a::1]:8010`), unblocking IPv6-only Tailnets.
+- **`/health` probe accepts any status <500.** FFAI deployments
+  without a `/health` endpoint no longer silently fail Tailscale
+  auto-flip — connectivity is what we're probing, not application
+  health.
+- **Stable-key `JSON.stringify` for change detection.** Eliminates
+  spurious writes when a rebuilt providers map is structurally equal
+  but has different key insertion order than the on-disk version.
+
+### Plugin code quality
+
+- **Catalog hook fully wrapped in try/catch.** Every helper called
+  from `runFfaiCatalog` operates on `unknown`-shaped config from
+  disk; a single TypeError must not propagate out and break OpenClaw
+  boot. Override models are validated to be objects-with-string-id
+  before publishing.
+- **Provider-key collisions get a numeric disambiguator.** Two FFAI
+  providers that sanitize to the same key (e.g. `Groq!` and `groq?`)
+  used to merge into the first provider's URL, silently 404-ing the
+  second provider's models. Now becomes `ffai-groq` and `ffai-groq-2`,
+  each with the correct upstream URL.
+- **Model-id dedup within each discovered group** — FFAI sometimes
+  echoes the same model under multiple aliases; OpenClaw routes by
+  id so duplicates were noise at best, non-deterministic at worst.
+- **AbortController + clearTimeout** replaces `AbortSignal.timeout`
+  everywhere so the abort timer doesn't outlive the response read.
+- **`probeTimeoutMs` configurable** from plugin config (capped 30s)
+  for cross-continent Tailnets where RTT exceeds the 2s default.
+- **catalog-sync rejection logs via `api.logger.error`** instead of
+  being swallowed as `.catch(() => {})`.
+
+### Docs (plugin)
+
+- README check-counts corrected (9 typical, 11 with Discord — was
+  8/10), "four slash commands" (was "three"), `FFAI_BIND` row added
+  to the env table with link to canonical Tailscale section, stale
+  "pre-1.2.0" cutoff removed from the legacy-alias note.
+- AGENTS.md doctor-check count corrected.
+- `docs/adding-a-provider.md` cross-link to repo-root AGENTS.md fixed
+  (`../../AGENTS.md`), `serve.js` line-number references replaced
+  with symbol-name anchors that won't rot when the file is reorganised.
+
+### package.json + tsconfig
+
+- Dropped `main: ./index.ts` (Node can't load TS directly; the host
+  loads the plugin via `openclaw.plugin.json`).
+- `noUnusedParameters: true` (was `false`), now consistent with
+  `noUnusedLocals`.
+
 ## [0.5.0] - 2026-04-26
 
 Reliability and onboarding pass after operator feedback. Plugin

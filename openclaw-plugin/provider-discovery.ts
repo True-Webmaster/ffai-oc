@@ -145,6 +145,22 @@ async function runFfaiApiKeyAuth(ctx: ProviderAuthContext): Promise<ProviderAuth
 
 // ── Catalog: dynamic model discovery ───────────────────────────────────────
 
+/**
+ * Validate that an override `models` array contains real model objects with
+ * a string `id`. Filters out garbage so a malformed user config can't poison
+ * the published catalog with primitives or nameless entries.
+ */
+function validateOverrideModels(raw: unknown): unknown[] | undefined {
+  if (!Array.isArray(raw) || raw.length === 0) return undefined;
+  const valid = raw.filter((m) =>
+    m !== null
+    && typeof m === "object"
+    && "id" in m
+    && typeof (m as { id: unknown }).id === "string"
+    && (m as { id: string }).id.length > 0);
+  return valid.length > 0 ? valid : undefined;
+}
+
 async function runFfaiCatalog(ctx: ProviderCatalogContext): Promise<ProviderCatalogResult> {
   // This hook is registered for completeness, but the OpenClaw host's
   // dispatch path does not currently invoke catalog.run for plugins that
@@ -152,84 +168,100 @@ async function runFfaiCatalog(ctx: ProviderCatalogContext): Promise<ProviderCata
   // catalog-sync.ts running from inside register(). If a future host
   // version starts calling this hook, both paths will produce the same
   // openclaw.json shape.
-  const pluginConfig = readFfaiPluginConfig(ctx.config);
-  const explicit = ctx.config.models?.providers?.[PROVIDER_ID];
+  //
+  // Outer try/catch: every helper called below operates on `unknown`-shaped
+  // config from disk. A single TypeError from a malformed openclaw.json must
+  // not propagate out of the hook and break OpenClaw boot — return null to
+  // preserve whatever the host already has.
+  const logger = (ctx as { logger?: { warn?: (msg: string) => void } }).logger;
+  try {
+    const pluginConfig = readFfaiPluginConfig(ctx.config);
+    const explicit = ctx.config.models?.providers?.[PROVIDER_ID];
 
-  const baseUrl = resolveFfaiBaseUrl({
-    pluginConfig,
-    providerConfig: explicit as { baseUrl?: string } | undefined,
-    env: ctx.env,
-  });
+    const baseUrl = resolveFfaiBaseUrl({
+      pluginConfig,
+      providerConfig: explicit as { baseUrl?: string } | undefined,
+      env: ctx.env,
+    });
 
-  const resolved = ctx.resolveProviderApiKey(PROVIDER_ID);
-  const apiKey = resolveFfaiApiKey({
-    env: ctx.env,
-    resolvedApiKey: resolved?.apiKey,
-    providerConfig: explicit as { apiKey?: unknown } | undefined,
-  });
+    const resolved = ctx.resolveProviderApiKey(PROVIDER_ID);
+    const apiKey = resolveFfaiApiKey({
+      env: ctx.env,
+      resolvedApiKey: resolved?.apiKey,
+      providerConfig: explicit as { apiKey?: unknown } | undefined,
+    });
 
-  // If the user has hand-populated models.providers.ffai.models, honour it as
-  // an override but still attempt live discovery afterwards — a single stale
-  // entry must not permanently freeze the catalog.
-  const explicitOverride: ModelProviderConfig | undefined =
-    Array.isArray((explicit as { models?: unknown })?.models) &&
-    (explicit as { models: unknown[] }).models.length > 0
+    // If the user has hand-populated models.providers.ffai.models, honour it
+    // as an override but still attempt live discovery afterwards — a single
+    // stale entry must not permanently freeze the catalog. Each override
+    // entry is validated to be an object with a string id so a malformed
+    // config (e.g. `models: ["gpt-4"]`) can't poison the published shape.
+    const validatedOverride = validateOverrideModels((explicit as { models?: unknown })?.models);
+    const explicitOverride: ModelProviderConfig | undefined = validatedOverride
       ? {
           ...(explicit as ModelProviderConfig),
+          models: validatedOverride as ModelProviderConfig["models"],
           baseUrl: `${baseUrl}/v1`,
           api: ((explicit as { api?: ModelProviderConfig["api"] }).api ?? "openai-completions"),
           apiKey: apiKey ?? "ffai-local",
         }
       : undefined;
 
-  let fetched: Awaited<ReturnType<typeof buildFfaiProviders>> | undefined;
-  try {
-    fetched = await buildFfaiProviders({
-      baseUrl,
-      apiKey,
-      favorites: pluginConfig.favorites,
-    });
+    let fetched: Awaited<ReturnType<typeof buildFfaiProviders>> | undefined;
+    try {
+      fetched = await buildFfaiProviders({
+        baseUrl,
+        apiKey,
+        favorites: pluginConfig.favorites,
+      });
+    } catch (err) {
+      // Unexpected thrown error (programmer bug). fetchFfaiModels itself
+      // catches network/SSRF/abort into a status field, so this path is rare.
+      logger?.warn?.(`[ffai] catalog threw: ${describeError(err)}`);
+    }
+
+    if (fetched) {
+      if (fetched.droppedProviders.length > 0) {
+        logger?.warn?.(
+          `[ffai] provider(s) dropped (name collides with reserved "favorites" key): ${fetched.droppedProviders.join(", ")}`,
+        );
+      }
+      if (fetched.unresolvedFavorites.length > 0) {
+        logger?.warn?.(
+          `[ffai] favorites not found in discovered catalog: ${fetched.unresolvedFavorites.join(", ")}`,
+        );
+      }
+
+      // Wipe-protection: only publish discovery results when we actually
+      // have providers. Empty/http_error/unreachable results must not
+      // overwrite the live catalog — a transient FFAI restart or a 5xx
+      // should never erase provider state users are mid-conversation on.
+      if (fetched.source === "fetched" && Object.keys(fetched.providers).length > 0) {
+        return { providers: fetched.providers };
+      }
+    }
+
+    // Discovery produced nothing usable. Preference order:
+    //   1. User-provided explicit override — real models, keep it.
+    //   2. Existing provider config in openclaw.json — return null to
+    //      preserve whatever's already there (wipe protection).
+    //   3. No prior config at all — return null too: the host should keep
+    //      whatever live state it has rather than receive an empty shell
+    //      that might overwrite a previously-discovered catalog held only
+    //      in the host's in-memory registry. catalog-sync.ts (the runtime
+    //      path) is what publishes the shell on a true cold start; this
+    //      hook errs on the side of preservation.
+    if (explicitOverride) return { provider: explicitOverride };
+    return null;
   } catch (err) {
-    // Unexpected thrown error (programmer bug). fetchFfaiModels itself catches
-    // network/SSRF/abort into a status field, so this path should be rare.
-    // Log via the host logger if present, otherwise swallow — never wipe.
-    const logger = (ctx as { logger?: { warn?: (msg: string) => void } }).logger;
-    logger?.warn?.(`[ffai] catalog threw: ${describeError(err)}`);
+    logger?.warn?.(`[ffai] catalog hook prelude threw: ${describeError(err)} — preserving existing catalog`);
+    return null;
   }
-
-  if (fetched) {
-    if (fetched.droppedProviders.length > 0) {
-      const logger = (ctx as { logger?: { warn?: (msg: string) => void } }).logger;
-      logger?.warn?.(
-        `[ffai] provider(s) dropped (name collides with reserved "favorites" key): ${fetched.droppedProviders.join(", ")}`,
-      );
-    }
-    if (fetched.unresolvedFavorites.length > 0) {
-      const logger = (ctx as { logger?: { warn?: (msg: string) => void } }).logger;
-      logger?.warn?.(
-        `[ffai] favorites not found in discovered catalog: ${fetched.unresolvedFavorites.join(", ")}`,
-      );
-    }
-
-    // Wipe-protection: only publish discovery results when we actually have
-    // providers. Empty/http_error/unreachable results must not overwrite the
-    // live catalog — a transient FFAI restart or a 5xx should never erase
-    // provider state users are mid-conversation on.
-    if (fetched.source === "fetched" && Object.keys(fetched.providers).length > 0) {
-      return { providers: fetched.providers };
-    }
-  }
-
-  // Discovery produced nothing usable. Preference order:
-  //   1. User-provided explicit override — real models, keep it.
-  //   2. Existing provider config in openclaw.json — return null to preserve
-  //      whatever's already there (wipe protection).
-  //   3. No prior config at all — publish the static empty-models shell so
-  //      the provider slot exists; first successful discovery will fill it.
-  if (explicitOverride) return { provider: explicitOverride };
-  if (explicit) return null;
-  return { provider: buildFfaiStaticProvider(baseUrl) };
 }
+
+// Re-export for tests / programmatic callers that only need the static shell
+// (e.g. catalog-sync's first-cold-boot path).
+export { buildFfaiStaticProvider };
 
 // ── Provider descriptor (default export) ───────────────────────────────────
 

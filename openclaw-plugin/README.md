@@ -120,8 +120,8 @@ In any OpenClaw chat (Telegram, web, CLI), run:
 /ffai_doctor
 ```
 
-You should see all `✓ ok` lines (typically 8 on a fresh Telegram-only
-install, up to 10 on Discord + Tailscale setups) and a `Summary: N ok ·
+You should see all `✓ ok` lines (typically 9 on a fresh Telegram-only
+install, up to 11 on Discord + Tailscale setups) and a `Summary: N ok ·
 0 warn · 0 fail · …` footer. If anything is `✗ fail` or `⚠ warn`, the
 line right below it tells you what to fix. Common first-install
 failures:
@@ -189,10 +189,11 @@ FFAI itself honours a few more knobs you may want to set before the gateway
 starts — they don't live in the plugin but directly affect what the plugin
 sees:
 
-| FFAI-side variable         | Default    | Effect on the plugin                                                                                     |
-|----------------------------|------------|----------------------------------------------------------------------------------------------------------|
-| `FFAI_MIN_CONTEXT_WINDOW`  | `32768`    | Drops any discovered model below this context size. Set to `131072` to hide 32K-only SambaNova models that would be useless for agent work. |
-| `FFAI_MIN_TPM`             | `20000`    | Drops models whose provider-level TPM is below this, so an agent turn can actually fit.                  |
+| FFAI-side variable         | Default      | Effect on the plugin                                                                                     |
+|----------------------------|--------------|----------------------------------------------------------------------------------------------------------|
+| `FFAI_BIND`                | `127.0.0.1`  | Interface FFAI listens on. Loopback is fine for Telegram-only setups; **Discord users must change this** so the plugin can reach FFAI on a non-loopback address. See [Tailscale setup](#tailscale-setup-required-for-discord). |
+| `FFAI_MIN_CONTEXT_WINDOW`  | `32768`      | Drops any discovered model below this context size. Set to `131072` to hide 32K-only SambaNova models that would be useless for agent work. |
+| `FFAI_MIN_TPM`             | `20000`      | Drops models whose provider-level TPM is below this, so an agent turn can actually fit.                  |
 
 ### Plugin config (`plugins.entries.ffai.config`)
 
@@ -468,7 +469,7 @@ a fresh keypair is generated on next boot and all old blobs will fail
 
 ## How it works
 
-1. At gateway start, the plugin's `register()` runs, registers the three
+1. At gateway start, the plugin's `register()` runs, registers the four
    slash commands, and kicks off [catalog sync](#catalog-sync) as a
    fire-and-forget task.
 2. Catalog sync `GET`s `${baseUrl}/models` with `Bearer ${FFAI_KEY}`,
@@ -978,7 +979,7 @@ exists for hosts that someday do dispatch correctly:
 ```
 
 The legacy key `compatSync: false` is still accepted as an alias for
-backwards compatibility with pre-1.2.0 configs.
+backwards compatibility with configs written before the rename.
 
 ### Auth scope
 

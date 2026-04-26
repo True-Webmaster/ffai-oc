@@ -274,7 +274,7 @@ ffai-commands.ts
 ├── handleFfaiStats — GETs /savings, formats
 ├── handleFfaiEncrypt — GETs /generate-import, writes HTML to disk
 ├── handleFfaiImportKeys — POSTs blob to /import
-└── handleFfaiDoctor — runs 8 preflight checks
+└── handleFfaiDoctor — runs preflight checks (9 typical, up to 11 with Discord)
 
 models.ts, provider-catalog.ts, defaults.ts, onboard.ts
 └── Shared helpers (SSRF policy, model normalization, baseUrl resolution)

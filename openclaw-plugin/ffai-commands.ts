@@ -10,8 +10,35 @@
  * pivot to internal metadata endpoints.
  */
 import { fetchWithSsrFGuard } from "openclaw/plugin-sdk/ssrf-runtime";
-import { buildFfaiSsrfPolicy } from "./models.js";
+import { buildFfaiSsrfPolicy, buildFfaiEndpointUrl } from "./models.js";
 import { findTailscaleIp, isLoopbackHost } from "./catalog-sync.js";
+
+/**
+ * Returns an AbortController + cleanup helper. Use over `AbortSignal.timeout`
+ * so the timer can be explicitly cleared once the body has been consumed —
+ * otherwise a slow body read can race the abort and surface a confusing
+ * "AbortError" on a request that actually succeeded.
+ */
+function timeoutSignal(ms: number): { signal: AbortSignal; cleanup: () => void } {
+  const ac = new AbortController();
+  const t = setTimeout(() => ac.abort(), ms);
+  return { signal: ac.signal, cleanup: () => clearTimeout(t) };
+}
+
+const MAX_IMPORT_BLOB_BYTES = 64 * 1024;
+const MAX_ERROR_BODY_BYTES = 4096;
+
+/**
+ * Sanitize a server-supplied provider name before interpolating it into a
+ * channel-rendered string. Channel renderers (Telegram MarkdownV2, Discord)
+ * interpret formatting characters; an unsanitized name like
+ * `[click](http://attacker)` becomes a clickable link.
+ */
+function sanitizeProviderName(raw: unknown): string {
+  if (typeof raw !== "string") return "unknown";
+  const trimmed = raw.replace(/[^A-Za-z0-9_.-]/g, "").slice(0, 64);
+  return trimmed || "unknown";
+}
 
 // ── Public exports ──────────────────────────────────────────────────────────
 
@@ -37,13 +64,16 @@ export async function handleFfaiStats(params: {
     };
   }
 
+  const url = buildFfaiEndpointUrl(baseUrl, "/savings");
+  if (!url) return { text: "Invalid FFAI base URL.", isError: true };
+
   return ffaiRequest(
     {
-      url: `${baseUrl}/savings`,
+      url,
       init: {
         headers: { Authorization: `Bearer ${apiKey}`, Accept: "application/json" },
-        signal: AbortSignal.timeout(10_000),
       },
+      timeoutMs: 10_000,
       baseUrl,
       audit: "ffai-provider.stats",
     },
@@ -82,13 +112,16 @@ export async function handleFfaiEncrypt(params: {
     };
   }
 
+  const url = buildFfaiEndpointUrl(baseUrl, "/generate-import");
+  if (!url) return { text: "Invalid FFAI base URL.", isError: true };
+
   return ffaiRequest(
     {
-      url: `${baseUrl}/generate-import`,
+      url,
       init: {
         headers: { Authorization: `Bearer ${adminKey}`, Accept: "text/html" },
-        signal: AbortSignal.timeout(15_000),
       },
+      timeoutMs: 15_000,
       baseUrl,
       audit: "ffai-provider.generate-import",
     },
@@ -152,26 +185,41 @@ export async function handleFfaiImportKeys(params: {
     };
   }
 
-  // Require the explicit FFAI-IMPORT: prefix. The previous base64-prefix
-  // heuristic (`/^eyJ/`) was ambiguous and happy to promote any base64 JSON
-  // to an import attempt, which widened the attack surface of this command.
-  if (!raw.startsWith("FFAI-IMPORT:")) {
+  // Bound size before doing anything else — accepting an arbitrarily large
+  // blob would let a hostile pasted string consume memory and bandwidth
+  // before the FFAI server gets a chance to reject it.
+  if (raw.length > MAX_IMPORT_BLOB_BYTES) {
     return {
-      text: "Invalid import blob. It must start with FFAI-IMPORT: (regenerate via /ffai_encrypt).",
+      text: `Import blob too large (${raw.length} bytes, max ${MAX_IMPORT_BLOB_BYTES}).`,
+      isError: true,
+    };
+  }
+
+  // Require the explicit FFAI-IMPORT: prefix and a strict charset for the
+  // remainder. The previous base64-prefix heuristic (`/^eyJ/`) was ambiguous
+  // and happy to promote any base64 JSON to an import attempt; the tight
+  // charset stops anything weird (control characters, JSON-injection
+  // attempts) before it reaches the server.
+  if (!/^FFAI-IMPORT:[A-Za-z0-9+/=._-]+$/.test(raw)) {
+    return {
+      text: "Invalid import blob. It must start with FFAI-IMPORT: and contain only base64-safe characters (regenerate via /ffai_encrypt).",
       isError: true,
     };
   }
   const blob = raw;
 
+  const url = buildFfaiEndpointUrl(baseUrl, "/import");
+  if (!url) return { text: "Invalid FFAI base URL.", isError: true };
+
   return ffaiRequest(
     {
-      url: `${baseUrl}/import`,
+      url,
       init: {
         method: "POST",
         headers: { "Content-Type": "application/json", Accept: "application/json" },
         body: JSON.stringify({ payload: blob }),
-        signal: AbortSignal.timeout(15_000),
       },
+      timeoutMs: 15_000,
       baseUrl,
       audit: "ffai-provider.import",
     },
@@ -196,6 +244,10 @@ export async function handleFfaiImportKeys(params: {
         };
       }
 
+      // Every server-supplied string passes through `redactSecrets` before
+      // being interpolated into channel-rendered output. A malicious or
+      // buggy FFAI server could otherwise echo Bearer tokens or API keys
+      // straight to the operator's chat.
       if (data.error) {
         const errMsg = redactSecrets(String(data.error)).slice(0, 600);
         return { text: `FFAI /import error: ${errMsg}`, isError: true };
@@ -205,12 +257,11 @@ export async function handleFfaiImportKeys(params: {
       const duplicates = typeof data.duplicates === "number" ? data.duplicates : 0;
       const invalid = typeof data.invalid === "number" ? data.invalid : 0;
       const mismatched = typeof data.mismatched === "number" ? data.mismatched : 0;
-      const provider = typeof data.provider === "string" && data.provider.trim()
-        ? data.provider.trim()
-        : "unknown";
+      const provider = sanitizeProviderName(data.provider);
 
       if (imported === 0) {
-        const msg = typeof data.message === "string" ? data.message : "no keys imported";
+        const rawMsg = typeof data.message === "string" ? data.message : "no keys imported";
+        const msg = redactSecrets(rawMsg).slice(0, 600);
         return { text: `FFAI /import: ${msg} (provider "${provider}")`, isError: mismatched > 0 };
       }
 
@@ -223,7 +274,7 @@ export async function handleFfaiImportKeys(params: {
         ? `\nProvider stanza for "${provider}" was auto-created in FFAI's config.json from a built-in template.`
         : "";
       const restartHint = typeof data.restart_hint === "string"
-        ? `\n\nNote: ${data.restart_hint}`
+        ? `\n\nNote: ${redactSecrets(data.restart_hint).slice(0, 600)}`
         : "";
       return {
         text: `Keys imported successfully! ${imported} key(s) added for provider "${provider}"${suffix}.${autoCreatedLine}${restartHint}`,
@@ -271,7 +322,7 @@ export async function handleFfaiDoctor(params: {
     checks.push({
       name: "FFAI_KEY in gateway env",
       status: "ok",
-      detail: `present (${apiKey.length} chars)`,
+      detail: "present",
     });
   } else {
     checks.push({
@@ -289,7 +340,7 @@ export async function handleFfaiDoctor(params: {
     checks.push({
       name: "FFAI_ADMIN_KEY in gateway env",
       status: "ok",
-      detail: `present (${adminKey.length} chars)`,
+      detail: "present",
     });
   } else {
     checks.push({
@@ -373,12 +424,14 @@ export async function handleFfaiDoctor(params: {
         }
       }
     } else {
+      let host = baseUrl;
+      try { host = new URL(baseUrl).host; } catch { /* malformed — fall through with full URL */ }
       checks.push({
         name: "FFAI reachable",
         status: "fail",
         detail: `${baseUrl} unreachable (${providersResult.reason})`,
         remediation:
-          `Verify FFAI is running and bound to ${new URL(baseUrl).host}. ` +
+          `Verify FFAI is running and bound to ${host}. ` +
           "If FFAI is on a different host or port, set FFAI_URL in the gateway environment and restart.",
       });
     }
@@ -465,13 +518,16 @@ export async function handleFfaiDoctor(params: {
     let totalRefs = 0;
     let covered = 0;
     for (const provKey of ffaiProvidersInConfig) {
-      const prov = (cfg?.models?.providers as Record<string, unknown>)?.[provKey] as
-        { models?: Array<{ id?: unknown }> } | undefined;
-      const models = Array.isArray(prov?.models) ? prov.models : [];
+      const provRaw = (cfg?.models?.providers as Record<string, unknown>)?.[provKey];
+      // Provider entry may be a non-object if the user hand-edited
+      // openclaw.json badly; skip rather than crash.
+      if (typeof provRaw !== "object" || provRaw === null) continue;
+      const prov = provRaw as { models?: unknown };
+      const models = Array.isArray(prov.models) ? prov.models : [];
       for (const m of models) {
-        const id = typeof m === "object" && m && "id" in m && typeof (m as { id: unknown }).id === "string"
-          ? (m as { id: string }).id
-          : null;
+        if (typeof m !== "object" || m === null) continue;
+        const idRaw = (m as { id?: unknown }).id;
+        const id = typeof idRaw === "string" ? idRaw : null;
         if (!id) continue;
         totalRefs++;
         if (allowlistKeys.has(`${provKey}/${id}`)) covered++;
@@ -618,7 +674,11 @@ function isDiscordConfigured(openclawConfig: unknown): boolean {
     channels?: Record<string, unknown>;
     plugins?: { entries?: Record<string, { enabled?: unknown }> };
   } | undefined;
-  if (cfg?.channels?.discord) return true;
+  // A truthy primitive (`channels.discord: 0` slips through TS because the
+  // field is `unknown`); require an actual object before declaring Discord
+  // configured.
+  const ch = cfg?.channels?.discord;
+  if (typeof ch === "object" && ch !== null) return true;
   const entry = cfg?.plugins?.entries?.discord;
   return entry?.enabled === true;
 }
@@ -640,13 +700,16 @@ async function probeFfaiProviders(params: { baseUrl: string; apiKey: string }): 
   | { ok: true; providers: string[]; providerDetails: Record<string, { total: number }> }
   | { ok: false; reason: string }
 > {
+  const url = buildFfaiEndpointUrl(params.baseUrl, "/providers");
+  if (!url) return { ok: false, reason: "invalid baseUrl" };
+  const { signal, cleanup } = timeoutSignal(5_000);
   let release: (() => Promise<void> | void) | undefined;
   try {
     const result = await fetchWithSsrFGuard({
-      url: `${params.baseUrl}/providers`,
+      url,
       init: {
         headers: { Authorization: `Bearer ${params.apiKey}`, Accept: "application/json" },
-        signal: AbortSignal.timeout(5_000),
+        signal,
       },
       policy: buildFfaiSsrfPolicy(params.baseUrl),
       auditContext: "ffai-provider.doctor.providers",
@@ -670,8 +733,11 @@ async function probeFfaiProviders(params: { baseUrl: string; apiKey: string }): 
     }
     return { ok: true, providers, providerDetails };
   } catch (err) {
-    return { ok: false, reason: describe(err) };
+    // Errors from undici/fetch can include the full URL with credentials;
+    // redact before surfacing as a doctor `reason`.
+    return { ok: false, reason: redactSecrets(describe(err)) };
   } finally {
+    cleanup();
     if (release) {
       try { await release(); } catch { /* release failure is not actionable */ }
     }
@@ -682,13 +748,16 @@ async function probeFfaiModels(params: { baseUrl: string; apiKey: string }): Pro
   | { ok: true; modelCount: number }
   | { ok: false; reason: string }
 > {
+  const url = buildFfaiEndpointUrl(params.baseUrl, "/models");
+  if (!url) return { ok: false, reason: "invalid baseUrl" };
+  const { signal, cleanup } = timeoutSignal(10_000);
   let release: (() => Promise<void> | void) | undefined;
   try {
     const result = await fetchWithSsrFGuard({
-      url: `${params.baseUrl}/models`,
+      url,
       init: {
         headers: { Authorization: `Bearer ${params.apiKey}`, Accept: "application/json" },
-        signal: AbortSignal.timeout(10_000),
+        signal,
       },
       policy: buildFfaiSsrfPolicy(params.baseUrl),
       auditContext: "ffai-provider.doctor.models",
@@ -705,8 +774,9 @@ async function probeFfaiModels(params: { baseUrl: string; apiKey: string }): Pro
     if (!list) return { ok: false, reason: "missing data array" };
     return { ok: true, modelCount: list.length };
   } catch (err) {
-    return { ok: false, reason: describe(err) };
+    return { ok: false, reason: redactSecrets(describe(err)) };
   } finally {
+    cleanup();
     if (release) {
       try { await release(); } catch { /* release failure is not actionable */ }
     }
@@ -722,14 +792,15 @@ async function probeFfaiModels(params: { baseUrl: string; apiKey: string }): Pro
  * CommandResult errors so handlers stay linear.
  */
 async function ffaiRequest(
-  params: { url: string; init: RequestInit; baseUrl: string; audit: string },
+  params: { url: string; init: RequestInit; timeoutMs: number; baseUrl: string; audit: string },
   consume: (response: Response) => Promise<CommandResult>,
 ): Promise<CommandResult> {
+  const { signal, cleanup } = timeoutSignal(params.timeoutMs);
   let release: (() => Promise<void> | void) | undefined;
   try {
     const result = await fetchWithSsrFGuard({
       url: params.url,
-      init: params.init,
+      init: { ...params.init, signal },
       policy: buildFfaiSsrfPolicy(params.baseUrl),
       auditContext: params.audit,
     });
@@ -737,7 +808,7 @@ async function ffaiRequest(
     const response = result.response;
 
     if (!response.ok) {
-      const body = await safeReadBody(response);
+      const body = await safeReadBody(response, MAX_ERROR_BODY_BYTES);
       // Redact first, THEN slice — slicing a 200-char window before
       // redaction could truncate mid-token and leave a secret exposed.
       const redacted = redactSecrets(body).slice(0, 300);
@@ -751,15 +822,44 @@ async function ffaiRequest(
   } catch (err) {
     return { text: `Failed to reach FFAI: ${redactSecrets(describe(err))}`, isError: true };
   } finally {
+    cleanup();
     if (release) {
       try { await release(); } catch { /* release failure is not actionable */ }
     }
   }
 }
 
-async function safeReadBody(response: Response): Promise<string> {
+/**
+ * Read at most `maxBytes` of a response body as UTF-8 text. Bounds memory
+ * usage when an error response (5xx HTML page, attacker-controlled) could
+ * otherwise tie up the channel. Returns an empty string on read failure or
+ * abort — the caller has already decided to surface an error.
+ */
+async function safeReadBody(response: Response, maxBytes: number): Promise<string> {
   try {
-    return await response.text();
+    const reader = response.body?.getReader();
+    if (!reader) return await response.text();
+    const chunks: Uint8Array[] = [];
+    let received = 0;
+    // eslint-disable-next-line no-constant-condition
+    while (true) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      if (value) {
+        const remaining = maxBytes - received;
+        if (remaining <= 0) {
+          try { await reader.cancel(); } catch { /* best effort */ }
+          break;
+        }
+        const slice = value.byteLength > remaining ? value.slice(0, remaining) : value;
+        chunks.push(slice);
+        received += slice.byteLength;
+      }
+    }
+    const merged = new Uint8Array(received);
+    let offset = 0;
+    for (const c of chunks) { merged.set(c, offset); offset += c.byteLength; }
+    return new TextDecoder("utf-8").decode(merged);
   } catch {
     return "";
   }
@@ -770,9 +870,10 @@ const SECRET_PATTERNS: RegExp[] = [
   /\b(?:gsk_[A-Za-z0-9_-]{10,})/g,
   /\b(?:csk-[A-Za-z0-9_-]{10,})/g,
   /\bAIza[0-9A-Za-z_-]{10,}/g,
-  /\bAKIA[0-9A-Z]{12,}/g,                   // AWS access key IDs
+  /\bAKIA[0-9A-Z]{12,}/g,                                        // AWS access key IDs
   /Bearer\s+[A-Za-z0-9._~+/=-]+/gi,
-  /\/\/[^@\s]+:[^@\s]+@/g,                   // URL-embedded user:pass@
+  /\/\/[^@\s]+:[^@\s]+@/g,                                       // URL-embedded user:pass@
+  /[?&](?:api[_-]?key|token|key|password|secret|access[_-]?token)=[^&\s"'<>]+/gi, // querystring creds
 ];
 
 function redactSecrets(text: string): string {

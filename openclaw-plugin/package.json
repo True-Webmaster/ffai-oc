@@ -1,12 +1,10 @@
 {
   "name": "@ffai/openclaw-plugin",
-  "version": "1.3.0",
+  "version": "1.4.0",
   "description": "OpenClaw FFAI provider plugin — free-tier AI key-pooling proxy with dynamic model discovery",
   "license": "MIT",
   "type": "module",
-  "main": "./index.ts",
   "exports": {
-    ".": "./index.ts",
     "./plugin": "./openclaw.plugin.json"
   },
   "files": [

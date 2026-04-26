@@ -50,6 +50,72 @@ export function buildFfaiSsrfPolicy(baseUrl: string): SsrFPolicy {
   };
 }
 
+/**
+ * Build the request URL for an FFAI endpoint. Pins protocol+host+port to the
+ * configured baseUrl — the SDK SSRF policy is hostname-only, so a tampered
+ * `baseUrl` could otherwise pivot port (e.g. 127.0.0.1:8010 → 127.0.0.1:22).
+ *
+ * Rejects baseUrls with non-http(s) schemes, embedded credentials, or query/
+ * hash components. Returns null on any rejection so the caller can fail closed.
+ */
+export function buildFfaiEndpointUrl(baseUrl: string, pathname: string): string | null {
+  let parsed: URL;
+  try {
+    parsed = new URL(baseUrl);
+  } catch {
+    return null;
+  }
+  if (parsed.protocol !== "http:" && parsed.protocol !== "https:") return null;
+  if (parsed.username || parsed.password) return null;
+  if (parsed.search || parsed.hash) return null;
+  // Compose explicitly so trailing slashes / paths in baseUrl don't get
+  // truncated by `new URL(pathname, baseUrl)` semantics.
+  const base = baseUrl.replace(/\/+$/, "");
+  const suffix = pathname.startsWith("/") ? pathname : `/${pathname}`;
+  return `${base}${suffix}`;
+}
+
+// Cap response body to a sane size so a malicious or misconfigured FFAI server
+// can't OOM the host process at boot. 10 MB is generous for /models (real
+// payloads are <100 KB) without being so small it breaks future growth.
+export const FFAI_MAX_RESPONSE_BYTES = 10 * 1024 * 1024;
+
+async function readBoundedJson(response: Response, maxBytes: number): Promise<unknown> {
+  const lenHeader = response.headers.get("content-length");
+  if (lenHeader) {
+    const len = Number(lenHeader);
+    if (Number.isFinite(len) && len > maxBytes) {
+      throw new Error(`response body too large (${len} > ${maxBytes} bytes)`);
+    }
+  }
+  const reader = response.body?.getReader();
+  if (!reader) {
+    // Fallback for environments without a streaming body — bounded by header
+    // check above; if no header, accept the small risk of buffering.
+    return response.json();
+  }
+  const chunks: Uint8Array[] = [];
+  let received = 0;
+  // eslint-disable-next-line no-constant-condition
+  while (true) {
+    const { value, done } = await reader.read();
+    if (done) break;
+    if (value) {
+      received += value.byteLength;
+      if (received > maxBytes) {
+        try { await reader.cancel(); } catch { /* best effort */ }
+        throw new Error(`response body too large (>${maxBytes} bytes)`);
+      }
+      chunks.push(value);
+    }
+  }
+  const merged = new Uint8Array(received);
+  let offset = 0;
+  for (const c of chunks) { merged.set(c, offset); offset += c.byteLength; }
+  const text = new TextDecoder("utf-8").decode(merged);
+  return JSON.parse(text);
+}
+
 // ── Runtime validators ─────────────────────────────────────────────────────
 
 /**
@@ -99,13 +165,18 @@ export async function fetchFfaiModels(
   baseUrl: string,
   apiKey: string | undefined,
 ): Promise<FfaiFetchResult> {
+  const url = buildFfaiEndpointUrl(baseUrl, "/models");
+  if (!url) {
+    return { status: "unreachable", reason: "invalid baseUrl (scheme/credentials/query)" };
+  }
+
   const headers: Record<string, string> = { Accept: "application/json" };
   if (apiKey) headers.Authorization = `Bearer ${apiKey}`;
 
   let release: (() => Promise<void> | void) | undefined;
   try {
     const result = await fetchWithSsrFGuard({
-      url: `${baseUrl}/models`,
+      url,
       init: {
         headers,
         signal: AbortSignal.timeout(FFAI_DISCOVERY_TIMEOUT_MS),
@@ -120,13 +191,25 @@ export async function fetchFfaiModels(
       // Drain the body to release the connection back to the pool. An
       // unconsumed body in Node (undici) keeps the socket tied to this
       // response, leaking connections under sustained error conditions.
-      try { await response.text(); } catch { /* drain best-effort */ }
+      // Bounded read so an attacker can't tie up memory via a giant 5xx body.
+      try {
+        const reader = response.body?.getReader();
+        if (reader) {
+          let drained = 0;
+          while (drained < 64 * 1024) {
+            const { value, done } = await reader.read();
+            if (done) break;
+            drained += value?.byteLength ?? 0;
+          }
+          try { await reader.cancel(); } catch { /* best effort */ }
+        }
+      } catch { /* drain best-effort */ }
       return { status: "http_error", code: response.status };
     }
 
     let body: unknown;
     try {
-      body = await response.json();
+      body = await readBoundedJson(response, FFAI_MAX_RESPONSE_BYTES);
     } catch (err) {
       return { status: "unreachable", reason: `invalid JSON: ${describe(err)}` };
     }

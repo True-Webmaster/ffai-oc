@@ -49,6 +49,7 @@
 import { promises as fs } from "node:fs";
 import path from "node:path";
 import os from "node:os";
+import crypto from "node:crypto";
 
 import type { ModelProviderConfig } from "openclaw/plugin-sdk/provider-model-shared";
 import { buildFfaiProviders } from "./provider-catalog.js";
@@ -62,26 +63,34 @@ import {
 const PROVIDER_ID = FFAI_PROVIDER_ID;
 const PROVIDER_PREFIX = "ffai-";
 
-// Module-level guard. `syncHasFired` flips to true on a successful sync
-// (or on intentional config-disable) and stays true for the lifetime of
-// the gateway process — there is no value in re-running once we've written
-// the catalog. `syncInFlight` prevents concurrent runs while the in-progress
-// retry loop is still scheduling timers.
-let syncHasFired = false;
-let syncInFlight = false;
+// Process-wide guard. Lives on `globalThis` so plugin hot-reload (which
+// re-evaluates this module and would otherwise reset module-level `let`
+// bindings) doesn't cause a duplicate sync run on the same gateway process.
+// Two flags: `fired` flips true after a successful sync (or intentional
+// config-disable); `inFlight` is the re-entry mutex while the retry loop
+// is still scheduling timers.
+const SYNC_FLAG_KEY = Symbol.for("ffai.catalog-sync.flags");
+type SyncFlags = { fired: boolean; inFlight: boolean };
+const _g = globalThis as { [k: symbol]: unknown };
+if (!_g[SYNC_FLAG_KEY]) {
+  _g[SYNC_FLAG_KEY] = { fired: false, inFlight: false } satisfies SyncFlags;
+}
+const syncFlags = _g[SYNC_FLAG_KEY] as SyncFlags;
 
 // Retry tuning. Discovery against a freshly-booted FFAI sometimes fails
 // because the gateway races FFAI's listen-ready (especially under Docker /
-// systemd parallel start). The backoff covers ~5 minutes total, after which
-// the operator gets a single warn line and we wait for the next gateway
-// restart to retry.
+// systemd parallel start). Cumulative wait after each attempt:
+//   attempt 1 → 0s,   2 → 5s,   3 → 15s,   4 → 45s,
+//   attempt 5 → 1m45s, 6 → 3m45s, 7 → 5m45s.
+// Total ~5m45s, after which the operator gets a single warn line and we
+// wait for the next gateway restart to retry.
 const RETRY_DELAYS_MS = [
-  5_000,    // 5s
-  10_000,   // 15s
-  30_000,   // 45s
-  60_000,   // 1m45s
-  120_000,  // 3m45s
-  120_000,  // 5m45s
+  5_000,    // +5s   (cum 5s)
+  10_000,   // +10s  (cum 15s)
+  30_000,   // +30s  (cum 45s)
+  60_000,   // +60s  (cum 1m45s)
+  120_000,  // +120s (cum 3m45s)
+  120_000,  // +120s (cum 5m45s)
 ] as const;
 
 export type CatalogSyncLogger = {
@@ -94,6 +103,9 @@ export type CatalogSyncPluginConfig = {
   baseUrl?: string;
   favorites: readonly string[];
   catalogSync: boolean;
+  /** Tailscale-probe timeout in ms. Defaults to 2000. Higher values help
+   *  cross-continent Tailnets where RTT can exceed 2s. */
+  probeTimeoutMs?: number;
 };
 
 // ── openclaw.json I/O ───────────────────────────────────────────────────────
@@ -135,18 +147,99 @@ export async function readOpenclawConfig(
     const parsed: unknown = JSON.parse(raw);
     if (parsed && typeof parsed === "object") return parsed as OpenclawConfigLike;
     logger?.warn?.(`[ffai] ${configPath} contains non-object JSON — treating as missing`);
-  } catch {
-    logger?.warn?.(`[ffai] ${configPath} contains invalid JSON (corrupted?) — treating as missing`);
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    logger?.warn?.(`[ffai] ${configPath} contains invalid JSON (${msg}) — treating as missing`);
   }
   return undefined;
 }
 
+/**
+ * Atomic write with crash safety:
+ *   - random tmp suffix (no PID-reuse collisions, no leftovers from prior
+ *     processes pinning a name)
+ *   - fsync before rename so a power loss between write and rename doesn't
+ *     publish a zero-byte file
+ *   - finally-unlink on any failure path so a thrown writeFile / rename
+ *     doesn't leak an `openclaw.json.tmp-<uuid>` forever
+ *
+ * Cross-process linearization is provided by the lockfile in the caller
+ * (`withConfigLock`), not here — this function is the inner critical-section
+ * write.
+ */
 export async function writeOpenclawConfigAtomic(configPath: string, next: unknown): Promise<void> {
   const dir = path.dirname(configPath);
   await fs.mkdir(dir, { recursive: true });
-  const tmp = `${configPath}.tmp-${process.pid}`;
-  await fs.writeFile(tmp, `${JSON.stringify(next, null, 2)}\n`, "utf8");
-  await fs.rename(tmp, configPath);
+  const tmp = `${configPath}.tmp-${crypto.randomUUID()}`;
+  let written = false;
+  try {
+    const handle = await fs.open(tmp, "w", 0o600);
+    try {
+      await handle.writeFile(`${JSON.stringify(next, null, 2)}\n`, "utf8");
+      try { await handle.sync(); } catch { /* fsync is best-effort on some FSes */ }
+    } finally {
+      await handle.close();
+    }
+    written = true;
+    await fs.rename(tmp, configPath);
+  } finally {
+    if (written) {
+      // rename either succeeded (tmp gone) or threw (tmp still there) —
+      // an unlink in the second case avoids a stale tmp accumulating.
+      await fs.stat(tmp).then(() => fs.unlink(tmp)).catch(() => { /* gone */ });
+    } else {
+      // open or write threw before we could rename
+      await fs.unlink(tmp).catch(() => { /* may not exist */ });
+    }
+  }
+}
+
+/**
+ * Cross-process file lock around openclaw.json read-modify-write.
+ *
+ * Uses `mkdir` as a mutex — atomic on POSIX and Windows, no extra deps.
+ * Stale-lock detection: if the lock dir is older than `staleAfterMs`, the
+ * holding process probably crashed; we steal it. Default 60s is generous
+ * (catalog-sync's critical section is well under 1s in normal operation).
+ *
+ * The body runs after acquisition; the lock is released in finally even
+ * on throw so a partial write doesn't strand future writers.
+ */
+async function withConfigLock<T>(
+  configPath: string,
+  logger: CatalogSyncLogger | undefined,
+  body: () => Promise<T>,
+): Promise<T> {
+  const lockDir = `${configPath}.lock`;
+  const staleAfterMs = 60_000;
+  const maxAttempts = 30;
+  const retryMs = 100;
+
+  for (let attempt = 0; attempt < maxAttempts; attempt++) {
+    try {
+      await fs.mkdir(lockDir);
+      // Acquired.
+      try {
+        return await body();
+      } finally {
+        await fs.rmdir(lockDir).catch(() => { /* steal-or-already-gone */ });
+      }
+    } catch (err) {
+      const code = (err as { code?: string })?.code;
+      if (code !== "EEXIST") throw err;
+      // Lock held — check staleness.
+      try {
+        const st = await fs.stat(lockDir);
+        if (Date.now() - st.mtimeMs > staleAfterMs) {
+          logger?.warn?.(`[ffai] catalog-sync: stealing stale lock at ${lockDir} (>${staleAfterMs}ms old)`);
+          await fs.rmdir(lockDir).catch(() => { /* race with another stealer */ });
+          continue;
+        }
+      } catch { /* lock vanished between mkdir and stat — retry */ }
+      await sleep(retryMs);
+    }
+  }
+  throw new Error(`could not acquire ${lockDir} after ${maxAttempts} attempts`);
 }
 
 // ── Catalog merge ──────────────────────────────────────────────────────────
@@ -175,7 +268,7 @@ export function mergeFfaiProvidersIntoConfig(
     nextProviders[key] = value;
   }
 
-  const changed = JSON.stringify(existing) !== JSON.stringify(nextProviders);
+  const changed = stableStringify(existing) !== stableStringify(nextProviders);
   if (!changed) return { next: config, changed: false };
 
   const next: OpenclawConfigLike = {
@@ -255,7 +348,15 @@ export function normalizeCatalogSyncConfig(raw: unknown): CatalogSyncPluginConfi
   let catalogSync: boolean = true;
   if (src.catalogSync === false) catalogSync = false;
   else if (src.compatSync === false) catalogSync = false;
-  return { ...base, catalogSync };
+
+  let probeTimeoutMs: number | undefined;
+  if (typeof src.probeTimeoutMs === "number"
+      && Number.isFinite(src.probeTimeoutMs)
+      && src.probeTimeoutMs > 0
+      && src.probeTimeoutMs <= 30_000) {
+    probeTimeoutMs = src.probeTimeoutMs;
+  }
+  return { ...base, catalogSync, probeTimeoutMs };
 }
 
 export function resolveCatalogSyncBaseUrl(params: {
@@ -304,6 +405,9 @@ export function resolveCatalogSyncBaseUrl(params: {
 // completion request.
 
 const TAILSCALE_CGNAT_RE = /^100\.(?:6[4-9]|[7-9][0-9]|1[01][0-9]|12[0-7])\./;
+// Tailscale assigns IPv6 ULAs from fd7a:115c:a1e0::/48 on every node.
+// Match either a full or compact form; we don't need to parse, just detect.
+const TAILSCALE_ULA_RE = /^fd7a:115c:a1e0:/i;
 
 export function findTailscaleIp(): string | undefined {
   let interfaces: ReturnType<typeof os.networkInterfaces>;
@@ -312,16 +416,31 @@ export function findTailscaleIp(): string | undefined {
   } catch {
     return undefined;
   }
+  // Prefer IPv4 (broader compatibility with FFAI server defaults), fall
+  // back to IPv6 ULA on IPv6-only Tailnets.
+  let v6Fallback: string | undefined;
   for (const name of Object.keys(interfaces)) {
     const addrs = interfaces[name];
     if (!addrs) continue;
     for (const addr of addrs) {
       if (addr.internal) continue;
-      if (addr.family !== "IPv4") continue;
-      if (TAILSCALE_CGNAT_RE.test(addr.address)) return addr.address;
+      if (addr.family === "IPv4" && TAILSCALE_CGNAT_RE.test(addr.address)) {
+        return addr.address;
+      }
+      if (addr.family === "IPv6" && !v6Fallback && TAILSCALE_ULA_RE.test(addr.address)) {
+        v6Fallback = addr.address;
+      }
     }
   }
-  return undefined;
+  return v6Fallback;
+}
+
+/**
+ * Format an IP literal for use as a URL host. IPv6 addresses must be
+ * bracketed (`[fd7a::1]:80`); IPv4 is returned unchanged.
+ */
+function formatHostForUrl(ip: string): string {
+  return ip.includes(":") ? `[${ip}]` : ip;
 }
 
 export function isLoopbackHost(host: string): boolean {
@@ -335,6 +454,10 @@ async function probeReachable(url: string, timeoutMs: number): Promise<boolean> 
   // Plain `fetch` with an AbortController — no need for SSRF guard here:
   // the caller passes a URL we constructed from a Tailscale interface, not
   // operator-supplied input.
+  //
+  // We don't require a /health endpoint to exist — many FFAI deployments
+  // don't expose one. Anything <500 means the host is reachable on that
+  // address; we're probing connectivity, not application health.
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), timeoutMs);
   try {
@@ -342,7 +465,7 @@ async function probeReachable(url: string, timeoutMs: number): Promise<boolean> 
       method: "GET",
       signal: controller.signal,
     });
-    return resp.ok;
+    return resp.status < 500;
   } catch {
     return false;
   } finally {
@@ -393,7 +516,7 @@ export async function resolveDetectedBaseUrl(params: {
     return { baseUrl: resolved.baseUrl, source: "loopback", detail: "no Tailscale interface" };
   }
 
-  const candidate = `${parsed.protocol}//${tailscaleIp}:${parsed.port || (parsed.protocol === "https:" ? "443" : "80")}`;
+  const candidate = `${parsed.protocol}//${formatHostForUrl(tailscaleIp)}:${parsed.port || (parsed.protocol === "https:" ? "443" : "80")}`;
   const reachable = await probeReachable(candidate, probeTimeoutMs);
   if (!reachable) {
     return {
@@ -442,10 +565,27 @@ export async function runCatalogSync(ctx: CatalogSyncStartContext): Promise<void
   // Re-entry guard: config writes can trigger gateway reloads that re-call
   // register() → runCatalogSync(). Both flags must be checked because a
   // retry loop may still be sleeping when the next register() fires.
-  if (syncHasFired || syncInFlight) return;
-  syncInFlight = true;
+  if (syncFlags.fired || syncFlags.inFlight) return;
+  syncFlags.inFlight = true;
 
   const logger = ctx.logger;
+  try {
+    await runCatalogSyncInner(ctx, logger);
+  } catch (err) {
+    // Any throw above is a programmer bug — log it but never let it
+    // propagate out of the fire-and-forget path. Without this, an early
+    // throw would leave inFlight=true forever and no future sync can run.
+    const msg = err instanceof Error ? err.message : String(err);
+    logger?.error?.(`[ffai] catalog-sync: unexpected throw — ${msg}`);
+  } finally {
+    syncFlags.inFlight = false;
+  }
+}
+
+async function runCatalogSyncInner(
+  ctx: CatalogSyncStartContext,
+  logger: CatalogSyncLogger | undefined,
+): Promise<void> {
   const env = ctx.env ?? process.env;
 
   // Resolve plugin config. Provider plugins get loaded through a deferred
@@ -466,13 +606,15 @@ export async function runCatalogSync(ctx: CatalogSyncStartContext): Promise<void
 
   if (!pluginConfig.catalogSync) {
     logger?.info?.("[ffai] catalog-sync disabled by plugin config (catalogSync=false)");
-    syncHasFired = true; // intentional config — no retry
-    syncInFlight = false;
+    syncFlags.fired = true; // intentional config — no retry
     return;
   }
 
   const resolved = resolveCatalogSyncBaseUrl({ pluginConfig, env });
-  const detected = await resolveDetectedBaseUrl({ resolved });
+  const detected = await resolveDetectedBaseUrl({
+    resolved,
+    probeTimeoutMs: pluginConfig.probeTimeoutMs,
+  });
   if (detected.source === "tailscale-flipped") {
     logger?.info?.(`[ffai] catalog-sync: ${detected.detail}; using ${detected.baseUrl}`);
   } else if (detected.detail) {
@@ -482,11 +624,11 @@ export async function runCatalogSync(ctx: CatalogSyncStartContext): Promise<void
   const apiKey = resolveCatalogSyncApiKey(env);
 
   // Retry loop: try once immediately, then after each delay in
-  // RETRY_DELAYS_MS. A successful sync flips syncHasFired and exits.
+  // RETRY_DELAYS_MS. A successful sync flips syncFlags.fired and exits.
   const totalAttempts = RETRY_DELAYS_MS.length + 1;
   for (let attempt = 0; attempt < totalAttempts; attempt++) {
     if (attempt > 0) {
-      const delayMs = RETRY_DELAYS_MS[attempt - 1];
+      const delayMs = RETRY_DELAYS_MS[attempt - 1] ?? 120_000;
       logger?.info?.(
         `[ffai] catalog-sync: retrying in ${Math.round(delayMs / 1000)}s (attempt ${attempt + 1}/${totalAttempts})`,
       );
@@ -502,8 +644,7 @@ export async function runCatalogSync(ctx: CatalogSyncStartContext): Promise<void
     });
 
     if (outcome === "success" || outcome === "fatal") {
-      syncHasFired = true;
-      syncInFlight = false;
+      syncFlags.fired = true;
       return;
     }
     // outcome === "transient" → fall through to next retry iteration
@@ -513,9 +654,8 @@ export async function runCatalogSync(ctx: CatalogSyncStartContext): Promise<void
     `[ffai] catalog-sync: gave up after ${totalAttempts} attempts — catalog left as-is. ` +
     "Restart the gateway after FFAI is reachable.",
   );
-  syncInFlight = false;
-  // Intentionally do NOT set syncHasFired — operators sometimes restart FFAI
-  // shortly after the gateway, and we want to allow another sync if a
+  // Intentionally do NOT set syncFlags.fired — operators sometimes restart
+  // FFAI shortly after the gateway, and we want to allow another sync if a
   // future register() re-entry happens (e.g. config hot-reload).
 }
 
@@ -563,45 +703,67 @@ async function attemptCatalogSync(params: {
     );
   }
 
-  const onDisk = await readOpenclawConfig(cfgPath, logger);
-  if (!onDisk) {
-    logger?.warn?.(`[ffai] catalog-sync: could not read ${cfgPath} — skipping write`);
-    return "transient";
-  }
+  // Cross-process lock around read-modify-write. Without this, concurrent
+  // writers (gateway + `openclaw configure`) interleave reads and last-
+  // writer-wins drops the other's changes silently.
+  return withConfigLock(cfgPath, logger, async () => {
+    const onDisk = await readOpenclawConfig(cfgPath, logger);
+    if (!onDisk) {
+      logger?.warn?.(`[ffai] catalog-sync: could not read ${cfgPath} — skipping write`);
+      return "transient";
+    }
 
-  const { next: afterProviders, changed: providersChanged } = mergeFfaiProvidersIntoConfig(
-    onDisk,
-    fetched.providers,
-  );
+    const { next: afterProviders, changed: providersChanged } = mergeFfaiProvidersIntoConfig(
+      onDisk,
+      fetched.providers,
+    );
 
-  // Sync the allowlist after providers so newly added providers contribute
-  // their model refs.
-  const { next: afterAllowlist, added: allowlistAdded } = syncFfaiAllowlist(
-    afterProviders,
-    fetched.providers,
-  );
+    // Sync the allowlist after providers so newly added providers contribute
+    // their model refs.
+    const { next: afterAllowlist, added: allowlistAdded } = syncFfaiAllowlist(
+      afterProviders,
+      fetched.providers,
+    );
 
-  if (!providersChanged && allowlistAdded === 0) {
-    logger?.info?.("[ffai] catalog-sync: on-disk catalog already matches discovery — no write");
-    return "success";
-  }
+    if (!providersChanged && allowlistAdded === 0) {
+      logger?.info?.("[ffai] catalog-sync: on-disk catalog already matches discovery — no write");
+      return "success";
+    }
 
-  try {
-    await writeOpenclawConfigAtomic(cfgPath, afterAllowlist);
-    const parts: string[] = [];
-    if (providersChanged) parts.push(`${Object.keys(fetched.providers).length} ffai-* providers`);
-    if (allowlistAdded > 0) parts.push(`${allowlistAdded} model refs to allowlist`);
-    logger?.info?.(`[ffai] catalog-sync: wrote ${parts.join(" + ")} to ${cfgPath}`);
-    return "success";
-  } catch (err) {
-    const msg = err instanceof Error ? err.message : String(err);
-    logger?.error?.(`[ffai] catalog-sync: failed to write ${cfgPath}: ${msg}`);
-    // Write failures are typically permission issues, not transient. Don't
-    // burn the retry budget on something a backoff won't fix.
-    return "fatal";
-  }
+    try {
+      await writeOpenclawConfigAtomic(cfgPath, afterAllowlist);
+      const parts: string[] = [];
+      if (providersChanged) parts.push(`${Object.keys(fetched.providers).length} ffai-* providers`);
+      if (allowlistAdded > 0) parts.push(`${allowlistAdded} model refs to allowlist`);
+      logger?.info?.(`[ffai] catalog-sync: wrote ${parts.join(" + ")} to ${cfgPath}`);
+      return "success";
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      logger?.error?.(`[ffai] catalog-sync: failed to write ${cfgPath}: ${msg}`);
+      // Write failures are typically permission issues, not transient.
+      // Don't burn the retry budget on something a backoff won't fix.
+      return "fatal";
+    }
+  });
 }
 
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+/**
+ * Stable JSON.stringify — sorts object keys recursively so two structurally
+ * equal objects produce byte-identical output regardless of key insertion
+ * order. Used for change detection so a rebuild from scratch (which may
+ * order keys differently than the on-disk version) doesn't trigger
+ * spurious writes.
+ */
+function stableStringify(value: unknown): string {
+  if (value === null || typeof value !== "object") return JSON.stringify(value);
+  if (Array.isArray(value)) {
+    return `[${value.map(stableStringify).join(",")}]`;
+  }
+  const obj = value as Record<string, unknown>;
+  const keys = Object.keys(obj).sort();
+  return `{${keys.map((k) => `${JSON.stringify(k)}:${stableStringify(obj[k])}`).join(",")}}`;
 }

@@ -68,32 +68,45 @@ export async function buildFfaiProviders(params: {
   const groups = groupModelsByProvider(models);
   const providers: Record<string, ModelProviderConfig> = {};
   const droppedProviders: string[] = [];
+  // Track sanitized-key counts so collisions get a numeric disambiguator
+  // (`-2`, `-3`, …) rather than being merged into the first provider's
+  // baseUrl — merging silently routed the second provider's models to the
+  // first provider's URL on the FFAI side, which 404s every completion.
+  const keyCount = new Map<string, number>();
 
   for (const group of groups) {
     if (group.models.length === 0) continue;
-    const providerKey = `${PROVIDER_PREFIX}${sanitizeProviderKey(group.providerName)}`;
-    if (providerKey === FAVORITES_KEY) {
+    const baseKey = `${PROVIDER_PREFIX}${sanitizeProviderKey(group.providerName)}`;
+    if (baseKey === FAVORITES_KEY) {
       droppedProviders.push(group.providerName);
       continue; // reserve for the virtual group
     }
+    const seen = keyCount.get(baseKey) ?? 0;
+    keyCount.set(baseKey, seen + 1);
+    const providerKey = seen === 0 ? baseKey : `${baseKey}-${seen + 1}`;
+
+    // Dedupe by model id within this provider — FFAI sometimes echoes the
+    // same model under multiple aliases, and OpenClaw routes by id, so
+    // duplicates are at best UX noise and at worst non-deterministic.
+    const seenIds = new Set<string>();
+    const uniqueModels = group.models.filter((m) => {
+      const id = (m as { id?: unknown }).id;
+      if (typeof id !== "string" || seenIds.has(id)) return false;
+      seenIds.add(id);
+      return true;
+    });
+    if (uniqueModels.length === 0) continue;
+
     // URL-encode the provider segment — FFAI allows arbitrary provider
     // names in its /models response and we must not blindly splice
-    // unicode/spaces into a URL path.
-    const existing = providers[providerKey];
-    if (existing) {
-      // Key collision — two FFAI providers sanitize to the same key
-      // (e.g. "Groq!" and "groq?"). Merge models into the first entry
-      // rather than silently dropping one provider's models.
-      const existingModels = Array.isArray(existing.models) ? existing.models : [];
-      existing.models = [...existingModels, ...group.models];
-    } else {
-      providers[providerKey] = {
-        baseUrl: `${baseUrl}/${encodeURIComponent(group.providerName)}/v1`,
-        api: "openai-completions",
-        apiKey: resolvedKey,
-        models: group.models,
-      };
-    }
+    // unicode/spaces into a URL path. The original (un-sanitized) name is
+    // used so FFAI's routing matches what its /models response declared.
+    providers[providerKey] = {
+      baseUrl: `${baseUrl}/${encodeURIComponent(group.providerName)}/v1`,
+      api: "openai-completions",
+      apiKey: resolvedKey,
+      models: uniqueModels,
+    };
   }
 
   // Build favorites virtual provider last so it can never be clobbered by a

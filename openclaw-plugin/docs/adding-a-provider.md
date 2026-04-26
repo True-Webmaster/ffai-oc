@@ -33,7 +33,7 @@ pool. A mismatched key triggers a `mismatched` count in the import
 response, never enters the pool, and never trips circuit breakers
 silently.
 
-Find this block (around line 362):
+Find the `PROVIDER_KEY_PATTERNS` block:
 
 ```js
 const PROVIDER_KEY_PATTERNS = {
@@ -63,7 +63,7 @@ README's "Key-format requirements" table needs an example for the new
 provider — use a synthetic placeholder there (all-X filler that
 matches the regex shape, like `togetherai-XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX`).
 Real keys are for your local test runs only; they must not end up in
-any committed file. See [`AGENTS.md`](../AGENTS.md#examples-and-documentation--never-use-real-secrets)
+any committed file. See [`AGENTS.md`](../../AGENTS.md#examples-and-documentation--never-use-real-secrets)
 for the full rule.
 
 ### 2. `serve.js` — `PROVIDER_TEMPLATES`
@@ -72,7 +72,7 @@ Used for auto-creating the provider stanza on `/import` when the user
 imports keys for a provider that doesn't yet exist in `config.json`.
 Without this entry, the import returns `unknown provider` and refuses.
 
-Find this block (around line 377), and add a stanza matching what
+Find the `PROVIDER_TEMPLATES` block, and add a stanza matching what
 `config.json.example` shows for similar providers:
 
 ```js
@@ -107,7 +107,7 @@ constant inside `generateImportHtml` MUST mirror `PROVIDER_KEY_PATTERNS`
 exactly — they're the same regexes, just embedded in the generated HTML
 for the browser to use.
 
-Find this block (around line 1162):
+Find the `KEY_PATTERNS` array inside `generateImportHtml`:
 
 ```js
 const KEY_PATTERNS = [
@@ -169,7 +169,7 @@ client. The patterns are looser than the import-time validators since
 the goal is "catch anything that looks key-shaped" rather than precise
 identification.
 
-Find this regex (around line 441):
+Find the `_KEY_PATTERNS` regex:
 
 ```js
 const _KEY_PATTERNS = /\b(sk-[a-zA-Z0-9_-]{10,}|gsk_[a-zA-Z0-9]{20,}|AIzaSy[a-zA-Z0-9_-]{30,}|csk-[a-zA-Z0-9]{20,}|Bearer\s+[a-zA-Z0-9_-]{20,})\b/g;
