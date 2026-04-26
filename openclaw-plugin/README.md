@@ -405,9 +405,9 @@ provider's format. These are the patterns:
 | `sambanova` | standard UUID (`8-4-4-4-12`)                            | `00000000-0000-0000-0000-000000000000`                   |
 
 Providers without a pattern fall through to the old length-only check
-(`length >= 8`). Add new providers to `PROVIDER_KEY_PATTERNS` in `serve.js`
-and the matching `KEY_PATTERNS` constant in `generateImportHtml` to lock
-them down.
+(`length >= 8`). To add a new provider end-to-end (regex, template,
+auto-create, encrypt page integration), see
+[`docs/adding-a-provider.md`](docs/adding-a-provider.md).
 
 ## Telegram usage
 
@@ -512,6 +512,140 @@ in `openclaw.json` under `models.providers.ffai-<name>.models[]`.
   `/ffai_encrypt` returns 403 means `FFAI_ADMIN_KEY` is wrong or missing
   (the two are distinct — stats uses the user key, encrypt uses admin).
 
+## FAQ
+
+Quick answers to common gotchas. For anything not here, run
+[`/ffai_doctor`](#ffai_doctor) first — it short-circuits most diagnoses.
+
+### Why doesn't `/models` show `ffai-*` entries even though the plugin loaded?
+
+Three likely causes, in order:
+
+1. **catalog-sync hasn't run yet, or ran when FFAI was unreachable.**
+   Restart the gateway after FFAI is up. Look for
+   `[ffai] catalog-sync: wrote N ffai-* providers` in the gateway logs.
+2. **`agents.defaults.models` allowlist is non-empty and missing the
+   ffai-* refs.** OpenClaw treats that map as a strict allowlist when
+   non-empty. catalog-sync adds entries on every run, but you have to
+   restart the gateway after enabling FFAI so the sync fires.
+3. **FFAI itself has no providers configured.** Run `/ffai_doctor` —
+   the "FFAI providers configured" check reports zero.
+
+### Why does the gateway "see" `FFAI_KEY` when the rest of my shell doesn't?
+
+The gateway process inherits whatever environment it was launched with.
+If it was started by `systemd` from a unit with an `Environment=` line
+or `EnvironmentFile=`, that's what it sees — independent of your
+interactive shell. The reverse also bites people: setting `FFAI_KEY` in
+your shell after the gateway is running has no effect, because the
+gateway was started before the variable existed.
+
+**Fix:** put env vars in the gateway's `.env` or systemd unit, not just
+your shell. Then **restart the gateway**.
+
+### I imported keys, why aren't they working yet?
+
+The `/import` response includes a `restart_hint` field that surfaces in
+chat. The flow is:
+
+1. Keys are written to `config.json` (durable, survives restart).
+2. FFAI is signaled to hot-reload via `SIGHUP`.
+3. The hot-reload handler refreshes the pool with the new keys.
+
+Hot-reload is best-effort. If step 3 silently fails (rare but possible),
+the keys are on disk but the running pool doesn't know about them yet.
+Restart FFAI (`systemctl restart ffai` or equivalent) and the new keys
+become live.
+
+### I changed `.env`, why doesn't FFAI / the gateway pick it up?
+
+Both processes read environment variables at startup, not on demand.
+After editing `.env`:
+
+- For FFAI: `systemctl restart ffai`
+- For the OpenClaw gateway: `systemctl --user restart openclaw-gateway`
+
+This is the most common source of "I set X and nothing changed."
+
+### Where do my keys live? Is `config.json` safe to back up?
+
+Keys live in two places, **union-merged at runtime**:
+
+- Env vars referenced by `keys_var` (e.g. `GEMINI_KEYS=key1,key2,key3`)
+- `providers.<name>.keys[]` in FFAI's `config.json` (mode 0600)
+
+Both sources are honored simultaneously. Edit either one and restart
+FFAI to pick up the change.
+
+`config.json` IS safe to back up but treat it as a secret — it contains:
+
+- All keys imported via `/ffai_import_keys` in plaintext
+- The `import_keypair` (both halves of the ECDH P-256 keypair used by
+  the encrypted import flow)
+
+If you restore to a new host, the import keypair comes along, so any
+HTML pages you've generated still work. To invalidate outstanding
+pages (e.g. after a suspected leak), delete the `import_keypair` field
+and restart FFAI — a fresh keypair is generated and old blobs fail
+`decrypt_failed`.
+
+### I'm getting "format mismatch" — what does that mean?
+
+The server validates every imported key against the declared provider's
+regex (see [Key-format requirements](#key-format-requirements)). A
+"mismatch" means the key string doesn't look like a key for that
+provider. Most common causes:
+
+- Wrong provider selected on the encrypt page (auto-detect prevents
+  this; if you picked manually, double-check).
+- Truncated key (paste error).
+- Provider you're targeting isn't in the supported list — see the
+  table in `Key-format requirements`. Truly novel providers fall
+  through to a length-only check (`>= 8 chars`).
+
+### The catalog says my model has 131K context but it's failing at 32K — why?
+
+FFAI's discovery enriches the catalog with real context-window sizes
+where the upstream API exposes them:
+
+- **Gemini** — fetched natively from
+  `generativelanguage.googleapis.com`.
+- **Groq, SambaNova** — returned in `/v1/models` (Groq uses
+  `context_window`, SambaNova uses `context_length`).
+- **Ollama** — fetched per-model from `/api/show` (the OpenAI-compat
+  `/v1/models` returns no specs).
+- **Cerebras** — no API-side metadata. Defaults to 131K, which matches
+  Cerebras's actual published limits across their current model set.
+
+If you see a context-window mismatch, the most likely cause is you're
+on a pre-0.4.0 FFAI where SambaNova's `context_length` field wasn't
+read. Upgrade and restart.
+
+### What's the difference between `FFAI_KEY` and `FFAI_ADMIN_KEY`?
+
+- `FFAI_KEY` is the user-facing key — protects `/v1/chat/completions`,
+  `/models`, `/savings`. The plugin uses it for catalog discovery and
+  `/ffai_stats`.
+- `FFAI_ADMIN_KEY` is the operator key — protects `/generate-import`
+  (used by `/ffai_encrypt`) and other admin endpoints (`/stats`,
+  `/providers`, `/smush`).
+
+If `FFAI_ADMIN_KEY` isn't set, FFAI falls back to `FFAI_KEY` for admin
+operations. For production, set them to different values so leaking
+the user key doesn't grant admin access.
+
+### Should I disable `catalogSync`?
+
+No. It's the only thing populating `models.providers.ffai-*` in
+`openclaw.json`. The host's native `providerDiscoveryEntry` dispatch
+path doesn't fire for plugins that combine catalog discovery with a
+runtime entry that registers commands — see [Catalog sync](#catalog-sync)
+for the full architecture explanation. Disabling catalog-sync leaves
+`/models` empty for all FFAI providers.
+
+The opt-out exists for a hypothetical future where the upstream
+dispatch starts working. Keep it on for now.
+
 ## Catalog sync
 
 OpenClaw plugins normally publish their model catalog through the
@@ -592,3 +726,14 @@ api-key credential from `FFAI_KEY` plus the populated baseUrl, so
 completions work without an explicit `openclaw configure` step. Set
 `FFAI_KEY` in the environment before starting the gateway and any
 `ffai-*` model is usable as soon as the catalog is synced.
+
+## For maintainers and AI agents
+
+If you're editing this plugin's source (or you're an LLM helping
+someone do so), see [`AGENTS.md`](AGENTS.md) for the project's coding
+conventions, security boundaries, and common-question playbook. The
+repo root has its own [`AGENTS.md`](../AGENTS.md) for the FFAI server
+side.
+
+Adding a new OpenAI-compatible provider? The end-to-end checklist is in
+[`docs/adding-a-provider.md`](docs/adding-a-provider.md).

@@ -368,6 +368,19 @@ ffai/
   import-audit.log      # Per-import audit trail, in same dir as config.json
 ```
 
+## For maintainers and AI agents
+
+Project conventions, security boundaries, and "what not to change"
+guidance for anyone editing FFAI itself live in
+[`AGENTS.md`](AGENTS.md). The OpenClaw plugin has its own
+[`openclaw-plugin/AGENTS.md`](openclaw-plugin/AGENTS.md), which also
+covers runtime behavior for LLM agents working in environments where
+the plugin is installed.
+
+Adding a new OpenAI-compatible provider end-to-end?
+[`openclaw-plugin/docs/adding-a-provider.md`](openclaw-plugin/docs/adding-a-provider.md)
+is the checklist.
+
 ## License
 
 MIT
