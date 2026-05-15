@@ -3,8 +3,18 @@
 Zero-dependency, key-pooling proxy for OpenAI-compatible LLM APIs. Pool
 keys across multiple providers (Gemini, Groq, Cerebras, Ollama,
 SambaNova — anything OpenAI-compatible), get free-tier capacity rotated
-across keys, and surface the unified catalog to OpenClaw via the
-first-party plugin in `openclaw-plugin/`.
+across keys, and surface the unified catalog to your agent via a
+first-party plugin. **OpenClaw** and **Hermes Agent** are both supported
+via sibling plugins in this repo:
+
+- [`openclaw-plugin/`](openclaw-plugin/) — runtime plugin with slash
+  commands (`/ffai_stats`, `/ffai_encrypt`, `/ffai_import_keys`,
+  `/ffai_doctor`) and automatic catalog sync into `openclaw.json`.
+- [`hermes-plugin/`](hermes-plugin/) — config-file installer that
+  registers FFAI as Hermes `custom_providers` in `~/.hermes/config.yaml`.
+
+Same FFAI bridge serves both. Install one plugin, the other, or both —
+they coexist on a single machine pointing at the same proxy.
 
 ## Features
 
@@ -287,14 +297,48 @@ SSE (Server-Sent Events) streams get extended timeouts:
 - Cross-chunk buffering with `\n\n` delimiter parsing for JSON extraction
 - Pipe timeout flag guards against writes after connection close
 
-## OpenClaw integration
+## Agent integrations
+
+### OpenClaw
 
 FFAI ships with a first-party OpenClaw plugin in `openclaw-plugin/`.
 Install it by copying or symlinking that directory into
 `~/.openclaw/extensions/ffai` and running `openclaw configure`. Full
 install instructions, security model (public-key import), config schema,
-and the `/ffai_stats`, `/ffai_encrypt`, `/ffai_import_keys` command
-reference live in [`openclaw-plugin/README.md`](openclaw-plugin/README.md).
+and the `/ffai_stats`, `/ffai_encrypt`, `/ffai_import_keys`,
+`/ffai_doctor` command reference live in
+[`openclaw-plugin/README.md`](openclaw-plugin/README.md).
+
+### Hermes Agent
+
+FFAI ships with a Hermes plugin in `hermes-plugin/`. Install it with:
+
+```bash
+cd hermes-plugin
+npm install
+node bin/ffai-hermes.js install --key "$FFAI_KEY"
+```
+
+This registers one `ffai-<provider>` entry per FFAI free-tier provider in
+`~/.hermes/config.yaml`'s `custom_providers:` section and writes
+`FFAI_KEY` to `~/.hermes/.env`. Hermes then auto-discovers models from
+`<base_url>/models` on demand. Pick a model in Hermes with:
+
+```bash
+hermes -m custom:ffai-gemini:gemini-2.5-flash -z "your prompt"
+```
+
+Re-run `node bin/ffai-hermes.js sync` after adding new free-tier
+providers to FFAI's `config.json`. See
+[`hermes-plugin/README.md`](hermes-plugin/README.md) for full details.
+
+### Both agents on one machine
+
+The plugins are independent and the FFAI bridge is a single process.
+Install both plugins — each writes to its agent's config — and they
+coexist without conflict. Provider keys live in `~/ffai/.env` (the FFAI
+bridge owns them); neither agent needs its own copy of the upstream API
+keys.
 
 ## Alert webhook
 
@@ -354,6 +398,7 @@ ffai/
   cli.js                # FFAI CLI
   index.js              # Library entry
   openclaw-plugin/      # First-party OpenClaw provider plugin
+  hermes-plugin/        # First-party Hermes Agent provider plugin
   lib/                  # Core modules (pool, discovery, smush, auth, …)
   test/                 # node:test integration tests
   config.json           # Provider configuration (not in git, mode 0600)
