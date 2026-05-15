@@ -14,11 +14,16 @@ import { syncProviders } from "./sync.js";
 import { upsertEnvKey } from "./env-io.js";
 import { hermesEnvPath } from "./paths.js";
 
-export async function install({ baseUrl, apiKey, logger } = {}) {
+export async function install({ baseUrl, apiKey, timeoutMs, logger } = {}) {
   const log = logger ?? console;
   const resolvedKey = apiKey ?? process.env.FFAI_KEY?.trim() ?? "";
 
-  const syncResult = await syncProviders({ baseUrl, apiKey: resolvedKey || undefined, logger });
+  const syncResult = await syncProviders({
+    baseUrl,
+    apiKey: resolvedKey || undefined,
+    timeoutMs,
+    logger,
+  });
   if (!syncResult.ok) return syncResult;
 
   if (!resolvedKey) {

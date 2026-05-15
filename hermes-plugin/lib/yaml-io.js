@@ -49,21 +49,31 @@ export async function readConfigDocument(configPath) {
 }
 
 export async function writeConfigAtomic(configPath, doc) {
-  const dir = path.dirname(configPath);
+  const text = doc.toString();
+  await writeFileAtomic(configPath, text.endsWith("\n") ? text : `${text}\n`, 0o600);
+}
+
+/**
+ * Generic atomic-write helper used by both yaml and env writers.
+ * Random tmp suffix (no PID-reuse / leftover collisions), fsync before
+ * rename (no zero-byte file on power loss), finally-unlink on any failure
+ * path. Shared so a single set of bug-fixes covers both code paths.
+ */
+export async function writeFileAtomic(filePath, content, mode = 0o600) {
+  const dir = path.dirname(filePath);
   await fs.mkdir(dir, { recursive: true });
-  const tmp = `${configPath}.tmp-${crypto.randomUUID()}`;
+  const tmp = `${filePath}.tmp-${crypto.randomUUID()}`;
   let written = false;
   try {
-    const handle = await fs.open(tmp, "w", 0o600);
+    const handle = await fs.open(tmp, "w", mode);
     try {
-      const text = doc.toString();
-      await handle.writeFile(text.endsWith("\n") ? text : `${text}\n`, "utf8");
+      await handle.writeFile(content, "utf8");
       try { await handle.sync(); } catch { /* fsync best-effort */ }
     } finally {
       await handle.close();
     }
     written = true;
-    await fs.rename(tmp, configPath);
+    await fs.rename(tmp, filePath);
   } finally {
     if (written) {
       await fs.stat(tmp).then(() => fs.unlink(tmp)).catch(() => {});
@@ -131,8 +141,12 @@ export function upsertCustomProvider(doc, entry) {
     const itemName = item.get("name");
     if (itemName !== entry.name) continue;
 
-    const before = JSON.stringify(item.toJSON());
-    const after = JSON.stringify(entry);
+    // Stable stringify: key-order-independent equality. Without this,
+    // a re-upsert where YAML happens to have keys in a different order
+    // than `entry` (common after the yaml library reformats on emit)
+    // would report "updated" even when the data is identical.
+    const before = stableStringify(item.toJSON());
+    const after = stableStringify(entry);
     if (before === after) return { action: "unchanged" };
 
     seq.set(i, entry);
@@ -141,6 +155,19 @@ export function upsertCustomProvider(doc, entry) {
 
   seq.add(entry);
   return { action: "added" };
+}
+
+/**
+ * JSON.stringify with recursive key sorting. Used for structural equality
+ * checks where insertion order is not semantically significant.
+ */
+export function stableStringify(value) {
+  if (value === null || typeof value !== "object") return JSON.stringify(value);
+  if (Array.isArray(value)) {
+    return `[${value.map(stableStringify).join(",")}]`;
+  }
+  const keys = Object.keys(value).sort();
+  return `{${keys.map((k) => `${JSON.stringify(k)}:${stableStringify(value[k])}`).join(",")}}`;
 }
 
 /**

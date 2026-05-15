@@ -60,3 +60,21 @@ test("invalid key names are rejected", async () => {
   await assert.rejects(() => upsertEnvKey(p, "lower_case", "x"), /invalid key name/);
   await assert.rejects(() => upsertEnvKey(p, "1STARTS_WITH_DIGIT", "x"), /invalid key name/);
 });
+
+test("values containing newline or NUL are rejected", async () => {
+  // Regression: a newline in the value would let the rest land on a
+  // new line, effectively injecting a second KEY=value entry.
+  const p = await tempPath();
+  await assert.rejects(
+    () => upsertEnvKey(p, "FFAI_KEY", "safe\nANTHROPIC_API_KEY=stolen"),
+    /must not contain newline/,
+  );
+  await assert.rejects(() => upsertEnvKey(p, "FFAI_KEY", "with\rCR"), /must not contain newline/);
+  await assert.rejects(() => upsertEnvKey(p, "FFAI_KEY", "with\0null"), /must not contain newline/);
+});
+
+test("non-string values are rejected", async () => {
+  const p = await tempPath();
+  await assert.rejects(() => upsertEnvKey(p, "FFAI_KEY", 12345), /value must be a string/);
+  await assert.rejects(() => upsertEnvKey(p, "FFAI_KEY", undefined), /value must be a string/);
+});

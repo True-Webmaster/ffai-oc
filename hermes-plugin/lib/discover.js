@@ -1,33 +1,78 @@
 /**
- * FFAI discovery — fetch /providers and /models to enumerate what backends
- * are live and which provider keys deserve a custom_providers entry.
+ * FFAI discovery — fetch /models to enumerate which backends are live
+ * and which deserve a custom_providers entry.
  *
  * Returns a list of provider names (e.g. ["gemini", "groq"]) whose model
  * catalog is currently non-empty. Hermes itself fetches models on demand
  * from <base_url>/v1/models, so the plugin doesn't need to embed a model
  * list — it just needs to point Hermes at one base_url per provider.
+ *
+ * Hardening:
+ *   - URL validated and pinned (no scheme/credentials/query smuggling).
+ *   - Cloud metadata hosts and link-local IPs blocked.
+ *   - Response body capped at MAX_RESPONSE_BYTES (default 10 MB).
+ *   - Timeout configurable; AbortController explicitly cleaned up.
  */
-const FETCH_TIMEOUT_MS = 15_000;
+import {
+  parseBaseUrl,
+  buildEndpointUrl,
+  assertNotMetadataEndpoint,
+  readBoundedText,
+  FfaiNetError,
+} from "./net.js";
 
-async function fetchJson(url, apiKey, signal) {
+export const DEFAULT_FETCH_TIMEOUT_MS = 15_000;
+export const MAX_RESPONSE_BYTES = 10 * 1024 * 1024;
+
+async function fetchJsonBounded(url, apiKey, signal, maxBytes) {
   const headers = { accept: "application/json" };
   if (apiKey) headers.authorization = `Bearer ${apiKey}`;
   const resp = await fetch(url, { headers, signal });
-  if (!resp.ok) throw new Error(`HTTP ${resp.status} from ${url}`);
-  return resp.json();
+  if (!resp.ok) {
+    // Drain (bounded) so the connection is released back to the pool.
+    try { await readBoundedText(resp, 64 * 1024); } catch { /* drain best-effort */ }
+    throw new Error(`HTTP ${resp.status} from ${url}`);
+  }
+  const text = await readBoundedText(resp, maxBytes);
+  try {
+    return JSON.parse(text);
+  } catch (err) {
+    throw new Error(`invalid JSON from ${url}: ${err.message ?? err}`);
+  }
 }
 
-export async function discoverProviders({ baseUrl, apiKey } = {}) {
+export async function discoverProviders({
+  baseUrl,
+  apiKey,
+  timeoutMs = DEFAULT_FETCH_TIMEOUT_MS,
+  maxResponseBytes = MAX_RESPONSE_BYTES,
+} = {}) {
   if (!baseUrl) throw new Error("discoverProviders: baseUrl is required");
-  const base = baseUrl.replace(/\/+$/, "");
+
+  // Validate the configured base URL up front. Any rejection here is a
+  // configuration error, not a runtime fetch failure — surface it as
+  // such so the CLI exits non-zero with a clear message.
+  let parsed;
+  try {
+    parsed = parseBaseUrl(baseUrl);
+    await assertNotMetadataEndpoint(parsed);
+  } catch (err) {
+    if (err instanceof FfaiNetError) {
+      return { providers: [], source: "blocked", error: err.message };
+    }
+    throw err;
+  }
+
+  const base = `${parsed.protocol}//${parsed.host}${parsed.pathname.replace(/\/+$/, "")}`;
+  const modelsUrl = buildEndpointUrl(base, "/models");
 
   const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), FETCH_TIMEOUT_MS);
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
   try {
     // /models is the authoritative source — providers without a populated
     // catalog are uninteresting (no models means Hermes would render an
     // empty submenu).
-    const modelsResp = await fetchJson(`${base}/models`, apiKey, controller.signal);
+    const modelsResp = await fetchJsonBounded(modelsUrl, apiKey, controller.signal, maxResponseBytes);
     const models = Array.isArray(modelsResp?.data) ? modelsResp.data : [];
 
     // `favorites` is a virtual group on the FFAI side — its `/favorites/v1/*`
@@ -50,8 +95,9 @@ export async function discoverProviders({ baseUrl, apiKey } = {}) {
 
     return { providers, source: "fetched" };
   } catch (err) {
-    if (err.name === "AbortError") return { providers: [], source: "timeout" };
-    return { providers: [], source: "error", error: err.message };
+    if (err?.name === "AbortError") return { providers: [], source: "timeout" };
+    if (err instanceof FfaiNetError) return { providers: [], source: "blocked", error: err.message };
+    return { providers: [], source: "error", error: err.message ?? String(err) };
   } finally {
     clearTimeout(timer);
   }

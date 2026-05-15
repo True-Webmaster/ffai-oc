@@ -21,10 +21,10 @@ const FFAI_PREFIX = "ffai-";
 const KEY_ENV = "FFAI_KEY";
 const API_MODE = "chat_completions";
 
-function buildEntry(providerName, baseUrl) {
-  const sanitized = sanitizeProviderName(providerName);
+function buildEntry(providerName, baseUrl, disambiguatedName) {
+  const nameSuffix = disambiguatedName ?? sanitizeProviderName(providerName);
   return {
-    name: `${FFAI_PREFIX}${sanitized}`,
+    name: `${FFAI_PREFIX}${nameSuffix}`,
     base_url: `${baseUrl.replace(/\/+$/, "")}/${encodeURIComponent(providerName)}/v1`,
     key_env: KEY_ENV,
     api_mode: API_MODE,
@@ -43,16 +43,30 @@ export function applyCustomProviders(doc, providers, baseUrl) {
   // discovery result).
   const removed = removeCustomProvidersWhere(doc, (name) => name.startsWith(FFAI_PREFIX));
 
+  // Track sanitized-name collisions so two FFAI providers that sanitize
+  // to the same custom_providers `name` (e.g. "Groq!" and "groq?") don't
+  // silently clobber each other. Second collision gets a "-2" suffix,
+  // third "-3", etc. The URL path still uses the original (un-sanitized)
+  // FFAI name, so completions route to the right backend either way.
+  const keyCount = new Map();
+  const droppedCollisions = [];
+
   let added = 0;
   let unchanged = 0;
   for (const { name } of providers) {
-    const entry = buildEntry(name, baseUrl);
+    const sanitized = sanitizeProviderName(name);
+    const seen = keyCount.get(sanitized) ?? 0;
+    keyCount.set(sanitized, seen + 1);
+    const disambiguated = seen === 0 ? sanitized : `${sanitized}-${seen + 1}`;
+    if (seen > 0) droppedCollisions.push({ from: name, to: disambiguated });
+
+    const entry = buildEntry(name, baseUrl, disambiguated);
     const { action } = upsertCustomProvider(doc, entry);
     if (action === "added") added++;
     else if (action === "unchanged") unchanged++;
   }
 
-  return { added, unchanged, removed, total: providers.length };
+  return { added, unchanged, removed, total: providers.length, droppedCollisions };
 }
 
 export function removeAllFfaiEntries(doc) {

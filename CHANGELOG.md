@@ -2,6 +2,54 @@
 
 All notable changes to FFAI are documented in this file.
 
+## hermes-plugin [0.2.0] - 2026-05-15
+
+Hardening pass on the freshly-landed hermes-plugin, mirroring the
+patterns already applied to openclaw-plugin in 0.6.0. No FFAI server
+changes. 17/17 tests pass.
+
+### Security
+
+- **SSRF guard on `discoverProviders`.** Base URL is validated up
+  front (`http(s)` only, no credentials, no query/hash) and cloud
+  metadata endpoints (`169.254.169.254`, `metadata.google.internal`,
+  `fd00:ec2::*`) are refused even when reached via a CNAME. Running
+  the CLI on a cloud VM with a hijacked FFAI bridge can no longer be
+  turned into an IMDS-credential exfiltration tool.
+- **Bounded response body** (10 MB) on `/models` via streaming
+  reader. Stops OOM-via-giant-payload from a malicious FFAI server.
+- **Env-line injection guard.** `upsertEnvKey` rejects values
+  containing `\n`, `\r`, or NUL — without this, a key with a
+  newline could inject a second `KEY=value` line under attacker
+  control (`FFAI_KEY=safe\nANTHROPIC_API_KEY=stolen`).
+- **Cross-process lock on `.env` writes.** Previously only
+  `config.yaml` was lock-protected; concurrent `ffai-hermes install`
+  invocations could race the env write.
+
+### Reliability
+
+- **Provider-name collision handled.** Two FFAI providers that
+  sanitize to the same custom_providers `name` (e.g. `Groq!` and
+  `groq?`) now get a numeric disambiguator (`ffai-groq`,
+  `ffai-groq-2`) with their own `base_url`, instead of silently
+  clobbering each other on YAML upsert. Mirrors the openclaw-plugin
+  `provider-catalog.ts` fix in 0.6.0. Collisions are surfaced as
+  warnings in the CLI output.
+- **Stable-key change detection** in `upsertCustomProvider`. The
+  prior `JSON.stringify` compare was key-order-sensitive, so a
+  re-upsert where YAML happened to have keys in a different order
+  than the entry would report `"updated"` even when the data was
+  identical.
+
+### CLI ergonomics
+
+- **`--name=VALUE` form** accepted alongside `--name VALUE` for all
+  flags.
+- **`--version` / `-v`** flag prints the package version.
+- **`--timeout MS`** flag (and plumbed through to discovery) lets
+  operators raise the 15s default for slow networks. Capped at
+  120000 ms so a typo can't hang CI forever.
+
 ## [0.6.0] - 2026-04-26
 
 Plugin hardening pass driven by an internal multi-agent code review.

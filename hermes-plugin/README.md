@@ -64,13 +64,20 @@ Removes every `custom_providers` entry whose `name` starts with `ffai-`. Leaves 
 | (built-in) | bridge base URL | `http://127.0.0.1:8010` |
 | `--key` flag | auth key | — |
 | `$FFAI_KEY` | auth key | (no auth) |
+| `--timeout` flag | discovery fetch timeout (ms, max 120000) | `15000` |
 | `$HERMES_HOME` | Hermes config dir | `~/.hermes` |
+
+Flags accept both `--name VALUE` and `--name=VALUE` forms. `--version` / `-v` prints the version; `--help` / `-h` prints usage.
 
 ## Safety
 
 - **Wipe protection.** `sync` and `install` refuse to write when FFAI returns zero providers, an HTTP error, or is unreachable — a transient bridge restart will not erase Hermes's view of the catalog mid-session.
-- **Atomic writes.** Both `config.yaml` and `.env` are written via tmpfile + fsync + rename. A power loss between write and rename can never publish a zero-byte file.
-- **Cross-process lock.** `config.yaml` operations acquire a `mkdir`-based lock with 60s stale detection, so concurrent `ffai-hermes` invocations and editor saves don't interleave reads and writes.
+- **SSRF guard on outbound fetches.** The `--url` / `$FFAI_URL` base URL is validated up front: only `http(s)`, no embedded credentials, no query/hash. Cloud metadata endpoints (`169.254.169.254`, `metadata.google.internal`, `fd00:ec2::*`) are refused even if a CNAME points at them — running `ffai-hermes` on an EC2 instance with a hijacked FFAI bridge can't be turned into an IMDS credential-theft tool.
+- **Bounded response body.** The `/models` response is read through a streaming reader capped at 10 MB so a malicious or misconfigured FFAI server can't OOM the CLI.
+- **Atomic writes.** Both `config.yaml` and `.env` are written via tmpfile + fsync + rename, with random UUID suffix (no PID-reuse collisions) and finally-unlink on any failure path. A power loss between write and rename can never publish a zero-byte file.
+- **Cross-process lock.** Both `config.yaml` and `.env` writes acquire a `mkdir`-based lock with 60s stale detection, so concurrent `ffai-hermes` invocations and editor saves don't interleave reads and writes.
+- **Env-line injection guarded.** `upsertEnvKey` rejects values containing `\n`, `\r`, or NUL — without this, a key value containing a newline could inject a second `KEY=value` line under attacker control.
+- **Collision-aware naming.** Two FFAI providers that sanitize to the same custom_providers `name` (e.g. `Groq!` and `groq?`) get a numeric disambiguator (`ffai-groq`, `ffai-groq-2`) instead of silently clobbering each other. Each entry keeps its own `base_url` so completions route correctly.
 - **Comment preservation.** YAML comments and key ordering are preserved across writes. The first install/sync produces a one-time cosmetic reformat outside the `custom_providers:` block (escaped unicode is rewritten to raw UTF-8, long quoted strings are reflowed) because `yaml`'s Document API normalizes string serialization on emit. No data is lost — Hermes parses both forms identically — and subsequent syncs are byte-stable. See [`lib/yaml-io.js`](lib/yaml-io.js) for details.
 
 ## Architecture

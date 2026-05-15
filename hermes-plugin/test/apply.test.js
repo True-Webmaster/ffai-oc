@@ -70,6 +70,31 @@ test("applyCustomProviders URL-encodes provider names with special chars", async
   assert.match(raw, /base_url: http:\/\/127\.0\.0\.1:8010\/weird%2Fname%20with%20spaces\/v1/);
 });
 
+test("collision in sanitized provider names produces a disambiguated entry, not a clobber", async () => {
+  // Regression: two FFAI providers that sanitize to the same custom
+  // _providers `name` (e.g. "Groq!" and "groq?") used to silently
+  // clobber each other on upsert. Now the second collision becomes
+  // ffai-groq-2 with its own base_url path.
+  const p = await tempPath();
+  const doc = await readConfigDocument(p);
+  const summary = applyCustomProviders(
+    doc,
+    [{ name: "Groq!" }, { name: "groq?" }],
+    "http://127.0.0.1:8010",
+  );
+  await writeConfigAtomic(p, doc);
+
+  const raw = await fs.readFile(p, "utf8");
+  assert.match(raw, /name: ffai-groq$/m);
+  assert.match(raw, /name: ffai-groq-2/);
+  // `!` is unreserved in RFC 3986 so encodeURIComponent leaves it raw; `?`
+  // is reserved and gets %3F. Either way each provider gets its own URL.
+  assert.match(raw, /base_url: http:\/\/127\.0\.0\.1:8010\/Groq!\/v1/);
+  assert.match(raw, /base_url: http:\/\/127\.0\.0\.1:8010\/groq%3F\/v1/);
+  assert.equal(summary.droppedCollisions.length, 1);
+  assert.deepEqual(summary.droppedCollisions[0], { from: "groq?", to: "groq-2" });
+});
+
 test("removeAllFfaiEntries leaves non-ffai untouched", async () => {
   const p = await tempPath();
   const seed = [
