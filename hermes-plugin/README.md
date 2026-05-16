@@ -7,17 +7,21 @@ Registers FFAI's free-tier providers as Hermes [custom_providers](https://hermes
 Reads FFAI's `/models` endpoint, groups by upstream provider (gemini, groq, …), and writes one `custom_providers` entry per group into `~/.hermes/config.yaml`. Hermes then auto-discovers models for each provider via `<base_url>/models` on demand — the plugin never embeds a model list, so adding/removing free-tier models in FFAI doesn't require a re-sync.
 
 ```yaml
-# ~/.hermes/config.yaml after `ffai-hermes install`
+# ~/.hermes/config.yaml after `ffai-hermes install --key $FFAI_KEY`
 custom_providers:
   - name: ffai-gemini
     base_url: http://127.0.0.1:8010/gemini/v1
+    api_key: <FFAI_KEY value>
     key_env: FFAI_KEY
     api_mode: chat_completions
   - name: ffai-groq
     base_url: http://127.0.0.1:8010/groq/v1
+    api_key: <FFAI_KEY value>
     key_env: FFAI_KEY
     api_mode: chat_completions
 ```
+
+Both `api_key:` and `key_env:` are written. Hermes's `/model` picker (Telegram / Discord inline keyboards) reads `api_key:` directly to enumerate the live model list; `key_env:` is retained as a hint for operators inspecting the file and so future rotations correctly identify ffai-* entries. The `api_key` value lands in `config.yaml` (chmod 600) in addition to `~/.hermes/.env`. Both files have the same single-user 0600 boundary — same conventions Hermes's own setup wizard uses.
 
 ## Install
 

@@ -2,6 +2,53 @@
 
 All notable changes to FFAI are documented in this file.
 
+## hermes-plugin [0.3.0] - 2026-05-16
+
+Workaround for a Hermes-side picker bug found while deploying 0.2.0
+to a live VPS with 7 Hermes profiles. No server-side or openclaw-plugin
+changes. 19/19 tests pass (added 2 regression tests).
+
+### Fixes
+
+- **`/model` picker showed `(0 models)` for every ffai-* entry** even
+  when the FFAI bridge was healthy. Root cause: Hermes's
+  `list_authenticated_providers` (`hermes_cli/model_switch.py` ~L1638)
+  reads `entry["api_key"]` directly when grouping custom_providers for
+  the picker and does NOT resolve `key_env` to a value there. Section 4
+  of the picker then gates live model discovery on
+  `if api_url and api_key:`, so an entry written with only `key_env:`
+  is invisible in the count even though every other Hermes code path
+  honours it.
+
+  **`apply.js` now emits both `api_key:` (resolved from `FFAI_KEY` at
+  install time) and `key_env: FFAI_KEY`.** This matches the shape
+  Hermes's own `_save_custom_provider` (`main.py` L3313) writes when a
+  user runs the setup wizard manually, so `/model` rendering is
+  identical to the wizard-written path.
+
+### Security note
+
+The `FFAI_KEY` value now lands in `config.yaml` (chmod 600) in
+addition to `~/.hermes/.env`. Both files have the same single-user
+0600 boundary, so this is consistent with Hermes's own conventions —
+no new exposure. `key_env:` is preserved on every entry so:
+
+- Operators inspecting the file see the source of truth.
+- Future rotations via `ffai-hermes install` correctly identify
+  ffai-* entries to update.
+- If Hermes ever fixes the section-4 picker to honour `key_env:`,
+  the file already declares it — no migration needed.
+
+### API
+
+- `applyCustomProviders(doc, providers, baseUrl, opts)` now accepts an
+  optional `opts.apiKey` parameter. When non-empty, it's embedded as
+  `api_key:` on every emitted entry. Blank/whitespace values are
+  ignored (no `api_key: ""` written, which would be worse than
+  omitting it).
+- `sync.js` and `install.js` pass the resolved `FFAI_KEY` through to
+  this option transparently.
+
 ## hermes-plugin [0.2.0] - 2026-05-15
 
 Hardening pass on the freshly-landed hermes-plugin, mirroring the

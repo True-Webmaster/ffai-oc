@@ -1,6 +1,6 @@
 {
   "name": "@ffai/hermes-plugin",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "Hermes Agent integration for FFAI — registers FFAI providers as Hermes custom_providers and syncs the catalog",
   "license": "MIT",
   "type": "module",

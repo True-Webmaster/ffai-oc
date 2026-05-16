@@ -40,7 +40,14 @@ export async function syncProviders({ baseUrl, apiKey, timeoutMs, logger } = {})
   const cfgPath = hermesConfigPath();
   return withConfigLock(cfgPath, async () => {
     const doc = await readConfigDocument(cfgPath);
-    const summary = applyCustomProviders(doc, discovery.providers, resolvedBaseUrl);
+    // Pass the resolved key through so `applyCustomProviders` emits
+    // `api_key:` on each entry. Hermes's picker (section 4 of
+    // model_switch.py) reads api_key directly and ignores key_env there,
+    // so without this the `/model` picker shows "(0 models)" for every
+    // ffai-* entry even when the bridge is healthy. See apply.js header.
+    const summary = applyCustomProviders(doc, discovery.providers, resolvedBaseUrl, {
+      apiKey: resolvedKey,
+    });
     await writeConfigAtomic(cfgPath, doc);
     log.info?.(
       `[hermes-plugin] wrote ${cfgPath}: ` +
