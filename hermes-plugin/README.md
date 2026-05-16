@@ -10,18 +10,25 @@ Reads FFAI's `/models` endpoint, groups by upstream provider (gemini, groq, …)
 # ~/.hermes/config.yaml after `ffai-hermes install --key $FFAI_KEY`
 custom_providers:
   - name: ffai-gemini
-    base_url: http://127.0.0.1:8010/gemini/v1
+    base_url: http://127.0.0.1:8010/gemini
     api_key: <FFAI_KEY value>
     key_env: FFAI_KEY
     api_mode: chat_completions
   - name: ffai-groq
-    base_url: http://127.0.0.1:8010/groq/v1
+    base_url: http://127.0.0.1:8010/groq
     api_key: <FFAI_KEY value>
     key_env: FFAI_KEY
     api_mode: chat_completions
 ```
 
-Both `api_key:` and `key_env:` are written. Hermes's `/model` picker (Telegram / Discord inline keyboards) reads `api_key:` directly to enumerate the live model list; `key_env:` is retained as a hint for operators inspecting the file and so future rotations correctly identify ffai-* entries. The `api_key` value lands in `config.yaml` (chmod 600) in addition to `~/.hermes/.env`. Both files have the same single-user 0600 boundary — same conventions Hermes's own setup wizard uses.
+Notes on the entry shape:
+
+- **`base_url:` omits `/v1`.** Hermes appends `/v1/chat/completions` for completions and `/models` for catalog discovery. The completions path lands on FFAI's per-provider proxy (`/<provider>/v1/*`, with key rotation); the discovery path lands on FFAI's filtered per-provider model list (`/<provider>/models`, ≥ FFAI 0.7.0). The picker therefore shows the same curated ~15 models per provider that openclaw shows, not the ~50-entry raw upstream catalog.
+- **Both `api_key:` and `key_env:` are written.** Hermes's `/model` picker reads `api_key:` directly to enumerate the live model list; `key_env:` is retained as a hint for operators inspecting the file and so future rotations correctly identify ffai-* entries. The `api_key` value lands in `config.yaml` (chmod 600) in addition to `~/.hermes/.env`. Both files have the same single-user 0600 boundary — same convention Hermes's own setup wizard uses.
+
+### Compatibility
+
+**Requires FFAI bridge ≥ 0.7.0** for the filtered discovery path. Older bridges don't have the `/<provider>/models` route and Hermes will see `(0 models)` for every ffai-* entry. Upgrade the bridge first, or pin hermes-plugin to 0.3.0 (which used `<bridge>/<provider>/v1` and the raw upstream catalog).
 
 ## Install
 

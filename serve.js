@@ -1827,11 +1827,14 @@ function handleHealth(req, res, url) {
   sendJson(res, data.status === "ok" ? 200 : 503, { status: data.status });
 }
 
-// ── Route: /models (OpenAI-compat model listing) ────────────────────────────
-function handleModels(req, res) {
-  const now = Date.now();
+// Build the curated/filtered model list once and serve it from cache for
+// `MODELS_CACHE_TTL`. Used by both /models (full catalog) and
+// /<provider>/models (per-provider slice). Keeping a single builder means
+// the two endpoints can never drift — when /models filters something out,
+// /<provider>/models filters it too.
+function buildModelsResponse(now = Date.now()) {
   if (_modelsCache && (now - _modelsCacheTs) < MODELS_CACHE_TTL) {
-    return sendJson(res, 200, _modelsCache);
+    return _modelsCache;
   }
 
   const models = [];
@@ -1882,7 +1885,40 @@ function handleModels(req, res) {
 
   _modelsCache = { object: "list", data: models };
   _modelsCacheTs = now;
-  sendJson(res, 200, _modelsCache);
+  return _modelsCache;
+}
+
+// ── Route: /models (OpenAI-compat model listing) ────────────────────────────
+function handleModels(req, res) {
+  sendJson(res, 200, buildModelsResponse());
+}
+
+// ── Route: /<provider>/models (filtered subset for non-aggregator clients) ──
+//
+// Returns the same curated catalog as /models, but only the entries whose
+// `provider` matches the given provider name. Designed for clients (e.g.
+// Hermes) that point each provider entry at `<bridge>/<provider>` and rely
+// on `<base_url>/models` for catalog discovery — those clients would
+// otherwise hit `/<provider>/v1/models` (raw upstream passthrough) and see
+// the unfiltered upstream catalog including pay-only / free-tier-zero
+// models like gemini-2.5-pro.
+//
+// Favorites entries are excluded — they're a virtual provider and don't
+// make sense in a per-provider slice. The internal `_source_provider`
+// field is stripped from the response since it's only meaningful when
+// the favorites slot is visible alongside the real ones.
+function handleProviderModels(req, res, providerName) {
+  // 404 instead of empty list when the provider isn't configured at all —
+  // an empty list is indistinguishable from "this provider has no curated
+  // models today" and would mislead clients caching discovery results.
+  if (!pool.providerNames().includes(providerName)) {
+    return sendJson(res, 404, { error: `unknown provider: ${providerName}` });
+  }
+  const all = buildModelsResponse();
+  const filtered = all.data
+    .filter(m => m.provider === providerName)
+    .map(({ _source_provider, ...rest }) => rest);
+  sendJson(res, 200, { object: "list", data: filtered });
 }
 
 // ── Route: /stats ───────────────────────────────────────────────────────────
@@ -2389,6 +2425,16 @@ async function handleRequest(req, res) {
   if (proxyMatch) {
     if (!requireAuth(true)) return sendJson(res, 401, { error: "unauthorized" });
     return handleProxy(req, res, proxyMatch[1], proxyMatch[2], reqId);
+  }
+
+  // /{provider}/models — filtered curated model list scoped to a single
+  // provider. Lives at the non-/v1 path so a client whose base_url is
+  // `<bridge>/<provider>` (no /v1) reaches this route on GET /models,
+  // and reaches handleProxy on /v1/chat/completions for completions.
+  const providerModelsMatch = pathname.match(/^\/([a-z0-9_-]+)\/models$/);
+  if (providerModelsMatch && req.method === "GET") {
+    if (!requireAuth(true)) return sendJson(res, 401, { error: "unauthorized" });
+    return handleProviderModels(req, res, providerModelsMatch[1]);
   }
 
   sendJson(res, 404, { error: "not found" });

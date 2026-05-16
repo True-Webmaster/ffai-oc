@@ -2,6 +2,69 @@
 
 All notable changes to FFAI are documented in this file.
 
+## [0.7.0] - 2026-05-16
+
+Adds a filtered per-provider model listing endpoint so non-aggregator
+clients (Hermes) see the same curated catalog that aggregator clients
+(OpenClaw) already see. Pairs with hermes-plugin 0.4.0 below.
+
+### New endpoint
+
+- **`GET /<provider>/models`** — same shape and filtering as `/models`,
+  scoped to a single provider. Returns 404 for unknown providers (rather
+  than an empty list, which would be indistinguishable from "this
+  provider has no curated models today" and would mislead cached
+  discovery results). Excludes favorites virtual entries; strips the
+  internal `_source_provider` field. Built from the same
+  `buildModelsResponse()` helper as `/models` so the two endpoints can
+  never drift.
+
+### Why this exists
+
+FFAI's per-provider proxy `/<provider>/v1/*` is a raw passthrough to
+the upstream (Google, Groq, etc). A client whose `base_url` is
+`<bridge>/<provider>/v1` and that hits `<base_url>/models` for catalog
+discovery (Hermes does this) was seeing the unfiltered upstream catalog
+— ~51 Gemini models from Google's `/v1/models` instead of the ~15
+free-tier-compatible ones FFAI's `/models` aggregator returns. That
+caused users picking `gemini-2.5-pro` in Hermes's `/model` picker to
+get a hard `limit: 0` 429 from Google (pay-only model on a free-tier
+key) and fall through to a fallback provider.
+
+The new route lets Hermes-style clients drop the `/v1` suffix from
+their `base_url` and reach the curated list at `<bridge>/<provider>/models`.
+Completions continue to land on `<bridge>/<provider>/v1/chat/completions`
+unchanged.
+
+### Tests
+
+- 25/25 pass in `test/serve.test.js` (added 4 new tests covering auth,
+  per-provider filtering, unknown-provider 404, and favorites exclusion).
+
+## hermes-plugin [0.4.0] - 2026-05-16
+
+Pairs with FFAI 0.7.0 above. Switches Hermes's discovery from the raw
+upstream catalog to FFAI's curated per-provider slice — same model set
+the openclaw-plugin already surfaces. 20/20 tests pass.
+
+### Fixes
+
+- **`/model` picker no longer shows pay-only or free-tier-zero models.**
+  `apply.js` now writes `base_url: <bridge>/<provider>` (without the
+  `/v1` suffix). Hermes appends `/models` for catalog discovery, so the
+  picker now hits FFAI 0.7.0's filtered route and shows the same ~15
+  curated entries per provider that openclaw shows. Completions
+  continue to work via Hermes's `<base_url>/v1/chat/completions` →
+  FFAI's existing per-provider proxy.
+
+### Compatibility
+
+- **Requires FFAI ≥ 0.7.0.** Older bridges don't have the
+  `/<provider>/models` route and will 404 Hermes's catalog probe; the
+  picker will then show `(0 models)` for every ffai-* entry. Upgrade
+  the bridge first, OR revert to hermes-plugin 0.3.0 (which appended
+  `/v1` and used the raw upstream catalog).
+
 ## hermes-plugin [0.3.0] - 2026-05-16
 
 Workaround for a Hermes-side picker bug found while deploying 0.2.0

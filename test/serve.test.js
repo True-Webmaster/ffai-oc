@@ -221,6 +221,51 @@ describe("serve.js HTTP bridge", { concurrency: 1 }, () => {
     });
   });
 
+  // ── /{provider}/models (filtered per-provider slice) ─────────────────────
+  // Mirrors /models's curated/filtered list but scoped to a single provider.
+  // Designed for clients that point at `<bridge>/<provider>` and rely on
+  // `<base_url>/models` for discovery — without this route they'd hit
+  // /<provider>/v1/models (raw upstream passthrough) and see unfiltered
+  // pay-only/free-tier-zero models.
+  describe("GET /{provider}/models", () => {
+    it("returns 401 without auth", async () => {
+      const res = await request("/fakeprov/models");
+      assert.equal(res.status, 401);
+    });
+
+    it("returns 200 with only entries for the named provider", async () => {
+      const res = await request("/fakeprov/models", { headers: authHeader(FFAI_KEY) });
+      assert.equal(res.status, 200);
+      assert.equal(res.json.object, "list");
+      assert.ok(Array.isArray(res.json.data));
+      // Every entry must belong to fakeprov (or no entries at all if the
+      // curated list happens to be empty — but never a different provider).
+      for (const m of res.json.data) {
+        assert.equal(m.provider, "fakeprov", `entry leaked from another provider: ${JSON.stringify(m)}`);
+      }
+      // _source_provider is an internal favorites field; never surfaced
+      // on the per-provider slice.
+      for (const m of res.json.data) {
+        assert.equal(m._source_provider, undefined, "_source_provider must be stripped");
+      }
+    });
+
+    it("returns 404 for an unknown provider", async () => {
+      const res = await request("/no-such-provider/models", { headers: authHeader(FFAI_KEY) });
+      assert.equal(res.status, 404);
+      assert.match(res.json.error || "", /unknown provider/);
+    });
+
+    it("excludes favorites virtual entries from the slice", async () => {
+      // The favorites virtual provider has provider="favorites"; a per-
+      // provider slice for "fakeprov" must never include it.
+      const res = await request("/fakeprov/models", { headers: authHeader(FFAI_KEY) });
+      assert.equal(res.status, 200);
+      const favs = res.json.data.filter((m) => m.provider === "favorites");
+      assert.equal(favs.length, 0, "favorites entries leaked into per-provider slice");
+    });
+  });
+
   // ── /stats ──────────────────────────────────────────────────────────────
   describe("GET /stats", () => {
     it("returns 401 without auth", async () => {

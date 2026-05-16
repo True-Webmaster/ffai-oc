@@ -51,9 +51,24 @@ function buildEntry(providerName, baseUrl, disambiguatedName, apiKey) {
   // Field order matches Hermes's own writer (main.py::_save_custom_provider)
   // so a `git diff` between a wizard-written entry and a plugin-written one
   // is empty when the values agree.
+  //
+  // base_url intentionally omits the `/v1` suffix. Hermes appends `/models`
+  // for catalog discovery and `/v1/chat/completions` for completions. Both
+  // are correct against FFAI:
+  //   - `<bridge>/<provider>/models`            → FFAI's curated/filtered
+  //     per-provider slice (added in FFAI 0.7.0). Hermes's picker shows
+  //     ~15 free-tier models instead of the ~50 raw upstream catalog,
+  //     matching what openclaw-plugin sees.
+  //   - `<bridge>/<provider>/v1/chat/completions` → FFAI's per-provider
+  //     proxy with key rotation, unchanged.
+  //
+  // Older FFAI bridges (≤0.6.0) without the /<provider>/models route will
+  // return 404 on Hermes's model probe and the picker will show "(0
+  // models)" for ffai-* entries. Upgrade the bridge to 0.7.0 or revert
+  // to hermes-plugin 0.3.0 (which appended /v1 here).
   const entry = {
     name: `${FFAI_PREFIX}${nameSuffix}`,
-    base_url: `${baseUrl.replace(/\/+$/, "")}/${encodeURIComponent(providerName)}/v1`,
+    base_url: `${baseUrl.replace(/\/+$/, "")}/${encodeURIComponent(providerName)}`,
   };
   if (apiKey) entry.api_key = apiKey;
   entry.key_env = KEY_ENV;

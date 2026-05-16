@@ -25,9 +25,11 @@ test("applyCustomProviders writes one entry per provider with correct base_url",
 
   const raw = await fs.readFile(p, "utf8");
   assert.match(raw, /name: ffai-gemini/);
-  assert.match(raw, /base_url: http:\/\/127\.0\.0\.1:8010\/gemini\/v1/);
+  // base_url does NOT include /v1 — Hermes appends it for completions and
+  // /models for catalog discovery hits FFAI's filtered per-provider route.
+  assert.match(raw, /base_url: http:\/\/127\.0\.0\.1:8010\/gemini\s*$/m);
   assert.match(raw, /name: ffai-groq/);
-  assert.match(raw, /base_url: http:\/\/127\.0\.0\.1:8010\/groq\/v1/);
+  assert.match(raw, /base_url: http:\/\/127\.0\.0\.1:8010\/groq\s*$/m);
   assert.match(raw, /key_env: FFAI_KEY/);
   assert.match(raw, /api_mode: chat_completions/);
   // No api_key when apiKey isn't passed.
@@ -77,6 +79,28 @@ test("applyCustomProviders ignores empty/whitespace apiKey", async () => {
   assert.match(raw, /key_env: FFAI_KEY/);
 });
 
+test("base_url omits /v1 suffix (Hermes appends /v1/chat/completions or /models)", async () => {
+  // Regression: hermes-plugin <0.4.0 wrote `<bridge>/<provider>/v1` so
+  // Hermes's catalog probe hit `<bridge>/<provider>/v1/models` — the raw
+  // upstream passthrough — and showed unfiltered upstream catalogs
+  // including pay-only / free-tier-zero models like gemini-2.5-pro.
+  // Now base_url ends with the provider name; Hermes appends /models for
+  // discovery (hitting FFAI's filtered route) and /v1/chat/completions
+  // for completions (hitting the existing per-provider proxy).
+  const p = await tempPath();
+  const doc = await readConfigDocument(p);
+  applyCustomProviders(
+    doc,
+    [{ name: "gemini" }],
+    "http://127.0.0.1:8010",
+  );
+  await writeConfigAtomic(p, doc);
+
+  const raw = await fs.readFile(p, "utf8");
+  assert.doesNotMatch(raw, /base_url: http:\/\/127\.0\.0\.1:8010\/gemini\/v1/);
+  assert.match(raw, /base_url: http:\/\/127\.0\.0\.1:8010\/gemini\s*$/m);
+});
+
 test("applyCustomProviders preserves non-ffai entries and replaces only ffai-*", async () => {
   const p = await tempPath();
   const seed = [
@@ -112,7 +136,7 @@ test("applyCustomProviders URL-encodes provider names with special chars", async
 
   const raw = await fs.readFile(p, "utf8");
   assert.match(raw, /name: ffai-weird-name-with-spaces/);
-  assert.match(raw, /base_url: http:\/\/127\.0\.0\.1:8010\/weird%2Fname%20with%20spaces\/v1/);
+  assert.match(raw, /base_url: http:\/\/127\.0\.0\.1:8010\/weird%2Fname%20with%20spaces\s*$/m);
 });
 
 test("collision in sanitized provider names produces a disambiguated entry, not a clobber", async () => {
@@ -134,8 +158,8 @@ test("collision in sanitized provider names produces a disambiguated entry, not 
   assert.match(raw, /name: ffai-groq-2/);
   // `!` is unreserved in RFC 3986 so encodeURIComponent leaves it raw; `?`
   // is reserved and gets %3F. Either way each provider gets its own URL.
-  assert.match(raw, /base_url: http:\/\/127\.0\.0\.1:8010\/Groq!\/v1/);
-  assert.match(raw, /base_url: http:\/\/127\.0\.0\.1:8010\/groq%3F\/v1/);
+  assert.match(raw, /base_url: http:\/\/127\.0\.0\.1:8010\/Groq!\s*$/m);
+  assert.match(raw, /base_url: http:\/\/127\.0\.0\.1:8010\/groq%3F\s*$/m);
   assert.equal(summary.droppedCollisions.length, 1);
   assert.deepEqual(summary.droppedCollisions[0], { from: "groq?", to: "groq-2" });
 });
